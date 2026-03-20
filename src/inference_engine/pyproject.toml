@@ -1,0 +1,16 @@
+[project]
+name = "inference_engine"
+version = "0.1.0"
+description = "Service: inference_engine"
+requires-python = ">=3.11"
+dependencies = [
+  "python-dotenv>=1.0.1",
+  "pydantic>=2.8.0",
+  "pydantic-settings>=2.4.0",
+  "structlog>=24.4.0",
+  "fastapi>=0.116.0", "uvicorn>=0.30.0", "numpy>=1.26.0"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
