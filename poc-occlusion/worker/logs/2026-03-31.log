@@ -1,0 +1,5 @@
+2026-03-31 15:06:27,054 - poc-occlusion-reid_matcher - INFO - Track 1 created new person 1 (v_avg=0.800)
+2026-03-31 15:06:27,054 - poc-occlusion-reid_matcher - INFO - Track 1 tentative (v_avg=0.300)
+2026-03-31 15:06:27,055 - poc-occlusion-reid_matcher - INFO - Track 1 tentative (v_avg=0.300)
+2026-03-31 15:06:27,055 - poc-occlusion-reid_matcher - INFO - Track 1 created person 1 after 3 tentative attempts
+2026-03-31 15:06:27,055 - poc-occlusion-reid_matcher - INFO - Track 1 matched to person 42 (sim=0.850)

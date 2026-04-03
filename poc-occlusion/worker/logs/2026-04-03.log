@@ -1,0 +1,20 @@
+2026-04-03 11:22:03,557 - poc-occlusion-reid_matcher - INFO - Track 1 created new person 1 (v_avg=0.800, consistency=0.900)
+2026-04-03 11:22:03,559 - poc-occlusion-reid_matcher - INFO - Track 1 tentative (v_avg=0.300, consistency=0.900)
+2026-04-03 11:22:03,560 - poc-occlusion-reid_matcher - INFO - Track 1 tentative (v_avg=0.800, consistency=0.300)
+2026-04-03 11:22:03,561 - poc-occlusion-reid_matcher - INFO - Track 1 tentative (v_avg=0.300, consistency=0.500)
+2026-04-03 11:22:03,561 - poc-occlusion-reid_matcher - INFO - Track 1 created new person 1 (v_avg=0.800, consistency=0.900)
+2026-04-03 11:22:03,561 - poc-occlusion-reid_matcher - INFO - Track 1 tentative (v_avg=0.300, consistency=0.300)
+2026-04-03 11:22:03,561 - poc-occlusion-reid_matcher - INFO - Track 1 fallback → person 1 after 5 attempts
+2026-04-03 11:22:03,562 - poc-occlusion-reid_matcher - INFO - Track 1 matched to person 42 (sim=0.850)
+2026-04-03 11:22:03,562 - poc-occlusion-reid_matcher - INFO - Track 1 matched to person 42 (sim=0.850)
+2026-04-03 11:22:16,146 - poc-occlusion-reid_matcher - INFO - Track 1 created new person 1 (v_avg=0.800, consistency=0.900)
+2026-04-03 11:22:16,147 - poc-occlusion-reid_matcher - INFO - Track 1 tentative (v_avg=0.300, consistency=0.900)
+2026-04-03 11:22:16,147 - poc-occlusion-reid_matcher - INFO - Track 1 tentative (v_avg=0.800, consistency=0.300)
+2026-04-03 11:22:16,147 - poc-occlusion-reid_matcher - INFO - Track 1 tentative (v_avg=0.300, consistency=0.500)
+2026-04-03 11:22:16,148 - poc-occlusion-reid_matcher - INFO - Track 1 created new person 1 (v_avg=0.800, consistency=0.900)
+2026-04-03 11:22:16,148 - poc-occlusion-reid_matcher - INFO - Track 1 tentative (v_avg=0.300, consistency=0.300)
+2026-04-03 11:22:16,148 - poc-occlusion-reid_matcher - INFO - Track 1 fallback → person 1 after 5 attempts
+2026-04-03 11:22:16,148 - poc-occlusion-reid_matcher - INFO - Track 1 matched to person 42 (sim=0.850)
+2026-04-03 11:22:16,149 - poc-occlusion-reid_matcher - INFO - Track 1 matched to person 42 (sim=0.850)
+2026-04-03 13:32:22,704 - poc-occlusion-worker - INFO - Worker pipeline starting...
+2026-04-03 13:32:22,728 - poc-occlusion-worker - INFO - Connected to model service
