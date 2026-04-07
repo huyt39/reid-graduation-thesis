@@ -1,12 +1,13 @@
 from kafka import KafkaProducer
 from src.kafka.serialization import load_avro_schema, serialize_avro
 
+
 class EdgeKafkaProducer:
     def __init__(
         self,
         bootstrap_servers: str = "localhost:9092",
         topic: str = "reid_input",
-        schema_path: str = "contracts/reid_input_v2.avsc"
+        schema_path: str = "src/contracts/reid_input.avsc",
     ):
         self.topic = topic
         self.schema = load_avro_schema(schema_path)
