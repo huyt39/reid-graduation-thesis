@@ -1,0 +1,112 @@
+from __future__ import annotations
+
+from datetime import datetime
+
+from fastapi import APIRouter, Query
+
+from src.api.deps import get_mongo, get_redis
+
+router = APIRouter(prefix="/persons", tags=["persons"])
+
+
+@router.get("")
+async def list_persons(
+    gender: str | None = None,
+    device: str | None = None,
+    is_active: bool | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    mongo = get_mongo()
+    filters: dict = {}
+    if gender:
+        filters["attributes.gender"] = gender
+    if device:
+        filters["stats.last_seen_device"] = device
+    if is_active is not None:
+        filters["is_active"] = is_active
+
+    items, total = await mongo.search_persons(
+        filters=filters, skip=(page - 1) * page_size, limit=page_size,
+    )
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@router.get("/{person_id}")
+async def get_person(person_id: int):
+    from fastapi import HTTPException
+
+    mongo = get_mongo()
+    redis_cache = get_redis()
+
+    cached = await redis_cache.get_person(person_id)
+    if cached:
+        return cached
+
+    person = await mongo.get_person(person_id)
+    if person is None:
+        raise HTTPException(404, f"Person {person_id} not found")
+
+    await redis_cache.set_person(person_id, person)
+    return person
+
+
+@router.get("/{person_id}/sightings")
+async def get_sightings(
+    person_id: int,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    mongo = get_mongo()
+    items, total = await mongo.get_sightings(
+        person_id, start_time=start_time, end_time=end_time,
+        skip=(page - 1) * page_size, limit=page_size,
+    )
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@router.get("/{person_id}/timeline")
+async def get_timeline(
+    person_id: int,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    event_types: list[str] | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+):
+    mongo = get_mongo()
+    items, total = await mongo.get_timeline(
+        person_id, start_time=start_time, end_time=end_time, event_types=event_types,
+        skip=(page - 1) * page_size, limit=page_size,
+    )
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@router.get("/{person_id}/similar")
+async def get_similar(
+    person_id: int,
+    top_k: int = Query(10, ge=1, le=50),
+    min_score: float = Query(0.5, ge=0.0, le=1.0),
+):
+    from src.api.deps import get_qdrant
+    from fastapi import HTTPException
+    qdrant = get_qdrant()
+    mongo = get_mongo()
+
+    source_person = await mongo.get_person(person_id)
+    if source_person is None:
+        raise HTTPException(404, f"Person {person_id} not found")
+
+    results = qdrant.search_similar(person_id, top_k=top_k, min_score=min_score)
+
+    enriched = []
+    for r in results:
+        person = await mongo.get_person(r["person_id"])
+        item = dict(r)
+        if person is not None:
+            item["person"] = person
+        enriched.append(item)
+
+    return {"similar_persons": enriched}

@@ -1,0 +1,56 @@
+"""Tests for the NL query parser fallback keyword matching."""
+import pytest
+
+from src.services.nl_parser import NLQueryParser
+
+
+@pytest.fixture
+def parser():
+    return NLQueryParser(vllm_url="")  # no vLLM — pure fallback
+
+
+def test_person_lookup(parser):
+    r = parser._fallback_keyword_parse("show me person 42")
+    assert r["query_type"] == "person_lookup"
+    assert r["params"]["person_id"] == 42
+
+
+def test_person_lookup_hash(parser):
+    r = parser._fallback_keyword_parse("person #7")
+    assert r["query_type"] == "person_lookup"
+    assert r["params"]["person_id"] == 7
+
+
+def test_similarity_search(parser):
+    r = parser._fallback_keyword_parse("who looks like person 15")
+    assert r["query_type"] == "similarity_search"
+    assert r["params"]["person_id"] == 15
+
+
+def test_timeline(parser):
+    r = parser._fallback_keyword_parse("where was person 3 today?")
+    assert r["query_type"] == "timeline"
+    assert r["params"]["person_id"] == 3
+
+
+def test_aggregation(parser):
+    r = parser._fallback_keyword_parse("how many times was person 5 seen grouped by hour")
+    assert r["query_type"] == "sighting_aggregation"
+    assert r["params"]["person_id"] == 5
+    assert r["params"]["group_by"] == "hour"
+
+
+def test_device_lookup(parser):
+    r = parser._fallback_keyword_parse("list all cameras")
+    assert r["query_type"] == "device_lookup"
+
+
+def test_gender_search(parser):
+    r = parser._fallback_keyword_parse("find all males seen today")
+    assert r["query_type"] == "person_search"
+    assert r["params"]["filters"]["gender"] == "male"
+
+
+def test_unparseable_returns_error(parser):
+    r = parser._fallback_keyword_parse("what is the weather?")
+    assert r["query_type"] == "error"

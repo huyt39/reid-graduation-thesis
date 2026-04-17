@@ -1,0 +1,103 @@
+"""Tests for QueryExecutor with mocked DB clients."""
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from pydantic import ValidationError
+
+from src.services.query_executor import QueryExecutor
+from src.schemas.query import StructuredQueryRequest
+
+
+@pytest.fixture
+def mongo():
+    m = AsyncMock()
+    m.get_person = AsyncMock(return_value={"person_id": 1, "attributes": {"gender": "male"}})
+    m.search_persons = AsyncMock(return_value=([{"person_id": 1}], 1))
+    m.get_timeline = AsyncMock(return_value=([{"event_type": "sighting_start"}], 1))
+    m.list_devices = AsyncMock(return_value=[{"device_id": "cam-1"}])
+    m.get_stats = AsyncMock(return_value={"total_persons": 5})
+    return m
+
+
+@pytest.fixture
+def qdrant():
+    q = MagicMock()
+    q.search_similar = MagicMock(return_value=[{"person_id": 2, "score": 0.8}])
+    return q
+
+
+@pytest.fixture
+def redis_cache():
+    r = AsyncMock()
+    r.get_person = AsyncMock(return_value=None)
+    r.set_person = AsyncMock()
+    return r
+
+
+@pytest.fixture
+def executor(mongo, qdrant, redis_cache):
+    return QueryExecutor(mongo, qdrant, redis_cache)
+
+
+@pytest.mark.asyncio
+async def test_person_lookup(executor, mongo):
+    result = await executor.execute({"query_type": "person_lookup", "params": {"person_id": 1}})
+    assert result["person"]["person_id"] == 1
+    mongo.get_person.assert_awaited_once_with(1)
+
+
+@pytest.mark.asyncio
+async def test_person_lookup_uses_cache(executor, redis_cache, mongo):
+    redis_cache.get_person.return_value = {"person_id": 1, "attributes": {"gender": "male"}}
+    result = await executor.execute({"query_type": "person_lookup", "params": {"person_id": 1}})
+    assert result["person"]["person_id"] == 1
+    mongo.get_person.assert_not_awaited()
+    redis_cache.set_person.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_person_search(executor, mongo):
+    result = await executor.execute({
+        "query_type": "person_search",
+        "params": {"filters": {"gender": "male"}},
+    })
+    assert result["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_similarity_search(executor, qdrant):
+    result = await executor.execute({
+        "query_type": "similarity_search",
+        "params": {"person_id": 1, "top_k": 5},
+    })
+    assert len(result["similar_persons"]) == 1
+    qdrant.search_similar.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_device_lookup_all(executor, mongo):
+    result = await executor.execute({"query_type": "device_lookup", "params": {}})
+    assert len(result["devices"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_device_lookup_one(executor, mongo):
+    mongo.get_device = AsyncMock(return_value={"device_id": "cam-1"})
+    result = await executor.execute({
+        "query_type": "device_lookup",
+        "params": {"device_id": "cam-1"},
+    })
+    assert result["device"]["device_id"] == "cam-1"
+
+
+@pytest.mark.asyncio
+async def test_unknown_query_type(executor):
+    result = await executor.execute({"query_type": "invalid_type", "params": {}})
+    assert "error" in result
+
+
+def test_structured_query_request_rejects_unknown_query_type():
+    with pytest.raises(ValidationError):
+        StructuredQueryRequest(query_type="invalid_type", params={})
