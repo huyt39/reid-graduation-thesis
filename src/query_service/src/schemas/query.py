@@ -25,6 +25,26 @@ class StructuredQueryRequest(BaseModel):
     params: dict = Field(default_factory=dict)
 
 
+class PersonLookupParams(BaseModel):
+    person_id: int
+
+
+class DeviceLookupParams(BaseModel):
+    device_id: str | None = None
+
+
+class TimelineParams(BaseModel):
+    person_id: int
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    event_types: list[str] | None = None
+
+class SimilaritySearchParams(BaseModel):
+    person_id: int
+    top_k: int = 10
+    min_score: float = 0.5
+
+
 class PersonSearchFilters(BaseModel):
     gender: str | None = None
     gender_confidence_min: float | None = None

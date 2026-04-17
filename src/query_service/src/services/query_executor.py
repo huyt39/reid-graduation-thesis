@@ -6,6 +6,7 @@ import structlog
 from src.db.mongo_client import MongoQueryClient
 from src.db.qdrant_client import QdrantQueryClient
 from src.db.redis_client import RedisQueryCache
+from src.schemas.query import PersonLookupParams, DeviceLookupParams, TimelineParams, SimilaritySearchParams
 
 log = structlog.get_logger()
 
@@ -40,7 +41,8 @@ class QueryExecutor:
         return await handler(params)
 
     async def _person_lookup(self, params: dict) -> dict:
-        pid = params["person_id"]
+        parsed = PersonLookupParams(**params)
+        pid = parsed.person_id
         # Check cache first
         cached = await self.redis.get_person(pid)
         if cached:
@@ -77,19 +79,23 @@ class QueryExecutor:
         return {"items": items, "total": total, "page": page, "page_size": page_size}
 
     async def _timeline(self, params: dict) -> dict:
+        parsed = TimelineParams(**params)
+
         items, total = await self.mongo.get_timeline(
-            person_id=params["person_id"],
-            start_time=params.get("start_time"),
-            end_time=params.get("end_time"),
-            event_types=params.get("event_types"),
+            person_id=parsed.person_id,
+            start_time=parsed.start_time,
+            end_time=parsed.end_time,
+            event_types=parsed.event_types,
         )
         return {"items": items, "total": total}
 
     async def _similarity_search(self, params: dict) -> dict:
+        parsed = SimilaritySearchParams(**params)
+
         results = self.qdrant.search_similar(
-            person_id=params["person_id"],
-            top_k=params.get("top_k", 10),
-            min_score=params.get("min_score", 0.5),
+            person_id=parsed.person_id,
+            top_k=parsed.top_k,
+            min_score=parsed.min_score,
         )
         return {"similar_persons": results}
 
@@ -104,7 +110,8 @@ class QueryExecutor:
         return {"aggregation": results}
 
     async def _device_lookup(self, params: dict) -> dict:
-        device_id = params.get("device_id")
+        parsed = DeviceLookupParams(**params)
+        device_id = parsed.device_id
         if device_id:
             device = await self.mongo.get_device(device_id)
             return {"device": device} if device else {"error": f"Device {device_id} not found"}
