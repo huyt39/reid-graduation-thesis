@@ -70,3 +70,4 @@ services:
     env_file: ../query_service/.env.example
     depends_on: [mongo, qdrant, redis]
     ports: ["8090:8090"]
+
