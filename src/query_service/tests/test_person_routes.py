@@ -139,6 +139,29 @@ async def test_aggregate_stats_route_calls_mongo_with_query_params(monkeypatch):
         group_by="device",
     )
 
+
+@pytest.mark.asyncio
+async def test_get_stats_route_returns_mongo_stats(monkeypatch):
+    mongo = AsyncMock()
+    mongo.get_stats.return_value = {
+        "total_persons": 5,
+        "active_persons": 3,
+        "total_sightings": 12,
+        "total_devices": 2,
+    }
+
+    monkeypatch.setattr(stats_routes, "get_mongo", lambda: mongo)
+
+    result = await stats_routes.get_stats()
+
+    assert result == {
+        "total_persons": 5,
+        "active_persons": 3,
+        "total_sightings": 12,
+        "total_devices": 2,
+    }
+    mongo.get_stats.assert_awaited_once()
+
     assert result == {"aggregation": [{"_id": "cam_01", "count": 3}]}
     mongo.aggregate_sightings.assert_awaited_once_with(
         person_id=7,

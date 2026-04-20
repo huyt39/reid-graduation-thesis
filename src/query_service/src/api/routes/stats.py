@@ -1,8 +1,8 @@
 from __future__ import annotations
-
+from typing import Literal
 from datetime import datetime
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter
 
 from src.api.deps import get_mongo
 
@@ -21,7 +21,7 @@ async def aggregate_stats(
     device_id: str | None = None,
     start_time: datetime | None = None,
     end_time: datetime | None = None,
-    group_by: str = Query("hour", pattern="^(hour|day|device)$"),
+    group_by: Literal["hour", "day", "device"] = "hour",
 ):
     mongo = get_mongo()
     aggregation = await mongo.aggregate_sightings(
