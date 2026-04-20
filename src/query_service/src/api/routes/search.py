@@ -12,7 +12,7 @@ router = APIRouter(tags=["search"])
 async def structured_search(query: StructuredQueryRequest):
     """Execute a structured JSON query."""
     executor = get_executor()
-    return await executor.execute(query.model_dump())
+    return await executor.execute(query)
 
 
 @router.post("/query/natural")

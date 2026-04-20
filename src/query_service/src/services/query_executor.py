@@ -6,7 +6,16 @@ import structlog
 from src.db.mongo_client import MongoQueryClient
 from src.db.qdrant_client import QdrantQueryClient
 from src.db.redis_client import RedisQueryCache
-from src.schemas.query import PersonLookupParams, DeviceLookupParams, TimelineParams, SimilaritySearchParams, PersonSearchParams, SightingAggregationParams
+from src.schemas.query import (
+    PersonLookupParams,
+    DeviceLookupParams,
+    TimelineParams,
+    SimilaritySearchParams,
+    PersonSearchParams,
+    SightingAggregationParams,
+    StructuredQueryRequest,
+    )
+
 
 log = structlog.get_logger()
 
@@ -22,7 +31,12 @@ class QueryExecutor:
         self.qdrant = qdrant
         self.redis = redis_cache
 
-    async def execute(self, query: dict) -> dict:
+    async def execute(self, query: dict | StructuredQueryRequest) -> dict:
+        if isinstance(query, StructuredQueryRequest):
+            payload = query.model_dump()
+        else:
+            payload = query
+            
         qt = query.get("query_type", "error")
         params = query.get("params", {})
 

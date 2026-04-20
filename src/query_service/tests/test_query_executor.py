@@ -1,13 +1,13 @@
 """Tests for QueryExecutor with mocked DB clients."""
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 from pydantic import ValidationError
 
 from src.services.query_executor import QueryExecutor
-from src.schemas.query import StructuredQueryRequest
+from src.schemas.query import SightingAggregationParams, StructuredQueryRequest
 
 
 @pytest.fixture
@@ -49,6 +49,18 @@ async def test_person_lookup(executor, mongo):
 
 
 @pytest.mark.asyncio
+async def test_execute_accepts_structured_query_request(executor):
+    query = StructuredQueryRequest(
+        query_type="person_lookup",
+        params={"person_id": 1},
+    )
+
+    result = await executor.execute(query)
+
+    assert result["person"]["person_id"] == 1
+
+
+@pytest.mark.asyncio
 async def test_person_lookup_uses_cache(executor, redis_cache, mongo):
     redis_cache.get_person.return_value = {"person_id": 1, "attributes": {"gender": "male"}}
     result = await executor.execute({"query_type": "person_lookup", "params": {"person_id": 1}})
@@ -67,6 +79,47 @@ async def test_person_search(executor, mongo):
 
 
 @pytest.mark.asyncio
+async def test_person_search_builds_filters_and_pagination():
+    mongo = AsyncMock()
+    qdrant = MagicMock()
+    redis_cache = AsyncMock()
+
+    mongo.search_persons = AsyncMock(return_value=([{"person_id": 1}], 1))
+
+    executor = QueryExecutor(mongo, qdrant, redis_cache)
+
+    result = await executor.execute({
+        "query_type": "person_search",
+        "params": {
+            "filters": {
+                "gender": "male",
+                "gender_confidence_min": 0.8,
+                "last_seen_device": "cam_01",
+                "is_active": True,
+            },
+            "page": 2,
+            "page_size": 10,
+        },
+    })
+
+    assert result["items"] == [{"person_id": 1}]
+    assert result["total"] == 1
+    assert result["page"] == 2
+    assert result["page_size"] == 10
+
+    mongo.search_persons.assert_awaited_once_with(
+        filters={
+            "attributes.gender": "male",
+            "attributes.gender_confidence": {"$gte": 0.8},
+            "stats.last_seen_device": "cam_01",
+            "is_active": True,
+        },
+        skip=10,
+        limit=10,
+    )
+
+
+@pytest.mark.asyncio
 async def test_similarity_search(executor, qdrant):
     result = await executor.execute({
         "query_type": "similarity_search",
@@ -74,6 +127,38 @@ async def test_similarity_search(executor, qdrant):
     })
     assert len(result["similar_persons"]) == 1
     qdrant.search_similar.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_sighting_aggregation_uses_typed_params():
+    mongo = AsyncMock()
+    qdrant = MagicMock()
+    redis_cache = AsyncMock()
+
+    mongo.aggregate_sightings = AsyncMock(return_value=[{"bucket": "2026-04-20T10:00:00Z", "count": 3}])
+
+    executor = QueryExecutor(mongo, qdrant, redis_cache)
+
+    result = await executor.execute({
+        "query_type": "sighting_aggregation",
+        "params": {
+            "person_id": 7,
+            "device_id": "cam_01",
+            "start_time": "2026-04-20T10:00:00Z",
+            "end_time": "2026-04-20T11:00:00Z",
+            "group_by": "hour",
+        },
+    })
+
+    assert result["aggregation"] == [{"bucket": "2026-04-20T10:00:00Z", "count": 3}]
+
+    mongo.aggregate_sightings.assert_awaited_once_with(
+        person_id=7,
+        device_id="cam_01",
+        start_time=ANY,
+        end_time=ANY,
+        group_by="hour",
+    )
 
 
 @pytest.mark.asyncio
@@ -101,3 +186,8 @@ async def test_unknown_query_type(executor):
 def test_structured_query_request_rejects_unknown_query_type():
     with pytest.raises(ValidationError):
         StructuredQueryRequest(query_type="invalid_type", params={})
+
+
+def test_sighting_aggregation_params_reject_invalid_group_by():
+    with pytest.raises(ValidationError):
+        SightingAggregationParams(group_by="month")

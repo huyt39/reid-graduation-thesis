@@ -4,10 +4,10 @@ from __future__ import annotations
 from datetime import datetime
 
 from pydantic import BaseModel, Field
-from typing import Literal
+from typing import Literal, Any
 
 
-# Requests 
+# Requests
 
 class NLQueryRequest(BaseModel):
     query: str
@@ -22,7 +22,7 @@ class StructuredQueryRequest(BaseModel):
         "sighting_aggregation",
         "device_lookup",
     ]
-    params: dict = Field(default_factory=dict)
+    params: dict[str, Any] = Field(default_factory=dict)
 
 
 class PersonLookupParams(BaseModel):
@@ -38,6 +38,7 @@ class TimelineParams(BaseModel):
     start_time: datetime | None = None
     end_time: datetime | None = None
     event_types: list[str] | None = None
+    
 
 class SimilaritySearchParams(BaseModel):
     person_id: int
