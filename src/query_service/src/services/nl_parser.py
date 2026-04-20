@@ -4,9 +4,8 @@ Calls vLLM for parsing when available, falls back to regex keyword matching.
 """
 from __future__ import annotations
 
-import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import httpx
 import structlog
@@ -40,7 +39,10 @@ class NLQueryParser:
             resp.raise_for_status()
             result = resp.json()
             if result.get("query_type") in VALID_QUERY_TYPES:
-                return result
+                params = result.get("params", {})
+                if isinstance(params, dict):
+                    return result
+                return {"query_type": "error", "message": "Invalid params shape from vLLM"}
             return {"query_type": "error", "message": "Unknown query type from vLLM"}
 
     @staticmethod
@@ -75,7 +77,15 @@ class NLQueryParser:
             return {"query_type": "person_lookup", "params": {"person_id": pid}}
 
         # Device lookup
-        if any(kw in q for kw in ["camera", "device", "devices", "cameras"]):
+        if any(
+            phrase in q for phrase in [
+                "list cameras",
+                "list devices",
+                "show devices",
+                "show cameras",
+                "all devices",
+                "all cameras",
+                ]):
             return {"query_type": "device_lookup", "params": {}}
 
         # Person search with filters

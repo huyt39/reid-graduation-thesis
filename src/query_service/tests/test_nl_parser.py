@@ -1,4 +1,6 @@
 """Tests for the NL query parser fallback keyword matching."""
+import httpx
+
 import pytest
 
 from src.services.nl_parser import NLQueryParser
@@ -45,6 +47,11 @@ def test_device_lookup(parser):
     assert r["query_type"] == "device_lookup"
 
 
+def test_camera_keyword_alone_does_not_trigger_device_lookup(parser):
+    r = parser._fallback_keyword_parse("camera")
+    assert r["query_type"] == "error"
+
+
 def test_gender_search(parser):
     r = parser._fallback_keyword_parse("find all males seen today")
     assert r["query_type"] == "person_search"
@@ -54,3 +61,40 @@ def test_gender_search(parser):
 def test_unparseable_returns_error(parser):
     r = parser._fallback_keyword_parse("what is the weather?")
     assert r["query_type"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_parse_via_vllm_rejects_non_dict_params():
+    parser = NLQueryParser(vllm_url="http://fake-vllm")
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "query_type": "person_lookup",
+                "params": ["not", "a", "dict"],
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, json):
+            return FakeResponse()
+
+    original_client = httpx.AsyncClient
+    httpx.AsyncClient = lambda *args, **kwargs: FakeClient()
+    try:
+        result = await parser._parse_via_vllm("person 7")
+    finally:
+        httpx.AsyncClient = original_client
+
+    assert result == {
+        "query_type": "error",
+        "message": "Invalid params shape from vLLM",
+    }
