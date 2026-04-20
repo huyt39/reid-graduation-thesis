@@ -20,6 +20,11 @@ async def natural_language_query(body: NLQueryRequest):
     """Parse natural language query and execute it."""
     parser = get_nl_parser()
     executor = get_executor()
+
     parsed = await parser.parse(body.query)
-    result = await executor.execute(parsed)
-    return {"parsed_query": parsed, "result": result}
+    if parsed.get("query_type") == "error":
+        return {"parsed_query": parsed, "result": parsed}
+
+    structured = StructuredQueryRequest(**parsed)
+    result = await executor.execute(structured)
+    return {"parsed_query": structured.model_dump(), "result": result}
