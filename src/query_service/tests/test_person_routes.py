@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from src.api import deps
 from src.api.routes import persons as persons_routes
 from src.api.routes import search as search_routes
+from src.api.routes import stats as stats_routes
 
 
 @pytest.mark.asyncio
@@ -121,3 +122,28 @@ async def test_natural_language_query_returns_validation_error_result(monkeypatc
     assert result["result"]["message"] == "Parsed query failed validation"
     assert "details" in result["result"]
     executor.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_stats_route_calls_mongo_with_query_params(monkeypatch):
+    mongo = AsyncMock()
+    mongo.aggregate_sightings.return_value = [{"_id": "cam_01", "count": 3}]
+
+    monkeypatch.setattr(stats_routes, "get_mongo", lambda: mongo)
+
+    result = await stats_routes.aggregate_stats(
+        person_id=7,
+        device_id="cam_01",
+        start_time=None,
+        end_time=None,
+        group_by="device",
+    )
+
+    assert result == {"aggregation": [{"_id": "cam_01", "count": 3}]}
+    mongo.aggregate_sightings.assert_awaited_once_with(
+        person_id=7,
+        device_id="cam_01",
+        start_time=None,
+        end_time=None,
+        group_by="device",
+    )
