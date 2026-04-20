@@ -6,7 +6,7 @@ import structlog
 from src.db.mongo_client import MongoQueryClient
 from src.db.qdrant_client import QdrantQueryClient
 from src.db.redis_client import RedisQueryCache
-from src.schemas.query import PersonLookupParams, DeviceLookupParams, TimelineParams, SimilaritySearchParams
+from src.schemas.query import PersonLookupParams, DeviceLookupParams, TimelineParams, SimilaritySearchParams, PersonSearchParams, SightingAggregationParams
 
 log = structlog.get_logger()
 
@@ -54,29 +54,28 @@ class QueryExecutor:
         return {"person": person}
 
     async def _person_search(self, params: dict) -> dict:
-        filters = params.get("filters", {})
+        parsed = PersonSearchParams(**params)
+        filters = parsed.filters
         mongo_query: dict = {}
-        if filters.get("gender"):
-            mongo_query["attributes.gender"] = filters["gender"]
-        if filters.get("gender_confidence_min"):
-            mongo_query["attributes.gender_confidence"] = {"$gte": filters["gender_confidence_min"]}
-        if filters.get("last_seen_device"):
-            mongo_query["stats.last_seen_device"] = filters["last_seen_device"]
-        if filters.get("last_seen_after"):
-            mongo_query.setdefault("stats.last_seen_at", {})["$gte"] = filters["last_seen_after"]
-        if filters.get("last_seen_before"):
-            mongo_query.setdefault("stats.last_seen_at", {})["$lte"] = filters["last_seen_before"]
-        if filters.get("is_active") is not None:
-            mongo_query["is_active"] = filters["is_active"]
+        if filters.gender:
+            mongo_query["attributes.gender"] = filters.gender
+        if filters.gender_confidence_min is not None:
+            mongo_query["attributes.gender_confidence"] = {"$gte": filters.gender_confidence_min}
+        if filters.last_seen_device:
+            mongo_query["stats.last_seen_device"] = filters.last_seen_device
+        if filters.last_seen_after:
+            mongo_query.setdefault("stats.last_seen_at", {})["$gte"] = filters.last_seen_after
+        if filters.last_seen_before:
+            mongo_query.setdefault("stats.last_seen_at", {})["$lte"] = filters.last_seen_before
+        if filters.is_active is not None:
+            mongo_query["is_active"] = filters.is_active
 
-        page = params.get("page", 1)
-        page_size = params.get("page_size", 20)
-        skip = (page - 1) * page_size
+        skip = (parsed.page - 1) * parsed.page_size
 
         items, total = await self.mongo.search_persons(
-            filters=mongo_query, skip=skip, limit=page_size,
+            filters=mongo_query, skip=skip, limit=parsed.page_size,
         )
-        return {"items": items, "total": total, "page": page, "page_size": page_size}
+        return {"items": items, "total": total, "page": parsed.page, "page_size": parsed.page_size}
 
     async def _timeline(self, params: dict) -> dict:
         parsed = TimelineParams(**params)
@@ -100,12 +99,13 @@ class QueryExecutor:
         return {"similar_persons": results}
 
     async def _sighting_aggregation(self, params: dict) -> dict:
+        parsed = SightingAggregationParams(**params)
         results = await self.mongo.aggregate_sightings(
-            person_id=params.get("person_id"),
-            device_id=params.get("device_id"),
-            start_time=params.get("start_time"),
-            end_time=params.get("end_time"),
-            group_by=params.get("group_by", "hour"),
+            person_id=parsed.person_id,
+            device_id=parsed.device_id,
+            start_time=parsed.start_time,
+            end_time=parsed.end_time,
+            group_by=parsed.group_by,
         )
         return {"aggregation": results}
 

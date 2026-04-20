@@ -45,6 +45,14 @@ class SimilaritySearchParams(BaseModel):
     min_score: float = 0.5
 
 
+class SightingAggregationParams(BaseModel):
+    person_id: int | None = None
+    device_id: str | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    group_by: Literal["hour", "day", "device"] = "hour"
+
+
 class PersonSearchFilters(BaseModel):
     gender: str | None = None
     gender_confidence_min: float | None = None
@@ -52,6 +60,12 @@ class PersonSearchFilters(BaseModel):
     last_seen_after: datetime | None = None
     last_seen_before: datetime | None = None
     is_active: bool | None = None
+
+
+class PersonSearchParams(BaseModel):
+    filters: PersonSearchFilters = PersonSearchFilters()
+    page: int = Field(1, ge=1)
+    page_size: int = Field(20, ge=1, le=100)
 
 
 class Pagination(BaseModel):
