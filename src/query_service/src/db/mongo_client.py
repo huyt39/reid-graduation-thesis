@@ -12,7 +12,7 @@ class MongoQueryClient:
         self._client = AsyncIOMotorClient(uri)
         self._db = self._client[db_name]
 
-    # ── Persons ───────────────────────────────────────────────────────
+    # Persons
 
     async def get_person(self, person_id: int) -> dict | None:
         return await self._db.persons.find_one({"person_id": person_id}, {"_id": 0})
@@ -36,7 +36,7 @@ class MongoQueryClient:
         items = await cursor.to_list(length=limit)
         return items, total
 
-    # ── Sightings ─────────────────────────────────────────────────────
+    # Sightings
 
     async def get_sightings(
         self,
@@ -65,7 +65,7 @@ class MongoQueryClient:
         items = await cursor.to_list(length=limit)
         return items, total
 
-    # ── Timeline ──────────────────────────────────────────────────────
+    # Timeline
 
     async def get_timeline(
         self,
@@ -97,7 +97,7 @@ class MongoQueryClient:
         items = await cursor.to_list(length=limit)
         return items, total
 
-    # ── Devices ───────────────────────────────────────────────────────
+    # Devices
 
     async def get_device(self, device_id: str) -> dict | None:
         doc = await self._db.devices.find_one({"device_id": device_id}, {"_id": 0})
@@ -135,34 +135,41 @@ class MongoQueryClient:
             return registered
 
         pipeline = [
-            {"$group": {
-            "_id": "$device_id",
-            "sighting_count": {"$sum": 1},
-            "last_seen_at": {"$max": "$started_at"},
-            "unique_persons": {"$addToSet": "$person_id"},
-        }},
-        {"$sort": {"last_seen_at": -1}},
+            {
+                "$group": {
+                    "_id": "$device_id",
+                    "sighting_count": {"$sum": 1},
+                    "last_seen_at": {"$max": "$started_at"},
+                    "unique_persons": {"$addToSet": "$person_id"},
+                }
+            },
+            {"$sort": {"last_seen_at": -1}},
         ]
         cursor = self._db.sightings.aggregate(pipeline)
         rows = await cursor.to_list(length=100)
 
         return [
             {
-            "device_id": r["_id"],
-            "sighting_count": r["sighting_count"],
-            "unique_person_count": len(r["unique_persons"]),
-            "last_seen_at": r["last_seen_at"],
+                "device_id": row["_id"],
+                "sighting_count": row["sighting_count"],
+                "unique_person_count": len(row["unique_persons"]),
+                "last_seen_at": row["last_seen_at"],
             }
-            for r in rows
+            for row in rows
         ]
 
-    # ── Stats ─────────────────────────────────────────────────────────
+    # Stats
 
     async def get_stats(self) -> dict:
         total_persons = await self._db.persons.count_documents({})
         active_persons = await self._db.persons.count_documents({"is_active": True})
         total_sightings = await self._db.sightings.count_documents({})
+
         total_devices = await self._db.devices.count_documents({})
+        if total_devices == 0:
+            device_ids = await self._db.sightings.distinct("device_id")
+            total_devices = len(device_ids)
+
         return {
             "total_persons": total_persons,
             "active_persons": active_persons,
@@ -170,7 +177,7 @@ class MongoQueryClient:
             "total_devices": total_devices,
         }
 
-    # ── Aggregation ───────────────────────────────────────────────────
+    # Aggregation
 
     async def aggregate_sightings(
         self,
