@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from src.api.deps import get_executor, get_nl_parser
 from src.schemas.query import NLQueryRequest, StructuredQueryRequest
+from pydantic import ValidationError
 
 router = APIRouter(tags=["search"])
 
@@ -25,6 +26,15 @@ async def natural_language_query(body: NLQueryRequest):
     if parsed.get("query_type") == "error":
         return {"parsed_query": parsed, "result": parsed}
 
-    structured = StructuredQueryRequest(**parsed)
+    try:
+        structured = StructuredQueryRequest(**parsed)
+    except ValidationError as exc:
+        error = {
+            "query_type": "error",
+            "message": "Parsed query failed validation",
+            "details": exc.errors(),
+        }
+        return {"parsed_query": parsed, "result": error}
+
     result = await executor.execute(structured)
     return {"parsed_query": structured.model_dump(), "result": result}
