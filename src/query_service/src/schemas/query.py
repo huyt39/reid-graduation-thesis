@@ -63,7 +63,7 @@ class PersonSearchFilters(BaseModel):
 
 
 class PersonSearchParams(BaseModel):
-    filters: PersonSearchFilters = PersonSearchFilters()
+    filters: PersonSearchFilters = Field(default_factory=PersonSearchFilters)
     page: int = Field(1, ge=1)
     page_size: int = Field(20, ge=1, le=100)
 
@@ -94,8 +94,8 @@ class PersonStats(BaseModel):
 
 class PersonResponse(BaseModel):
     person_id: int
-    attributes: PersonAttributes = PersonAttributes()
-    stats: PersonStats = PersonStats()
+    attributes: PersonAttributes = Field(default_factory=PersonAttributes)
+    stats: PersonStats = Field(default_factory=PersonStats)
     snapshot_url: str | None = None
     source: str = ""
     is_active: bool = True
@@ -110,7 +110,7 @@ class SightingResponse(BaseModel):
     duration_seconds: float = 0.0
     quality_score: float = 0.0
     snapshot_url: str | None = None
-    attributes: PersonAttributes = PersonAttributes()
+    attributes: PersonAttributes = Field(default_factory=PersonAttributes)
 
 
 class TimelineEvent(BaseModel):
@@ -118,7 +118,7 @@ class TimelineEvent(BaseModel):
     event_type: str
     timestamp: datetime
     device_id: str = ""
-    details: dict = {}
+    details: dict = Field(default_factory=dict)
 
 
 class DeviceResponse(BaseModel):
@@ -139,11 +139,11 @@ class StatsResponse(BaseModel):
 class SimilarPersonResult(BaseModel):
     person_id: int
     score: float
-    attributes: PersonAttributes = PersonAttributes()
+    attributes: PersonAttributes = Field(default_factory=PersonAttributes)
 
 
 class PaginatedResponse(BaseModel):
-    items: list = []
+    items: list = Field(default_factory=list)
     total: int = 0
     page: int = 1
     page_size: int = 20
