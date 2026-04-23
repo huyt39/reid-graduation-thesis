@@ -6,7 +6,11 @@ from fastapi import APIRouter, Query
 
 from src.api.deps import get_mongo, get_redis
 
-from src.schemas.query import PersonResponse, PaginatedPersonsResponse
+from src.schemas.query import (
+    PersonResponse,
+    PaginatedPersonsResponse,
+    PaginatedSightingsResponse,
+    )
 
 router = APIRouter(prefix="/persons", tags=["persons"])
 
@@ -53,7 +57,7 @@ async def get_person(person_id: int):
     return person
 
 
-@router.get("/{person_id}/sightings")
+@router.get("/{person_id}/sightings", response_model = PaginatedSightingsResponse)
 async def get_sightings(
     person_id: int,
     start_time: datetime | None = None,
