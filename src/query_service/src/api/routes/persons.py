@@ -6,10 +6,12 @@ from fastapi import APIRouter, Query
 
 from src.api.deps import get_mongo, get_redis
 
+from src.schemas.query import PersonResponse, PaginatedResponse
+
 router = APIRouter(prefix="/persons", tags=["persons"])
 
 
-@router.get("")
+@router.get("", response_model = PaginatedResponse)
 async def list_persons(
     gender: str | None = None,
     device: str | None = None,
@@ -32,7 +34,7 @@ async def list_persons(
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
-@router.get("/{person_id}")
+@router.get("/{person_id}", response_model = PersonResponse)
 async def get_person(person_id: int):
     from fastapi import HTTPException
 
