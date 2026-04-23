@@ -75,7 +75,10 @@ class WorkerPipeline:
         # Persistence
         self.mongo = MongoPersonStore(uri=self.settings.mongo_uri, db_name=self.settings.mongo_db)
         self.redis_cache = RedisPersonCache(url=self.settings.redis_url)
-        self.person_id_allocator = RedisPersonIdAllocator(url=self.settings.redis_url)
+        self.person_id_allocator = RedisPersonIdAllocator(
+            url=self.settings.redis_url,
+            key=self.settings.person_id_seq_key,
+        )
         self.minio = MinIOSnapshotStore(
             endpoint=self.settings.minio_endpoint,
             access_key=self.settings.minio_access_key,

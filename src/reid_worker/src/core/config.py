@@ -54,6 +54,7 @@ class Settings(BaseSettings):
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
+    person_id_seq_key: str = "reid:seq:person_id"
 
     # MinIO
     minio_endpoint: str = "localhost:9000"
