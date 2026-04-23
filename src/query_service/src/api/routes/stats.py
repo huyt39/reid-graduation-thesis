@@ -3,7 +3,7 @@ from typing import Literal
 from datetime import datetime
 
 from fastapi import APIRouter
-from src.schemas.query import StatsResponse
+from src.schemas.query import StatsResponse, AggregationResponse
 from src.api.deps import get_mongo
 
 router = APIRouter(tags=["stats"])
@@ -15,7 +15,7 @@ async def get_stats():
     return await mongo.get_stats()
 
 
-@router.get("/stats/aggregate")
+@router.get("/stats/aggregate", response_model = AggregationResponse)
 async def aggregate_stats(
     person_id: int | None = None,
     device_id: str | None = None,

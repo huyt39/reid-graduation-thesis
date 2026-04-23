@@ -148,3 +148,7 @@ class PaginatedResponse(BaseModel):
     total: int = 0
     page: int = 1
     page_size: int = 20
+
+
+class AggregationResponse(BaseModel):
+    aggregation: list[dict] = Field(default_factory=list)

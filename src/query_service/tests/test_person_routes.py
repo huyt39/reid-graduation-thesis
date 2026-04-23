@@ -185,3 +185,11 @@ async def test_get_device_route_raises_404_for_missing_device(monkeypatch):
         end_time=None,
         group_by="device",
     )
+
+
+def test_aggregation_response_defaults_to_empty_list():
+    from src.schemas.query import AggregationResponse
+
+    response = AggregationResponse()
+
+    assert response.aggregation == []
