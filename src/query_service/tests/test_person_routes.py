@@ -6,6 +6,7 @@ import pytest
 from fastapi import HTTPException
 
 from src.api import deps
+from src.api.routes import devices as devices_routes
 from src.api.routes import persons as persons_routes
 from src.api.routes import search as search_routes
 from src.api.routes import stats as stats_routes
@@ -139,6 +140,15 @@ async def test_aggregate_stats_route_calls_mongo_with_query_params(monkeypatch):
         group_by="device",
     )
 
+    assert result == {"aggregation": [{"_id": "cam_01", "count": 3}]}
+    mongo.aggregate_sightings.assert_awaited_once_with(
+        person_id=7,
+        device_id="cam_01",
+        start_time=None,
+        end_time=None,
+        group_by="device",
+    )
+
 
 @pytest.mark.asyncio
 async def test_get_stats_route_returns_mongo_stats(monkeypatch):
@@ -165,8 +175,6 @@ async def test_get_stats_route_returns_mongo_stats(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_device_route_raises_404_for_missing_device(monkeypatch):
-    from src.api.routes import devices as devices_routes
-
     mongo = AsyncMock()
     mongo.get_device.return_value = None
 
@@ -177,19 +185,39 @@ async def test_get_device_route_raises_404_for_missing_device(monkeypatch):
 
     assert exc.value.status_code == 404
 
-    assert result == {"aggregation": [{"_id": "cam_01", "count": 3}]}
-    mongo.aggregate_sightings.assert_awaited_once_with(
-        person_id=7,
-        device_id="cam_01",
-        start_time=None,
-        end_time=None,
-        group_by="device",
-    )
+
+@pytest.mark.asyncio
+async def test_list_devices_route_returns_devices_wrapper(monkeypatch):
+    mongo = AsyncMock()
+    mongo.list_devices.return_value = [
+        {
+            "device_id": "cam_01",
+            "sighting_count": 4,
+            "unique_person_count": 2,
+        }
+    ]
+
+    monkeypatch.setattr(devices_routes, "get_mongo", lambda: mongo)
+
+    result = await devices_routes.list_devices()
+
+    assert result == {
+        "devices": [
+            {
+                "device_id": "cam_01",
+                "sighting_count": 4,
+                "unique_person_count": 2,
+            }
+        ]
+    }
+    mongo.list_devices.assert_awaited_once()
 
 
 def test_aggregation_response_defaults_to_empty_list():
-    from src.schemas.query import AggregationResponse
+    from src.schemas.query import AggregationResponse, DevicesListResponse
 
     response = AggregationResponse()
+    devices = DevicesListResponse()
 
     assert response.aggregation == []
+    assert devices.devices == []

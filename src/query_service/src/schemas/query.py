@@ -128,6 +128,10 @@ class DeviceResponse(BaseModel):
     location: str = ""
     status: str = "unknown"
     last_frame_at: datetime | None = None
+    first_seen_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    sighting_count: int = 0
+    unique_person_count: int = 0
 
 
 class StatsResponse(BaseModel):
@@ -183,3 +187,7 @@ class SimilarPersonsResponse(BaseModel):
 
 class AggregationResponse(BaseModel):
     aggregation: list[dict] = Field(default_factory=list)
+
+
+class DevicesListResponse(BaseModel):
+    devices: list[DeviceResponse] = Field(default_factory=list)
