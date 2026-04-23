@@ -4,10 +4,14 @@ from __future__ import annotations
 from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from src.services.query_executor import QueryExecutor
-from src.schemas.query import SightingAggregationParams, StructuredQueryRequest
+from src.schemas.query import (
+    PersonLookupQuery,
+    SightingAggregationParams,
+    StructuredSearchQuery,
+)
 
 
 @pytest.fixture
@@ -50,10 +54,7 @@ async def test_person_lookup(executor, mongo):
 
 @pytest.mark.asyncio
 async def test_execute_accepts_structured_query_request(executor):
-    query = StructuredQueryRequest(
-        query_type="person_lookup",
-        params={"person_id": 1},
-    )
+    query = PersonLookupQuery(query_type="person_lookup", params={"person_id": 1})
 
     result = await executor.execute(query)
 
@@ -184,8 +185,18 @@ async def test_unknown_query_type(executor):
 
 
 def test_structured_query_request_rejects_unknown_query_type():
+    adapter = TypeAdapter(StructuredSearchQuery)
     with pytest.raises(ValidationError):
-        StructuredQueryRequest(query_type="invalid_type", params={})
+        adapter.validate_python({"query_type": "invalid_type", "params": {}})
+
+
+def test_structured_query_request_rejects_wrong_param_shape():
+    adapter = TypeAdapter(StructuredSearchQuery)
+    with pytest.raises(ValidationError):
+        adapter.validate_python({
+            "query_type": "person_lookup",
+            "params": {"device_id": "cam-1"},
+        })
 
 
 def test_sighting_aggregation_params_reject_invalid_group_by():

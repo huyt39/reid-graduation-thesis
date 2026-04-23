@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
-from typing import Literal, Any
 
 
 # Requests
@@ -14,15 +14,8 @@ class NLQueryRequest(BaseModel):
 
 
 class StructuredQueryRequest(BaseModel):
-    query_type: Literal[
-        "person_lookup",
-        "person_search",
-        "timeline",
-        "similarity_search",
-        "sighting_aggregation",
-        "device_lookup",
-    ]
-    params: dict[str, Any] = Field(default_factory=dict)
+    query_type: str
+    params: Any = Field(default_factory=dict)
 
 
 class PersonLookupParams(BaseModel):
@@ -67,6 +60,47 @@ class PersonSearchParams(BaseModel):
     filters: PersonSearchFilters = Field(default_factory=PersonSearchFilters)
     page: int = Field(1, ge=1)
     page_size: int = Field(20, ge=1, le=100)
+
+
+class PersonLookupQuery(StructuredQueryRequest):
+    query_type: Literal["person_lookup"]
+    params: PersonLookupParams
+
+
+class PersonSearchQuery(StructuredQueryRequest):
+    query_type: Literal["person_search"]
+    params: PersonSearchParams
+
+
+class TimelineQuery(StructuredQueryRequest):
+    query_type: Literal["timeline"]
+    params: TimelineParams
+
+
+class SimilaritySearchQuery(StructuredQueryRequest):
+    query_type: Literal["similarity_search"]
+    params: SimilaritySearchParams
+
+
+class SightingAggregationQuery(StructuredQueryRequest):
+    query_type: Literal["sighting_aggregation"]
+    params: SightingAggregationParams
+
+
+class DeviceLookupQuery(StructuredQueryRequest):
+    query_type: Literal["device_lookup"]
+    params: DeviceLookupParams
+
+
+StructuredSearchQuery = Annotated[
+    PersonLookupQuery
+    | PersonSearchQuery
+    | TimelineQuery
+    | SimilaritySearchQuery
+    | SightingAggregationQuery
+    | DeviceLookupQuery,
+    Field(discriminator="query_type"),
+]
 
 
 class Pagination(BaseModel):

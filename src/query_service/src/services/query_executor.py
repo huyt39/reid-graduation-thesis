@@ -7,14 +7,14 @@ from src.db.mongo_client import MongoQueryClient
 from src.db.qdrant_client import QdrantQueryClient
 from src.db.redis_client import RedisQueryCache
 from src.schemas.query import (
-    PersonLookupParams,
     DeviceLookupParams,
-    TimelineParams,
-    SimilaritySearchParams,
+    PersonLookupParams,
     PersonSearchParams,
     SightingAggregationParams,
+    SimilaritySearchParams,
     StructuredQueryRequest,
-    )
+    TimelineParams,
+)
 
 
 log = structlog.get_logger()
@@ -36,9 +36,9 @@ class QueryExecutor:
             payload = query.model_dump()
         else:
             payload = query
-            
-        qt = query.get("query_type", "error")
-        params = query.get("params", {})
+
+        qt = payload.get("query_type", "error")
+        params = payload.get("params", {})
 
         handler = {
             "person_lookup": self._person_lookup,
@@ -50,7 +50,7 @@ class QueryExecutor:
         }.get(qt)
 
         if handler is None:
-            return {"error": query.get("message", f"Unknown query type: {qt}")}
+            return {"error": payload.get("message", f"Unknown query type: {qt}")}
 
         return await handler(params)
 
