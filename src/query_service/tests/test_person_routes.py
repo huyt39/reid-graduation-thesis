@@ -162,6 +162,21 @@ async def test_get_stats_route_returns_mongo_stats(monkeypatch):
     }
     mongo.get_stats.assert_awaited_once()
 
+
+@pytest.mark.asyncio
+async def test_get_device_route_raises_404_for_missing_device(monkeypatch):
+    from src.api.routes import devices as devices_routes
+
+    mongo = AsyncMock()
+    mongo.get_device.return_value = None
+
+    monkeypatch.setattr(devices_routes, "get_mongo", lambda: mongo)
+
+    with pytest.raises(HTTPException) as exc:
+        await devices_routes.get_device("cam_404")
+
+    assert exc.value.status_code == 404
+
     assert result == {"aggregation": [{"_id": "cam_01", "count": 3}]}
     mongo.aggregate_sightings.assert_awaited_once_with(
         person_id=7,
