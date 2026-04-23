@@ -17,7 +17,7 @@ from src.embedding.client import ModelServiceClient
 from src.kafka.consumer import WorkerKafkaConsumer
 from src.kafka.producer import WorkerKafkaProducer
 from src.matching.qdrant_store import QdrantPersonStore
-from src.matching.reid_matcher import ReIDMatcher
+from src.matching.reid_matcher import ReIDMatcher, PersonIdAllocationError
 from src.persistence.minio_store import MinIOSnapshotStore
 from src.persistence.mongo_store import MongoPersonStore
 from src.persistence.redis_cache import RedisPersonCache, RedisPersonIdAllocator
@@ -325,13 +325,19 @@ class WorkerPipeline:
         # Resolve tracklet-level gender
         t_gender, t_gender_conf = self.gender_voter.resolve_tracklet(tracklet.track_id)
 
-        person_id = self.matcher.match_tracklet(
-            track_id=tracklet.track_id,
-            embedding=tracklet_embedding,
-            v_avg=v_avg,
-            embedding_consistency=emb_consistency,
-            tracklet_len=len(tracklet.entries),
-        )
+        try:
+            person_id = self.matcher.match_tracklet(
+                track_id=tracklet.track_id,
+                embedding=tracklet_embedding,
+                v_avg=v_avg,
+                embedding_consistency=emb_consistency,
+                tracklet_len=len(tracklet.entries),
+            )
+        except PersonIdAllocationError:
+            log.error("person_id_allocation_failed", track_id=tracklet.track_id, exc_info=True)
+            self.tracklet_buffer.remove(tracklet.track_id)
+            return
+
 
         tracklet_id = str(uuid.uuid4())
 

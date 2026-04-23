@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from src.attributes.gender_voter import GenderVoter
+from src.matching.reid_matcher import PersonIdAllocationError
 from src.tracklet.models import Tracklet, TrackletEntry, TrackletState
 from src.workers.main import WorkerPipeline
 
@@ -227,4 +228,68 @@ def test_process_tracklet_with_no_embeddings_returns_without_match_or_persist(mo
     assert pipeline.track_id_to_person_id == {}
     assert pipeline.track_metadata == {}
     assert removed_track_ids == []
+    assert persist_called["value"] is False
+
+
+def test_process_tracklet_allocation_failure_removes_tracklet_and_skips_persist(monkeypatch):
+    pipeline = _make_pipeline()
+    removed_track_ids = []
+    persist_called = {"value": False}
+
+    class DummySelector:
+        def is_tracklet_ready(self, entries):
+            return True
+
+        def select(self, entries):
+            return entries
+
+    class DummyAggregator:
+        def aggregate(self, embeddings, v_scores, overlap_ratios):
+            return np.array([0.6, 0.8], dtype=np.float32)
+
+    class DummyModelClient:
+        async def extract_features(self, img_bytes):
+            return None, {"embedding": [0.6, 0.8]}
+
+        async def classify_gender(self, img_bytes):
+            return {"gender": "male", "confidence": 0.95}
+
+    class DummyMatcher:
+        def match_tracklet(self, **kwargs):
+            raise PersonIdAllocationError("alloc failed")
+
+    class DummyBuffer:
+        def remove(self, track_id):
+            removed_track_ids.append(track_id)
+
+    async def fake_persist_tracklet(**kwargs):
+        persist_called["value"] = True
+
+    pipeline.topk_selector = DummySelector()
+    pipeline.aggregator = DummyAggregator()
+    pipeline.model_client = DummyModelClient()
+    pipeline.matcher = DummyMatcher()
+    pipeline.tracklet_buffer = DummyBuffer()
+    pipeline._persist_tracklet = fake_persist_tracklet
+
+    monkeypatch.setattr(
+        "src.workers.main.cv2.imencode",
+        lambda *args, **kwargs: (True, np.array([1, 2, 3], dtype=np.uint8)),
+    )
+    monkeypatch.setattr(
+        "src.workers.main.compute_tracklet_consistency",
+        lambda entries: SimpleNamespace(overall=0.88, good_frame_ratio=0.75),
+    )
+    monkeypatch.setattr(
+        "src.workers.main.WeightedEmbeddingAggregator.compute_embedding_consistency",
+        lambda embeddings: 0.91,
+    )
+
+    tracklet = Tracklet(track_id=77, entries=[_make_entry(1), _make_entry(2, v_score=0.9)])
+
+    asyncio.run(pipeline._process_tracklet(tracklet))
+
+    assert pipeline.track_id_to_person_id == {}
+    assert pipeline.track_metadata == {}
+    assert removed_track_ids == [77]
     assert persist_called["value"] is False

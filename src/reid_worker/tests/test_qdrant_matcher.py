@@ -1,6 +1,6 @@
 import numpy as np
 
-from src.matching.reid_matcher import ReIDMatcher
+from src.matching.reid_matcher import PersonIdAllocationError, ReIDMatcher
 
 
 def _make_id_allocator(start: int = 1):
@@ -167,3 +167,32 @@ def test_existing_match_returns_person_even_when_canonical_update_is_skipped():
     assert len(store.gated_update_calls) == 1
     assert store.gated_update_calls[0][1]["person_id"] == 42
     assert alloc_calls["n"] == 0
+
+
+def test_id_allocator_failure_raises_person_id_allocation_error_and_does_not_create_person():
+    store = MockQdrantStore()
+
+    def alloc() -> int:
+        raise RuntimeError("redis down")
+
+    matcher = ReIDMatcher(
+        store,
+        id_allocator=alloc,
+        promote_v_threshold=0.6,
+        promote_consistency_threshold=0.7,
+    )
+    emb = np.random.randn(512).astype(np.float32)
+
+    try:
+        matcher.match_tracklet(
+            track_id=99,
+            embedding=emb,
+            v_avg=0.9,
+            embedding_consistency=0.95,
+            tracklet_len=10,
+        )
+        assert False, "Expected PersonIdAllocationError"
+    except PersonIdAllocationError:
+        pass
+
+    assert store.persons == {}
