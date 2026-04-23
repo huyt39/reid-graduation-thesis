@@ -10,6 +10,7 @@ from src.schemas.query import (
     PersonResponse,
     PaginatedPersonsResponse,
     PaginatedSightingsResponse,
+    PaginatedTimelineResponse,
     )
 
 router = APIRouter(prefix="/persons", tags=["persons"])
@@ -73,7 +74,7 @@ async def get_sightings(
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
-@router.get("/{person_id}/timeline")
+@router.get("/{person_id}/timeline", response_model = PaginatedTimelineResponse)
 async def get_timeline(
     person_id: int,
     start_time: datetime | None = None,

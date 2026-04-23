@@ -164,5 +164,12 @@ class PaginatedSightingsResponse(BaseModel):
     page_size: int = 20
 
 
+class PaginatedTimelineResponse(BaseModel):
+    items: list[TimelineEvent] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    page_size: int = 20
+
+
 class AggregationResponse(BaseModel):
     aggregation: list[dict] = Field(default_factory=list)
