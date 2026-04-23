@@ -105,7 +105,22 @@ class WorkerPipeline:
         self.prev_bboxes: dict[int, list[np.ndarray]] = {}
         self.track_id_to_person_id: dict[int, int] = {}
         self.track_metadata: dict[int, dict] = {}
+        self.track_last_seen_ns: dict[int, int] = {}
         self._current_device_id: str = ""
+
+    def _cleanup_inactive_tracks(self, current_time_ns: int) -> None:
+        stale_after_ns = int(self.settings.tracklet_stale_seconds * 1e9)
+        stale_track_ids = {
+            track_id
+            for track_id, last_seen_ns in self.track_last_seen_ns.items()
+            if current_time_ns - last_seen_ns > stale_after_ns
+        }
+
+        for track_id in stale_track_ids:
+            self.prev_bboxes.pop(track_id, None)
+            self.track_id_to_person_id.pop(track_id, None)
+            self.track_metadata.pop(track_id, None)
+            self.track_last_seen_ns.pop(track_id, None)
 
     def run(self) -> None:
         log.info("worker_started", service=self.settings.service_name)
@@ -153,12 +168,15 @@ class WorkerPipeline:
             np.array(classes, dtype=np.float32),
             frame,
         )
+        current_time_ns = time.time_ns()
         if len(track_results) == 0:
+            self._cleanup_inactive_tracks(current_time_ns)
             return
 
         for track in track_results:
             bbox_xyxy = track[:4]
             track_id = int(track[4])
+            self.track_last_seen_ns[track_id] = current_time_ns
             v_edge = 0.5
             overlap_ratio = 0.0
             if det_v_edges:
@@ -211,10 +229,11 @@ class WorkerPipeline:
                 ),
             )
 
-        current_time_ns = time.time_ns()
         for tracklet in self.tracklet_buffer.get_ready_tracklets(current_time_ns):
             await self._process_tracklet(tracklet)
         self.tracklet_buffer.evict_stale(current_time_ns)
+
+        self._cleanup_inactive_tracks(current_time_ns)
 
         tracked_persons = []
         for track in track_results:
