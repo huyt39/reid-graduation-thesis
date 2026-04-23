@@ -13,6 +13,10 @@ if TYPE_CHECKING:
 logger = Logger("reid_matcher")
 
 
+class PersonIdAllocationError(RuntimeError):
+    pass
+
+
 class ReIDMatcher:
     def __init__(
         self,
@@ -105,6 +109,11 @@ class ReIDMatcher:
         return None
 
     def _create_person(self, embedding: np.ndarray, metadata: dict) -> int:
-        pid = self.id_allocator()
+        try:
+            pid = self.id_allocator()
+        except Exception as e:
+            logger.error(f"Person ID allocation failed: {e}")
+            raise PersonIdAllocationError(str(e)) from e
+
         self.store.add_person(pid, embedding, metadata)
         return pid
