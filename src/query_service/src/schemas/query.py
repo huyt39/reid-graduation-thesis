@@ -48,11 +48,15 @@ class SightingAggregationParams(BaseModel):
 
 
 class PersonSearchFilters(BaseModel):
+    person_id: int | None = None
     gender: str | None = None
     gender_confidence_min: float | None = None
     last_seen_device: str | None = None
+    first_seen_after: datetime | None = None
+    first_seen_before: datetime | None = None
     last_seen_after: datetime | None = None
     last_seen_before: datetime | None = None
+    min_sighting_count: int | None = None
     is_active: bool | None = None
 
 

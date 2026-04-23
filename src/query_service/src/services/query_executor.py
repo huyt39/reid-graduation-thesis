@@ -71,16 +71,24 @@ class QueryExecutor:
         parsed = PersonSearchParams(**params)
         filters = parsed.filters
         mongo_query: dict = {}
+        if filters.person_id is not None:
+            mongo_query["person_id"] = filters.person_id
         if filters.gender:
             mongo_query["attributes.gender"] = filters.gender
         if filters.gender_confidence_min is not None:
             mongo_query["attributes.gender_confidence"] = {"$gte": filters.gender_confidence_min}
         if filters.last_seen_device:
             mongo_query["stats.last_seen_device"] = filters.last_seen_device
+        if filters.first_seen_after:
+            mongo_query.setdefault("stats.first_seen_at", {})["$gte"] = filters.first_seen_after
+        if filters.first_seen_before:
+            mongo_query.setdefault("stats.first_seen_at", {})["$lte"] = filters.first_seen_before
         if filters.last_seen_after:
             mongo_query.setdefault("stats.last_seen_at", {})["$gte"] = filters.last_seen_after
         if filters.last_seen_before:
             mongo_query.setdefault("stats.last_seen_at", {})["$lte"] = filters.last_seen_before
+        if filters.min_sighting_count is not None:
+            mongo_query["stats.sighting_count"] = {"$gte": filters.min_sighting_count}
         if filters.is_active is not None:
             mongo_query["is_active"] = filters.is_active
 

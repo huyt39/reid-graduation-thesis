@@ -121,6 +121,99 @@ async def test_person_search_builds_filters_and_pagination():
 
 
 @pytest.mark.asyncio
+async def test_person_search_supports_person_id_filter():
+    mongo = AsyncMock()
+    qdrant = MagicMock()
+    redis_cache = AsyncMock()
+
+    mongo.search_persons = AsyncMock(return_value=([{"person_id": 7}], 1))
+
+    executor = QueryExecutor(mongo, qdrant, redis_cache)
+
+    result = await executor.execute({
+        "query_type": "person_search",
+        "params": {
+            "filters": {
+                "person_id": 7,
+            },
+        },
+    })
+
+    assert result["items"] == [{"person_id": 7}]
+    assert result["total"] == 1
+
+    mongo.search_persons.assert_awaited_once_with(
+        filters={"person_id": 7},
+        skip=0,
+        limit=20,
+    )
+
+
+@pytest.mark.asyncio
+async def test_person_search_supports_first_seen_range_filters():
+    mongo = AsyncMock()
+    qdrant = MagicMock()
+    redis_cache = AsyncMock()
+
+    mongo.search_persons = AsyncMock(return_value=([{"person_id": 9}], 1))
+
+    executor = QueryExecutor(mongo, qdrant, redis_cache)
+
+    result = await executor.execute({
+        "query_type": "person_search",
+        "params": {
+            "filters": {
+                "first_seen_after": "2026-04-01T00:00:00Z",
+                "first_seen_before": "2026-04-30T23:59:59Z",
+            },
+        },
+    })
+
+    assert result["items"] == [{"person_id": 9}]
+    assert result["total"] == 1
+
+    mongo.search_persons.assert_awaited_once_with(
+        filters={
+            "stats.first_seen_at": {
+                "$gte": ANY,
+                "$lte": ANY,
+            }
+        },
+        skip=0,
+        limit=20,
+    )
+
+
+@pytest.mark.asyncio
+async def test_person_search_supports_min_sighting_count():
+    mongo = AsyncMock()
+    qdrant = MagicMock()
+    redis_cache = AsyncMock()
+
+    mongo.search_persons = AsyncMock(return_value=([{"person_id": 11}], 1))
+
+    executor = QueryExecutor(mongo, qdrant, redis_cache)
+
+    result = await executor.execute({
+        "query_type": "person_search",
+        "params": {
+            "filters": {
+                "min_sighting_count": 3,
+            },
+        },
+    })
+
+    assert result["items"] == [{"person_id": 11}]
+    assert result["total"] == 1
+
+    mongo.search_persons.assert_awaited_once_with(
+        filters={"stats.sighting_count": {"$gte": 3}},
+        skip=0,
+        limit=20,
+    )
+
+
+@pytest.mark.asyncio
 async def test_similarity_search(executor, qdrant):
     result = await executor.execute({
         "query_type": "similarity_search",
