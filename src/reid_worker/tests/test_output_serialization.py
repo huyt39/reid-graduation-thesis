@@ -1,3 +1,5 @@
+import src.kafka.producer as producer_module
+from src.kafka.producer import WorkerKafkaProducer
 from src.kafka.serialization import load_avro_schema, serialize_avro
 
 
@@ -36,3 +38,82 @@ def test_reid_output_serialization():
 
     assert isinstance(encoded, bytes)
     assert len(encoded) > 0
+
+
+def test_normalize_tracked_person_defaults_and_types():
+    producer = WorkerKafkaProducer.__new__(WorkerKafkaProducer)
+
+    normalized = producer._normalize_tracked_person(
+        {
+            "person_id": "7",
+            "bbox": [1, 2, 3, 4],
+            "confidence": "0.95",
+            "attributes": {"gender": "male", "age": 25},
+        }
+    )
+
+    assert normalized["person_id"] == 7
+    assert normalized["bbox"] == [1.0, 2.0, 3.0, 4.0]
+    assert normalized["confidence"] == 0.95
+    assert normalized["gender"] == "unknown"
+    assert normalized["gender_confidence"] == 0.0
+    assert normalized["tracklet_id"] is None
+    assert normalized["tracklet_state"] is None
+    assert normalized["visibility_score"] == 0.0
+    assert normalized["quality"] is None
+    assert normalized["attributes"] == {"gender": "male", "age": "25"}
+
+
+def test_send_uses_normalized_tracked_persons(monkeypatch):
+    captured = {}
+
+    class DummyKafkaProducer:
+        def send(self, topic, value):
+            captured["topic"] = topic
+            captured["value"] = value
+
+    def fake_serialize(schema, datum):
+        captured["schema"] = schema
+        captured["datum"] = datum
+        return b"encoded-message"
+
+    producer = WorkerKafkaProducer.__new__(WorkerKafkaProducer)
+    producer.topic = "reid_output"
+    producer.schema = object()
+    producer.producer = DummyKafkaProducer()
+
+    monkeypatch.setattr(producer_module, "serialize_avro", fake_serialize)
+
+    producer.send(
+        device_id="cam-1",
+        frame_number=12,
+        tracked_persons=[
+            {
+                "person_id": "7",
+                "bbox": [1, 2, 3, 4],
+                "confidence": "0.95",
+                "attributes": {"gender": "male", "age": 25},
+            }
+        ],
+        image_data=b"jpeg-bytes",
+        timestamp_ns=123456789,
+    )
+
+    person = captured["datum"]["tracked_persons"][0]
+
+    assert captured["topic"] == "reid_output"
+    assert captured["value"] == b"encoded-message"
+    assert captured["datum"]["device_id"] == "cam-1"
+    assert captured["datum"]["frame_number"] == 12
+    assert captured["datum"]["created_at"] == 123456789
+    assert captured["datum"]["schema_version"] == 2
+    assert person["person_id"] == 7
+    assert person["bbox"] == [1.0, 2.0, 3.0, 4.0]
+    assert person["confidence"] == 0.95
+    assert person["gender"] == "unknown"
+    assert person["gender_confidence"] == 0.0
+    assert person["tracklet_id"] is None
+    assert person["tracklet_state"] is None
+    assert person["visibility_score"] == 0.0
+    assert person["quality"] is None
+    assert person["attributes"] == {"gender": "male", "age": "25"}
