@@ -20,7 +20,7 @@ from src.matching.qdrant_store import QdrantPersonStore
 from src.matching.reid_matcher import ReIDMatcher
 from src.persistence.minio_store import MinIOSnapshotStore
 from src.persistence.mongo_store import MongoPersonStore
-from src.persistence.redis_cache import RedisPersonCache
+from src.persistence.redis_cache import RedisPersonCache, RedisPersonIdAllocator
 from src.scoring.enhanced_visibility import (
     compute_iou_prev,
     compute_vel_smooth,
@@ -70,9 +70,21 @@ class WorkerPipeline:
             similarity_threshold=self.settings.similarity_threshold,
             momentum=self.settings.momentum,
         )
+        self.model_client = ModelServiceClient(base_url=self.settings.model_service_url)
+
+        # Persistence
+        self.mongo = MongoPersonStore(uri=self.settings.mongo_uri, db_name=self.settings.mongo_db)
+        self.redis_cache = RedisPersonCache(url=self.settings.redis_url)
+        self.person_id_allocator = RedisPersonIdAllocator(url=self.settings.redis_url)
+        self.minio = MinIOSnapshotStore(
+            endpoint=self.settings.minio_endpoint,
+            access_key=self.settings.minio_access_key,
+            secret_key=self.settings.minio_secret_key,
+        )
+        self.gender_voter = GenderVoter(person_threshold=self.settings.gender_person_threshold)
         self.matcher = ReIDMatcher(
             self.qdrant_store,
-            id_allocator = self._allocate_person_id,
+            id_allocator=self.person_id_allocator.allocate,
             promote_v_threshold=self.settings.promote_v_threshold,
             promote_consistency_threshold=self.settings.promote_consistency_threshold,
             update_v_threshold=self.settings.update_v_threshold,
@@ -80,17 +92,6 @@ class WorkerPipeline:
             update_min_tracklet_len=self.settings.update_min_tracklet_len,
             update_sim_threshold=self.settings.update_sim_threshold,
         )
-        self.model_client = ModelServiceClient(base_url=self.settings.model_service_url)
-
-        # Persistence
-        self.mongo = MongoPersonStore(uri=self.settings.mongo_uri, db_name=self.settings.mongo_db)
-        self.redis_cache = RedisPersonCache(url=self.settings.redis_url)
-        self.minio = MinIOSnapshotStore(
-            endpoint=self.settings.minio_endpoint,
-            access_key=self.settings.minio_access_key,
-            secret_key=self.settings.minio_secret_key,
-        )
-        self.gender_voter = GenderVoter(person_threshold=self.settings.gender_person_threshold)
 
         self.consumer = WorkerKafkaConsumer(
             bootstrap_servers=self.settings.kafka_bootstrap_servers,
@@ -107,13 +108,7 @@ class WorkerPipeline:
         self.track_id_to_person_id: dict[int, int] = {}
         self.track_metadata: dict[int, dict] = {}
         self.track_last_seen_ns: dict[int, int] = {}
-        self._next_person_id = 1
         self._current_device_id: str = ""
-
-    def _allocate_person_id(self) -> int:
-        person_id = self._next_person_id
-        self._next_person_id += 1
-        return person_id
 
     def _cleanup_inactive_tracks(self, current_time_ns: int) -> None:
         stale_after_ns = int(self.settings.tracklet_stale_seconds * 1e9)
@@ -136,6 +131,7 @@ class WorkerPipeline:
         finally:
             self.consumer.close()
             self.producer.close()
+            self.person_id_allocator.close()
 
     async def _run_loop(self) -> None:
         await self.mongo.ensure_indexes()

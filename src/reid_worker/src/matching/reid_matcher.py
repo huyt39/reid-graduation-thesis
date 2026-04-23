@@ -68,9 +68,13 @@ class ReIDMatcher:
             and embedding_consistency >= self.promote_consistency_threshold
         )
         if can_promote:
-            pid = self._create_person(embedding, {"source": "new_detection"})
-            self.tentative.pop(track_id, None)
-            return pid
+            # If this track has been tentative before, treat promotion as a tentative upgrade.
+            tent = self.tentative.pop(track_id, None)
+            best_embedding = embedding
+            if tent is not None and tent.get("v_avg", -1.0) > v_avg:
+                best_embedding = tent["embedding"]
+            source = "tentative_promoted" if tent is not None else "new_detection"
+            return self._create_person(best_embedding, {"source": source})
 
         if track_id not in self.tentative:
             self.tentative[track_id] = {
