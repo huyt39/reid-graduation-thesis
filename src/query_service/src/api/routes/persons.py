@@ -6,12 +6,12 @@ from fastapi import APIRouter, Query
 
 from src.api.deps import get_mongo, get_redis
 
-from src.schemas.query import PersonResponse, PaginatedResponse
+from src.schemas.query import PersonResponse, PaginatedPersonsResponse
 
 router = APIRouter(prefix="/persons", tags=["persons"])
 
 
-@router.get("", response_model = PaginatedResponse)
+@router.get("", response_model = PaginatedPersonsResponse)
 async def list_persons(
     gender: str | None = None,
     device: str | None = None,

@@ -144,6 +144,13 @@ class SimilarPersonResult(BaseModel):
 
 
 class PaginatedResponse(BaseModel):
+    items: list[dict] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    page_size: int = 20
+
+
+class PaginatedPersonsResponse(BaseModel):
     items: list[PersonResponse] = Field(default_factory=list)
     total: int = 0
     page: int = 1
