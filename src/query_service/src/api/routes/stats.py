@@ -3,13 +3,13 @@ from typing import Literal
 from datetime import datetime
 
 from fastapi import APIRouter
-
+from src.schemas.query import StatsResponse
 from src.api.deps import get_mongo
 
 router = APIRouter(tags=["stats"])
 
 
-@router.get("/stats")
+@router.get("/stats", response_model = StatsResponse)
 async def get_stats():
     mongo = get_mongo()
     return await mongo.get_stats()
