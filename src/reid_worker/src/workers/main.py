@@ -72,6 +72,7 @@ class WorkerPipeline:
         )
         self.matcher = ReIDMatcher(
             self.qdrant_store,
+            id_allocator = self._allocate_person_id,
             promote_v_threshold=self.settings.promote_v_threshold,
             promote_consistency_threshold=self.settings.promote_consistency_threshold,
             update_v_threshold=self.settings.update_v_threshold,
@@ -106,7 +107,13 @@ class WorkerPipeline:
         self.track_id_to_person_id: dict[int, int] = {}
         self.track_metadata: dict[int, dict] = {}
         self.track_last_seen_ns: dict[int, int] = {}
+        self._next_person_id = 1
         self._current_device_id: str = ""
+
+    def _allocate_person_id(self) -> int:
+        person_id = self._next_person_id
+        self._next_person_id += 1
+        return person_id
 
     def _cleanup_inactive_tracks(self, current_time_ns: int) -> None:
         stale_after_ns = int(self.settings.tracklet_stale_seconds * 1e9)
