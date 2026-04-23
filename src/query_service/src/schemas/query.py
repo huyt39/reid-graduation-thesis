@@ -38,7 +38,7 @@ class TimelineParams(BaseModel):
     start_time: datetime | None = None
     end_time: datetime | None = None
     event_types: list[str] | None = None
-    
+
 
 class SimilaritySearchParams(BaseModel):
     person_id: int
@@ -119,7 +119,7 @@ class TimelineEvent(BaseModel):
     event_type: str
     timestamp: datetime
     device_id: str = ""
-    details: dict = Field(default_factory=dict)
+    details: dict[str, object] = Field(default_factory=dict)
 
 
 class DeviceResponse(BaseModel):
@@ -144,7 +144,7 @@ class SimilarPersonResult(BaseModel):
 
 
 class PaginatedResponse(BaseModel):
-    items: list = Field(default_factory=list)
+    items: list[dict] = Field(default_factory=list)
     total: int = 0
     page: int = 1
     page_size: int = 20
