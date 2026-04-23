@@ -171,5 +171,15 @@ class PaginatedTimelineResponse(BaseModel):
     page_size: int = 20
 
 
+class SimilarPersonItem(BaseModel):
+    person_id: int
+    score: float
+    person: PersonResponse | None = None
+
+
+class SimilarPersonsResponse(BaseModel):
+    similar_persons: list[SimilarPersonItem] = Field(default_factory=list)
+
+
 class AggregationResponse(BaseModel):
     aggregation: list[dict] = Field(default_factory=list)

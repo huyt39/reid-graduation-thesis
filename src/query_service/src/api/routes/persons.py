@@ -11,6 +11,7 @@ from src.schemas.query import (
     PaginatedPersonsResponse,
     PaginatedSightingsResponse,
     PaginatedTimelineResponse,
+    SimilarPersonsResponse,
     )
 
 router = APIRouter(prefix="/persons", tags=["persons"])
@@ -91,7 +92,7 @@ async def get_timeline(
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
-@router.get("/{person_id}/similar")
+@router.get("/{person_id}/similar", response_model = SimilarPersonsResponse)
 async def get_similar(
     person_id: int,
     top_k: int = Query(10, ge=1, le=50),
