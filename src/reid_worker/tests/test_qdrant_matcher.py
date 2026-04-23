@@ -3,6 +3,18 @@ import numpy as np
 from src.matching.reid_matcher import ReIDMatcher
 
 
+def _make_id_allocator(start: int = 1):
+    next_id = start
+
+    def alloc() -> int:
+        nonlocal next_id
+        pid = next_id
+        next_id += 1
+        return pid
+
+    return alloc
+
+
 class MockQdrantStore:
     def __init__(self):
         self.persons = {}
@@ -23,7 +35,12 @@ class MockQdrantStore:
 
 def test_good_tracklet_no_match_creates_person():
     store = MockQdrantStore()
-    matcher = ReIDMatcher(store, promote_v_threshold=0.6, promote_consistency_threshold=0.7)
+    matcher = ReIDMatcher(
+        store,
+        id_allocator=_make_id_allocator(),
+        promote_v_threshold=0.6,
+        promote_consistency_threshold=0.7,
+    )
     emb = np.random.randn(512).astype(np.float32)
     pid = matcher.match_tracklet(
         track_id=1,
@@ -38,7 +55,12 @@ def test_good_tracklet_no_match_creates_person():
 
 def test_low_quality_first_attempt_stays_tentative():
     store = MockQdrantStore()
-    matcher = ReIDMatcher(store, promote_v_threshold=0.6, promote_consistency_threshold=0.7)
+    matcher = ReIDMatcher(
+        store,
+        id_allocator=_make_id_allocator(),
+        promote_v_threshold=0.6,
+        promote_consistency_threshold=0.7,
+    )
     emb = np.random.randn(512).astype(np.float32)
 
     pid = matcher.match_tracklet(
@@ -57,7 +79,12 @@ def test_low_quality_first_attempt_stays_tentative():
 
 def test_tentative_tracklet_promotes_when_later_quality_is_good():
     store = MockQdrantStore()
-    matcher = ReIDMatcher(store, promote_v_threshold=0.6, promote_consistency_threshold=0.7)
+    matcher = ReIDMatcher(
+        store,
+        id_allocator=_make_id_allocator(),
+        promote_v_threshold=0.6,
+        promote_consistency_threshold=0.7,
+    )
     emb1 = np.random.randn(512).astype(np.float32)
     emb2 = np.random.randn(512).astype(np.float32)
 
@@ -85,7 +112,12 @@ def test_tentative_tracklet_promotes_when_later_quality_is_good():
 
 def test_tentative_tracklet_falls_back_after_five_attempts():
     store = MockQdrantStore()
-    matcher = ReIDMatcher(store, promote_v_threshold=0.6, promote_consistency_threshold=0.7)
+    matcher = ReIDMatcher(
+        store,
+        id_allocator=_make_id_allocator(),
+        promote_v_threshold=0.6,
+        promote_consistency_threshold=0.7,
+    )
     emb = np.random.randn(512).astype(np.float32)
 
     result = None
@@ -107,7 +139,13 @@ def test_existing_match_returns_person_even_when_canonical_update_is_skipped():
     store = MockQdrantStore()
     store.search_results = [(42, 0.93)]
     store.gated_update_result = False
-    matcher = ReIDMatcher(store)
+    alloc_calls = {"n": 0}
+
+    def alloc() -> int:
+        alloc_calls["n"] += 1
+        return 999
+
+    matcher = ReIDMatcher(store, id_allocator=alloc)
     emb = np.random.randn(512).astype(np.float32)
     matcher.tentative[5] = {
         "embedding": emb,
@@ -128,3 +166,4 @@ def test_existing_match_returns_person_even_when_canonical_update_is_skipped():
     assert 5 not in matcher.tentative
     assert len(store.gated_update_calls) == 1
     assert store.gated_update_calls[0][1]["person_id"] == 42
+    assert alloc_calls["n"] == 0
