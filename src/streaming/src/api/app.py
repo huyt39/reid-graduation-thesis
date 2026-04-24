@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from contextlib import asynccontextmanager
+from uuid import uuid4
 
 import structlog
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 
 from src.core.config import settings
 from src.kafka.consumer import StreamingKafkaConsumer
@@ -78,6 +80,26 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=settings.service_name, lifespan=lifespan)
+
+@app.middleware("http")
+async def attach_request_id(request: Request, call_next):
+    request_id = request.headers.get("x-request-id", str(uuid4()))
+    request.state.request_id = request_id
+
+    started_at = time.perf_counter()
+    response = await call_next(request)
+    response.headers.setdefault("x-request-id", request_id)
+
+    logger.info(
+        "streaming.http_response",
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
+    )
+    return response
+
 
 
 # Health endpoints
