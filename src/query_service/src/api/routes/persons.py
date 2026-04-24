@@ -4,7 +4,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Query
 
-from src.api.deps import get_mongo, get_redis
+from src.api.deps import get_mongo, get_redis, get_minio_urls
 
 from src.schemas.query import (
     PersonResponse,
@@ -15,6 +15,11 @@ from src.schemas.query import (
     )
 
 router = APIRouter(prefix="/persons", tags=["persons"])
+
+def _attach_snapshot_url(item: dict, minio_urls) -> dict:
+    enriched = dict(item)
+    enriched["snapshot_url"] = minio_urls.presigned_url(item.get("snapshot_key"))
+    return enriched
 
 
 @router.get("", response_model = PaginatedPersonsResponse)
@@ -34,10 +39,12 @@ async def list_persons(
     if is_active is not None:
         filters["is_active"] = is_active
 
+    minio_urls = get_minio_urls()
     items, total = await mongo.search_persons(
         filters=filters, skip=(page - 1) * page_size, limit=page_size,
     )
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+    enriched_items = [_attach_snapshot_url(item, minio_urls) for item in items]
+    return {"items": enriched_items, "total": total, "page": page, "page_size": page_size}
 
 
 @router.get("/{person_id}", response_model = PersonResponse)
@@ -51,12 +58,15 @@ async def get_person(person_id: int):
     if cached:
         return cached
 
+    minio_urls = get_minio_urls()
+
     person = await mongo.get_person(person_id)
     if person is None:
         raise HTTPException(404, f"Person {person_id} not found")
 
-    await redis_cache.set_person(person_id, person)
-    return person
+    enriched_person = _attach_snapshot_url(person, minio_urls)
+    await redis_cache.set_person(person_id, enriched_person)
+    return enriched_person
 
 
 @router.get("/{person_id}/sightings", response_model = PaginatedSightingsResponse)
@@ -68,11 +78,13 @@ async def get_sightings(
     page_size: int = Query(20, ge=1, le=100),
 ):
     mongo = get_mongo()
+    minio_urls = get_minio_urls()
     items, total = await mongo.get_sightings(
         person_id, start_time=start_time, end_time=end_time,
         skip=(page - 1) * page_size, limit=page_size,
     )
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+    enriched_items = [_attach_snapshot_url(item, minio_urls) for item in items]
+    return {"items": enriched_items, "total": total, "page": page, "page_size": page_size}
 
 
 @router.get("/{person_id}/timeline", response_model = PaginatedTimelineResponse)
@@ -102,6 +114,7 @@ async def get_similar(
     from fastapi import HTTPException
     qdrant = get_qdrant()
     mongo = get_mongo()
+    minio_urls = get_minio_urls()
 
     source_person = await mongo.get_person(person_id)
     if source_person is None:
@@ -114,7 +127,7 @@ async def get_similar(
         person = await mongo.get_person(r["person_id"])
         item = dict(r)
         if person is not None:
-            item["person"] = person
+            item["person"] = _attach_snapshot_url(person, minio_urls)
         enriched.append(item)
 
     return {"similar_persons": enriched}

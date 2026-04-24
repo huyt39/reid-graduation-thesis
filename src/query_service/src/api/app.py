@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from src.api import deps
 from src.api.routes import devices, persons, search, stats
@@ -13,6 +13,7 @@ from src.db.qdrant_client import QdrantQueryClient
 from src.db.redis_client import RedisQueryCache
 from src.services.nl_parser import NLQueryParser
 from src.services.query_executor import QueryExecutor
+from src.services.minio_urls import MinIOURLBuilder
 
 log = structlog.get_logger()
 
@@ -24,8 +25,13 @@ async def lifespan(app: FastAPI):
     redis_cache = RedisQueryCache(settings.redis_url)
     executor = QueryExecutor(mongo, qdrant, redis_cache)
     nl_parser = NLQueryParser(vllm_url=settings.vllm_service_url)
+    minio_urls = MinIOURLBuilder(
+        endpoint=settings.minio_endpoint,
+        access_key=settings.minio_access_key,
+        secret_key=settings.minio_secret_key,
+    )
 
-    deps.init(mongo, qdrant, redis_cache, executor, nl_parser)
+    deps.init(mongo, qdrant, redis_cache, executor, nl_parser, minio_urls)
     log.info("query_service.started")
     yield
 
@@ -48,5 +54,32 @@ def healthz():
 
 
 @app.get("/readyz")
-def readyz():
-    return {"status": "ready", "service": settings.service_name}
+async def readyz():
+    mongo = deps.get_mongo()
+    qdrant = deps.get_qdrant()
+    redis_cache = deps.get_redis()
+    minio_urls = deps.get_minio_urls()
+
+    checks = {
+        "mongo": await mongo.ping(),
+        "qdrant": qdrant.ping(),
+        "redis": await redis_cache.ping(),
+        "minio": minio_urls.ping(),
+    }
+    ready = all(checks.values())
+
+    if not ready:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "not_ready",
+                "service": settings.service_name,
+                "checks": checks,
+            },
+        )
+
+    return {
+        "status": "ready",
+        "service": settings.service_name,
+        "checks": checks,
+    }

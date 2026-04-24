@@ -41,5 +41,11 @@ class RedisQueryCache:
         except Exception:
             pass
 
+    async def ping(self) -> bool:
+        try:
+            return bool(await self._redis.ping())
+        except Exception:
+            return False
+
     async def close(self) -> None:
         await self._redis.aclose()

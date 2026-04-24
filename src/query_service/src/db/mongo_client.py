@@ -221,5 +221,12 @@ class MongoQueryClient:
         cursor = self._db.sightings.aggregate(pipeline)
         return await cursor.to_list(length=200)
 
+    async def ping(self) -> bool:
+        try:
+            await self._client.admin.command("ping")
+            return True
+        except Exception:
+            return False
+
     def close(self) -> None:
         self._client.close()

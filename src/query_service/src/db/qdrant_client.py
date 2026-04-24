@@ -48,3 +48,10 @@ class QdrantQueryClient:
             {"person_id": int(r.id), "score": round(r.score, 4)}
             for r in results
         ]
+
+    def ping(self) -> bool:
+        try:
+            self._client.get_collections()
+            return True
+        except Exception:
+            return False
