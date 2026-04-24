@@ -4,7 +4,6 @@ from __future__ import annotations
 import io
 
 import structlog
-from minio import Minio
 
 log = structlog.get_logger()
 
@@ -19,6 +18,7 @@ class MinIOSnapshotStore:
         secret_key: str = "minio123",
         secure: bool = False,
     ) -> None:
+        from minio import Minio
         self._client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
         self._ensure_bucket()
 

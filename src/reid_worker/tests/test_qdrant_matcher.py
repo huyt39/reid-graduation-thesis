@@ -196,3 +196,47 @@ def test_id_allocator_failure_raises_person_id_allocation_error_and_does_not_cre
         pass
 
     assert store.persons == {}
+
+
+def test_tentative_state_is_preserved_when_id_allocation_fails_during_promote():
+    store = MockQdrantStore()
+
+    def alloc() -> int:
+        raise RuntimeError("redis down")
+
+    matcher = ReIDMatcher(
+        store,
+        id_allocator=alloc,
+        promote_v_threshold=0.6,
+        promote_consistency_threshold=0.7,
+    )
+    emb1 = np.random.randn(512).astype(np.float32)
+    emb2 = np.random.randn(512).astype(np.float32)
+
+    first = matcher.match_tracklet(
+        track_id=55,
+        embedding=emb1,
+        v_avg=0.4,
+        embedding_consistency=0.5,
+        tracklet_len=3,
+    )
+
+    assert first is None
+    assert 55 in matcher.tentative
+
+    try:
+        matcher.match_tracklet(
+            track_id=55,
+            embedding=emb2,
+            v_avg=0.95,
+            embedding_consistency=0.98,
+            tracklet_len=8,
+        )
+        assert False, "Expected PersonIdAllocationError"
+    except PersonIdAllocationError:
+        pass
+
+    assert 55 in matcher.tentative
+    assert matcher.tentative[55]["attempts"] == 1
+    np.testing.assert_allclose(matcher.tentative[55]["embedding"], emb1)
+    assert store.persons == {}

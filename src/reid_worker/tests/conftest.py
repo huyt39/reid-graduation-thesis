@@ -28,25 +28,3 @@ if "structlog" not in sys.modules:
 
         sys.modules["structlog"] = types.SimpleNamespace(get_logger=lambda *a, **k: _DummyLogger())
 
-
-if "minio" not in sys.modules:
-    try:
-        import minio  # noqa: F401
-    except Exception:
-        class _DummyMinio:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def bucket_exists(self, *args, **kwargs):
-                return True
-
-            def make_bucket(self, *args, **kwargs):
-                return None
-
-            def put_object(self, *args, **kwargs):
-                return None
-
-            def presigned_get_object(self, *args, **kwargs):
-                return ""
-
-        sys.modules["minio"] = types.SimpleNamespace(Minio=_DummyMinio)
