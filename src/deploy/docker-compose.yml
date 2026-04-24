@@ -45,6 +45,8 @@ services:
   reid_worker:
     build: ../reid_worker
     env_file: ../reid_worker/.env.example
+    environment:
+      - WORKER_PERSON_ID_SEQ_KEY=reid:seq:person_id
     depends_on: [kafka, mongo, qdrant, redis]
 
   inference_engine:
@@ -70,4 +72,3 @@ services:
     env_file: ../query_service/.env.example
     depends_on: [mongo, qdrant, redis]
     ports: ["8090:8090"]
-
