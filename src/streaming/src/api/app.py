@@ -5,7 +5,7 @@ import json
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 
 from src.core.config import settings
 from src.kafka.consumer import StreamingKafkaConsumer
@@ -89,9 +89,28 @@ def healthz():
 
 @app.get("/readyz")
 def readyz():
+    checks = {
+        "kafka_loop_running": bool(streaming_state["kafka_loop_running"]),
+        "kafka_loop_failed": bool(streaming_state["kafka_loop_failed"]),
+    }
+    ready = checks["kafka_loop_running"] and not checks["kafka_loop_failed"]
+
+    if not ready:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "not_ready",
+                "service": settings.service_name,
+                "checks": checks,
+                "connections": broadcaster.connection_count,
+                "devices": frame_cache.device_ids(),
+            },
+        )
+
     return {
         "status": "ready",
         "service": settings.service_name,
+        "checks": checks,
         "connections": broadcaster.connection_count,
         "devices": frame_cache.device_ids(),
     }
