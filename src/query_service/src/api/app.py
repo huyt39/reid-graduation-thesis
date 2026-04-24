@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-
+from uuid import uuid4
 import structlog
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 
 from src.api import deps
 from src.api.routes import devices, persons, search, stats
@@ -41,6 +41,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=settings.service_name, lifespan=lifespan)
+
+@app.middleware("http")
+async def attach_request_id(request: Request, call_next):
+    request_id = request.headers.get("x-request-id", str(uuid4()))
+    request.state.request_id = request_id
+
+    response = await call_next(request)
+    response.headers.setdefault("x-request-id", request_id)
+    return response
+
 
 app.include_router(persons.router)
 app.include_router(devices.router)
