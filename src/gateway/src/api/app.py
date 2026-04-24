@@ -1,12 +1,121 @@
-from fastapi import FastAPI
-from src.core.config import settings
+from __future__ import annotations
 
-app = FastAPI(title=settings.service_name)
+from contextlib import asynccontextmanager
+
+import httpx
+import structlog
+from fastapi import Depends, FastAPI, Request, WebSocket, HTTPException
+
+from src.auth.jwt_handler import create_token, decode_token
+from src.auth.models import LoginRequest, Role, TokenResponse
+from src.auth.rbac import get_current_user, get_ws_user
+from src.core.config import settings
+from src.middleware.rate_limiter import RateLimiterMiddleware
+from src.proxy.http_proxy import proxy_request
+from src.proxy.ws_proxy import proxy_websocket
+
+logger = structlog.get_logger()
+
+# Shared httpx client for connection pooling
+_http_client: httpx.AsyncClient | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _http_client
+    _http_client = httpx.AsyncClient()
+    yield
+    await _http_client.aclose()
+
+
+app = FastAPI(title=settings.service_name, lifespan=lifespan)
+app.add_middleware(RateLimiterMiddleware, rpm=settings.rate_limit_rpm)
+
+
+# Health endpoints
 
 @app.get("/healthz")
 def healthz():
     return {"status": "ok", "service": settings.service_name}
 
+
 @app.get("/readyz")
-def readyz():
-    return {"status": "ready", "service": settings.service_name}
+async def readyz():
+    assert _http_client is not None
+
+    checks = {
+        "query_service": False,
+        "streaming": False,
+    }
+
+    try:
+        query_resp = await _http_client.get(f"{settings.query_service_url}/readyz", timeout=5.0)
+        checks["query_service"] = query_resp.status_code == 200
+    except Exception:
+        checks["query_service"] = False
+
+    try:
+        streaming_http_base = settings.streaming_url.replace("ws://", "http://").replace("wss://", "https://")
+        streaming_resp = await _http_client.get(f"{streaming_http_base}/readyz", timeout=5.0)
+        checks["streaming"] = streaming_resp.status_code == 200
+    except Exception:
+        checks["streaming"] = False
+
+    ready = all(checks.values())
+    if not ready:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "not_ready",
+                "service": settings.service_name,
+                "checks": checks,
+            },
+        )
+
+    return {
+        "status": "ready",
+        "service": settings.service_name,
+        "checks": checks,
+    }
+
+
+# Auth endpoints
+
+@app.post("/auth/login", response_model=TokenResponse)
+def login(body: LoginRequest):
+    # Bootstrap auth: single admin user from env. Replace with DB lookup later.
+    if body.username != settings.admin_username or body.password != settings.admin_password:
+        from fastapi import HTTPException, status
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
+
+    token, expires_in = create_token(sub=body.username, role=Role.ADMIN)
+    return TokenResponse(access_token=token, expires_in=expires_in)
+
+
+@app.post("/auth/refresh", response_model=TokenResponse)
+def refresh(user=Depends(get_current_user)):
+    token, expires_in = create_token(sub=user.sub, role=user.role)
+    return TokenResponse(access_token=token, expires_in=expires_in)
+
+
+# WebSocket proxy to streaming service
+
+@app.websocket("/ws/stream")
+async def ws_stream(ws: WebSocket, user=Depends(get_ws_user)):
+    upstream = f"{settings.streaming_url}/ws"
+    await proxy_websocket(ws, upstream)
+
+
+# API proxy to query service
+
+@app.api_route(
+    "/api/v1/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+)
+async def api_proxy(path: str, request: Request, user=Depends(get_current_user)):
+    return await proxy_request(
+        request,
+        target_base=settings.query_service_url,
+        path=path,
+        client=_http_client,
+    )

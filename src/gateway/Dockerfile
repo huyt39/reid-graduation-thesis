@@ -8,5 +8,5 @@ COPY pyproject.toml /app/
 RUN uv pip install --system --no-cache .
 
 COPY src /app/src
-EXPOSE 8000
+EXPOSE 8080
 CMD ["python", "-m", "src"]
