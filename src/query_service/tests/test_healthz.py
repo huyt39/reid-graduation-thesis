@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 from fastapi.testclient import TestClient
 
 from src.api import deps
+from src.api import app as app_module
 from src.api.app import app
 
 
@@ -11,6 +12,46 @@ def test_healthz():
     r = c.get("/healthz")
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
+
+
+def test_healthz_preserves_existing_request_id_header():
+    c = TestClient(app)
+    r = c.get("/healthz", headers={"X-Request-ID": "req-qs-123"})
+
+    assert r.status_code == 200
+    assert r.headers["x-request-id"] == "req-qs-123"
+
+
+def test_healthz_generates_request_id_header_when_missing():
+    c = TestClient(app)
+    r = c.get("/healthz")
+
+    assert r.status_code == 200
+    assert "x-request-id" in r.headers
+    assert r.headers["x-request-id"]
+
+
+def test_healthz_logs_request_context(monkeypatch):
+    events: list[tuple[str, dict]] = []
+
+    class DummyLogger:
+        def info(self, event, **kwargs):
+            events.append((event, kwargs))
+
+    monkeypatch.setattr(app_module, "log", DummyLogger())
+
+    c = TestClient(app)
+    r = c.get("/healthz", headers={"X-Request-ID": "req-qs-log-1"})
+
+    assert r.status_code == 200
+    assert len(events) == 1
+    event, payload = events[0]
+    assert event == "query_service.http_response"
+    assert payload["request_id"] == "req-qs-log-1"
+    assert payload["method"] == "GET"
+    assert payload["path"] == "/healthz"
+    assert payload["status_code"] == 200
+    assert isinstance(payload["duration_ms"], float)
 
 
 def test_readyz_returns_ready_when_all_dependencies_pass(monkeypatch):
