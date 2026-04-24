@@ -1,7 +1,9 @@
 from __future__ import annotations
-
+import time
+import structlog
+from uuid import uuid4
 import httpx
-from fastapi import Request, Response
+from fastapi import Request, Response, HTTPException
 
 # Hop-by-hop headers that must not be forwarded
 _HOP_BY_HOP = frozenset(
@@ -16,6 +18,8 @@ _HOP_BY_HOP = frozenset(
         "upgrade",
     }
 )
+
+logger = structlog.get_logger()
 
 
 async def proxy_request(
@@ -33,15 +37,54 @@ async def proxy_request(
         for k, v in request.headers.items()
         if k.lower() not in _HOP_BY_HOP and k.lower() != "host"
     }
+    request_id = request.headers.get("x-request-id", str(uuid4()))
+    headers.setdefault("x-request-id", request_id)
 
-    upstream = await client.request(
-        method=request.method,
-        url=url,
-        headers=headers,
-        params=dict(request.query_params),
-        content=await request.body(),
-        timeout=30.0,
-    )
+    started_at = time.perf_counter()
+
+    try:
+        upstream = await client.request(
+            method=request.method,
+            url=url,
+            headers=headers,
+            params=dict(request.query_params),
+            content=await request.body(),
+            timeout=30.0,
+        )
+    except httpx.TimeoutException:
+        logger.warning(
+            "gateway.proxy_timeout",
+            request_id=request_id,
+            method=request.method,
+            target=target_base,
+            path=path,
+            duration_ms=round((time.perf_counter() - started_at)*1000,2),
+        )
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "error": "upstream_timeout",
+                "target": target_base,
+                "path": path,
+            },
+        )
+    except httpx.HTTPError:
+        logger.warning(
+            "gateway.proxy_error",
+            request_id=request_id,
+            method=request.method,
+            target=target_base,
+            path=path,
+            duration_ms=round((time.perf_counter() - started_at)*1000,2),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "upstream_unavailable",
+                "target": target_base,
+                "path": path,
+            },
+        )
 
     # Forward response, stripping hop-by-hop
     resp_headers = {
@@ -49,6 +92,19 @@ async def proxy_request(
         for k, v in upstream.headers.items()
         if k.lower() not in _HOP_BY_HOP
     }
+    resp_headers.setdefault("x-request-id", request_id)
+
+    # request successfully
+    logger.info(
+        "gateway.proxy_response",
+        request_id=request_id,
+        method=request.method,
+        target=target_base,
+        path=path,
+        status_code=upstream.status_code,
+        duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
+    )
+
 
     return Response(
         content=upstream.content,
