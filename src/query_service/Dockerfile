@@ -5,8 +5,7 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir uv
 COPY pyproject.toml /app/
-RUN uv pip install --system --no-cache .
-
 COPY src /app/src
+RUN uv pip install --system --no-cache .
 EXPOSE 8000
 CMD ["python", "-m", "src"]

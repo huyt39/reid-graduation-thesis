@@ -6,7 +6,8 @@ from datetime import timedelta
 class MinIOURLBuilder:
     def __init__(
         self,
-        endpoint: str,
+        internal_endpoint: str,
+        public_endpoint: str | None,
         access_key: str,
         secret_key: str,
         bucket: str = "reid-snapshots",
@@ -15,8 +16,14 @@ class MinIOURLBuilder:
         from minio import Minio
 
         self._bucket = bucket
-        self._client = Minio(
-            endpoint,
+        self._internal_client = Minio(
+            internal_endpoint,
+            access_key=access_key,
+            secret_key=secret_key,
+            secure=secure,
+        )
+        self._public_client = Minio(
+            public_endpoint or internal_endpoint,
             access_key=access_key,
             secret_key=secret_key,
             secure=secure,
@@ -26,7 +33,7 @@ class MinIOURLBuilder:
         if not object_key:
             return None
 
-        return self._client.presigned_get_object(
+        return self._public_client.presigned_get_object(
             self._bucket,
             object_key,
             expires=timedelta(hours=expires_hours),
@@ -34,7 +41,7 @@ class MinIOURLBuilder:
 
     def ping(self) -> bool:
         try:
-            self._client.bucket_exists(self._bucket)
+            self._internal_client.bucket_exists(self._bucket)
             return True
         except Exception:
             return False

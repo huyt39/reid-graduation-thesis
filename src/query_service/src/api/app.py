@@ -27,9 +27,11 @@ async def lifespan(app: FastAPI):
     executor = QueryExecutor(mongo, qdrant, redis_cache)
     nl_parser = NLQueryParser(vllm_url=settings.vllm_service_url)
     minio_urls = MinIOURLBuilder(
-        endpoint=settings.minio_endpoint,
+        internal_endpoint=settings.minio_internal_endpoint,
+        public_endpoint=settings.minio_public_endpoint,
         access_key=settings.minio_access_key,
         secret_key=settings.minio_secret_key,
+        secure=settings.minio_secure,
     )
 
     deps.init(mongo, qdrant, redis_cache, executor, nl_parser, minio_urls)
