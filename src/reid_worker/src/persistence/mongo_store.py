@@ -39,17 +39,25 @@ class MongoPersonStore:
         self,
         person_id: int,
         *,
-        gender: str = "unknown",
-        gender_confidence: float = 0.0,
+        attributes: dict[str, tuple[str, float]] | None = None,
         device_id: str = "",
         snapshot_key: str | None = None,
         source: str = "new_detection",
     ) -> None:
+        """Upsert a person doc.
+
+        ``attributes`` is the per-task person-level snapshot from the AttributeVoter:
+        ``{task: (label, confidence)}``. Each task lands as ``attributes.<task>`` and
+        ``attributes.<task>_confidence`` in the document.
+        """
         now = datetime.now(timezone.utc)
+        attr_set: dict = {}
+        for task, (label, conf) in (attributes or {}).items():
+            attr_set[f"attributes.{task}"] = label
+            attr_set[f"attributes.{task}_confidence"] = float(conf)
         update: dict = {
             "$set": {
-                "attributes.gender": gender,
-                "attributes.gender_confidence": gender_confidence,
+                **attr_set,
                 "stats.last_seen_at": now,
                 "stats.last_seen_device": device_id,
                 "updated_at": now,
@@ -117,9 +125,17 @@ class MongoPersonStore:
         entry_count: int,
         quality_score: float,
         snapshot_key: str | None = None,
-        gender: str = "unknown",
-        gender_confidence: float = 0.0,
+        attributes: dict[str, tuple[str, float]] | None = None,
     ) -> None:
+        """Insert a sighting row.
+
+        ``attributes`` is the same per-task ``(label, confidence)`` snapshot used by
+        ``upsert_person``. Stored as ``{<task>: label, <task>_confidence: conf, ...}``.
+        """
+        attr_doc: dict = {}
+        for task, (label, conf) in (attributes or {}).items():
+            attr_doc[task] = label
+            attr_doc[f"{task}_confidence"] = float(conf)
         doc = {
             "person_id": person_id,
             "device_id": device_id,
@@ -130,7 +146,7 @@ class MongoPersonStore:
             "entry_count": entry_count,
             "quality_score": quality_score,
             "snapshot_key": snapshot_key,
-            "attributes": {"gender": gender, "gender_confidence": gender_confidence},
+            "attributes": attr_doc,
         }
         try:
             await self._db[self.SIGHTINGS].insert_one(doc)

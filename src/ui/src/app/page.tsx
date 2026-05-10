@@ -1,8 +1,14 @@
-export default function Page() {
-  return (
-    <main style={{ padding: 24, fontFamily: "sans-serif" }}>
-      <h1>reid-production UI</h1>
-      <p>Skeleton initialized.</p>
-    </main>
-  );
+"use client";
+
+import { useEffect } from "react";
+import { useRouter } from "next/navigation";
+
+export default function Root() {
+  const router = useRouter();
+
+  useEffect(() => {
+    router.replace("/dashboard");
+  }, [router]);
+
+  return <div className="h-screen bg-surface" />;
 }

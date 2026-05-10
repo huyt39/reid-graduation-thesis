@@ -23,4 +23,3 @@ if "structlog" not in sys.modules:
                 pass
 
         sys.modules["structlog"] = types.SimpleNamespace(get_logger=lambda *a, **k: _DummyLogger())
-

@@ -5,20 +5,24 @@
   "fields": [
     {"name": "device_id", "type": "string"},
     {"name": "frame_number", "type": "long"},
-    {"name": "result", "type": {
-      "type": "array",
-      "items": {
-        "type": "record",
-        "name": "Detection",
-        "fields": [
-          {"name": "bbox", "type": {"type": "array", "items": "float"}},
-          {"name": "confidence", "type": "float"},
-          {"name": "class_id", "type": "int"}
-        ]
+    {
+      "name": "detections",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "Detection",
+          "fields": [
+            {"name": "bbox", "type": {"type": "array", "items": "float"}},
+            {"name": "confidence", "type": "float"},
+            {"name": "class_id", "type": "int"},
+            {"name": "visibility_score", "type": "float"},
+            {"name": "overlap_ratio", "type": "float"}
+          ]
+        }
       }
-    }},
+    },
     {"name": "created_at", "type": "long"},
-    {"name": "quality_score", "type": "float"},
     {"name": "image_data", "type": "bytes"}
   ]
 }

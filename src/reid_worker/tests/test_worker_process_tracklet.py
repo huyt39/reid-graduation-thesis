@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from src.attributes.gender_voter import GenderVoter
+from src.attributes.attribute_voter import AttributeVoter
 from src.matching.reid_matcher import PersonIdAllocationError
 from src.tracklet.models import Tracklet, TrackletEntry, TrackletState
 from src.workers.main import WorkerPipeline
@@ -22,13 +22,27 @@ def _make_entry(frame_idx: int, v_score: float = 0.8, overlap_ratio: float = 0.1
 
 def _make_pipeline() -> WorkerPipeline:
     pipeline = WorkerPipeline.__new__(WorkerPipeline)
-    pipeline.settings = SimpleNamespace()
+    pipeline.settings = SimpleNamespace(
+        recent_person_reuse_enabled=False,
+        recent_person_reuse_seconds=2.5,
+        recent_person_reuse_min_iou=0.2,
+        recent_person_reuse_max_center_distance_ratio=0.75,
+        gender_person_threshold=0.7,
+        gender_match_blocking_enabled=False,
+    )
     pipeline.track_id_to_person_id = {}
     pipeline.track_metadata = {}
     pipeline.track_last_seen_ns = {}
+    pipeline.person_last_observation = {}
+    pipeline.person_confirmed_gender = {}
     pipeline.prev_bboxes = {}
     pipeline._current_device_id = "cam-1"
-    pipeline.gender_voter = GenderVoter(person_threshold=0.7)
+    pipeline.attribute_voter = AttributeVoter(person_threshold=0.7)
+    pipeline.processed_messages = 0
+    pipeline.ready_tracklets = 0
+    pipeline.embedded_tracklets = 0
+    pipeline.matched_tracklets = 0
+    pipeline.worker_started_at = 0.0
     return pipeline
 
 
@@ -52,8 +66,9 @@ def test_process_tracklet_match_success_updates_state_and_persists(monkeypatch):
         async def extract_features(self, img_bytes):
             return None, {"embedding": [0.6, 0.8]}
 
-        async def classify_gender(self, img_bytes):
-            return {"gender": "male", "confidence": 0.95}
+        async def classify_attributes(self, img_bytes):
+            return {"gender": {"label": "male", "confidence": 0.95,
+                               "probabilities": {"male": 0.95, "female": 0.05}}}
 
     class DummyMatcher:
         def match_tracklet(self, **kwargs):
@@ -95,11 +110,12 @@ def test_process_tracklet_match_success_updates_state_and_persists(monkeypatch):
         "overall_consistency": 0.88,
         "good_frame_ratio": 0.75,
     }
-    assert removed_track_ids == [7]
+    assert removed_track_ids == []
     assert persisted["matcher_kwargs"]["track_id"] == 7
     assert persisted["persist_kwargs"]["tracklet_id"] == "tracklet-123"
     assert persisted["persist_kwargs"]["person_id"] == 101
-    assert persisted["persist_kwargs"]["gender"] == "male"
+    p_attrs = persisted["persist_kwargs"]["person_attrs"]
+    assert p_attrs["gender"][0] == "male"
 
 
 def test_process_tracklet_without_match_does_not_assign_person_or_persist(monkeypatch):
@@ -122,8 +138,9 @@ def test_process_tracklet_without_match_does_not_assign_person_or_persist(monkey
         async def extract_features(self, img_bytes):
             return None, {"embedding": [0.6, 0.8]}
 
-        async def classify_gender(self, img_bytes):
-            return {"gender": "male", "confidence": 0.95}
+        async def classify_attributes(self, img_bytes):
+            return {"gender": {"label": "male", "confidence": 0.95,
+                               "probabilities": {"male": 0.95, "female": 0.05}}}
 
     class DummyMatcher:
         def match_tracklet(self, **kwargs):
@@ -156,7 +173,7 @@ def test_process_tracklet_without_match_does_not_assign_person_or_persist(monkey
     assert tracklet.state == TrackletState.ACTIVE
     assert pipeline.track_id_to_person_id == {}
     assert pipeline.track_metadata == {}
-    assert removed_track_ids == [8]
+    assert removed_track_ids == []
     assert persist_called["value"] is False
 
 
@@ -179,7 +196,7 @@ def test_process_tracklet_not_ready_marks_tentative_and_returns():
 
     asyncio.run(pipeline._process_tracklet(tracklet))
 
-    assert tracklet.state == TrackletState.TENTATIVE
+    assert tracklet.state == TrackletState.ACTIVE
     assert tracklet.person_id is None
     assert pipeline.track_id_to_person_id == {}
     assert pipeline.track_metadata == {}
@@ -202,8 +219,9 @@ def test_process_tracklet_with_no_embeddings_returns_without_match_or_persist(mo
         async def extract_features(self, img_bytes):
             raise RuntimeError("embedding failed")
 
-        async def classify_gender(self, img_bytes):
-            return {"gender": "male", "confidence": 0.95}
+        async def classify_attributes(self, img_bytes):
+            return {"gender": {"label": "male", "confidence": 0.95,
+                               "probabilities": {"male": 0.95, "female": 0.05}}}
 
     class DummyBuffer:
         def remove(self, track_id):
@@ -251,8 +269,9 @@ def test_process_tracklet_allocation_failure_removes_tracklet_and_skips_persist(
         async def extract_features(self, img_bytes):
             return None, {"embedding": [0.6, 0.8]}
 
-        async def classify_gender(self, img_bytes):
-            return {"gender": "male", "confidence": 0.95}
+        async def classify_attributes(self, img_bytes):
+            return {"gender": {"label": "male", "confidence": 0.95,
+                               "probabilities": {"male": 0.95, "female": 0.05}}}
 
     class DummyMatcher:
         def match_tracklet(self, **kwargs):

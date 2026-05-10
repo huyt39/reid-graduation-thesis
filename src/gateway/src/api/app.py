@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 import httpx
 import structlog
 from fastapi import Depends, FastAPI, Request, WebSocket, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 from src.auth.jwt_handler import create_token, decode_token
 from src.auth.models import LoginRequest, Role, TokenResponse
@@ -30,6 +31,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=settings.service_name, lifespan=lifespan)
 app.add_middleware(RateLimiterMiddleware, rpm=settings.rate_limit_rpm)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # Health endpoints

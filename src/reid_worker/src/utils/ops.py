@@ -2,11 +2,10 @@ from typing import Union
 
 import cv2
 import numpy as np
-import torch
 
 
 def xywh2ltwh(x: list):
-    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
+    y = np.array(x, copy=True)
     y[0] = x[0] - x[2] / 2
     y[1] = x[1] - x[3] / 2
     return y
@@ -14,7 +13,7 @@ def xywh2ltwh(x: list):
 
 def xyxy2xywh(x: list):
     assert len(x) == 4
-    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
+    y = np.array(x, copy=True)
     y[0] = (x[0] + x[2]) / 2
     y[1] = (x[1] + x[3]) / 2
     y[2] = x[2] - x[0]
@@ -24,7 +23,7 @@ def xyxy2xywh(x: list):
 
 def xywh2xyxy(x: list):
     assert len(x) == 4
-    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
+    y = np.array(x, copy=True)
     xy = x[:2]
     wh = x[2:] / 2
     y[:2] = xy - wh
@@ -32,32 +31,44 @@ def xywh2xyxy(x: list):
     return y
 
 
-def _get_covariance_matrix(boxes: torch.Tensor):
-    gbbs = torch.cat((boxes[:, 2:4].pow(2) / 12, boxes[:, 4:]), dim=-1)
-    a, b, c = gbbs.split(1, dim=-1)
-    cos = c.cos()
-    sin = c.sin()
-    cos2 = cos.pow(2)
-    sin2 = sin.pow(2)
+def _get_covariance_matrix(boxes: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    gbbs = np.concatenate((np.square(boxes[:, 2:4]) / 12.0, boxes[:, 4:]), axis=-1)
+    a, b, c = np.split(gbbs, 3, axis=-1)
+    cos = np.cos(c)
+    sin = np.sin(c)
+    cos2 = np.square(cos)
+    sin2 = np.square(sin)
     return a * cos2 + b * sin2, a * sin2 + b * cos2, (a - b) * cos * sin
 
 
 def batch_probiou(
-    obb1: Union[torch.Tensor, np.ndarray],
-    obb2: Union[torch.Tensor, np.ndarray],
+    obb1: Union[np.ndarray, list],
+    obb2: Union[np.ndarray, list],
     eps: float = 1e-7,
-) -> torch.Tensor:
-    obb1 = torch.from_numpy(obb1) if isinstance(obb1, np.ndarray) else obb1
-    obb2 = torch.from_numpy(obb2) if isinstance(obb2, np.ndarray) else obb2
-    x1, y1 = obb1[..., :2].split(1, dim=-1)
-    x2, y2 = (x.squeeze(-1)[None] for x in obb2[..., :2].split(1, dim=-1))
+) -> np.ndarray:
+    obb1 = np.asarray(obb1, dtype=np.float32)
+    obb2 = np.asarray(obb2, dtype=np.float32)
+
+    x1 = obb1[:, 0:1]
+    y1 = obb1[:, 1:2]
+    x2 = obb2[:, 0][None, :]
+    y2 = obb2[:, 1][None, :]
     a1, b1, c1 = _get_covariance_matrix(obb1)
-    a2, b2, c2 = (x.squeeze(-1)[None] for x in _get_covariance_matrix(obb2))
-    t1 = (((a1 + a2) * (y1 - y2).pow(2) + (b1 + b2) * (x1 - x2).pow(2)) / ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2) + eps)) * 0.25
-    t2 = (((c1 + c2) * (x2 - x1) * (y1 - y2)) / ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2) + eps)) * 0.5
-    t3 = (((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2)) / (4 * ((a1 * b1 - c1.pow(2)).clamp_(0) * (a2 * b2 - c2.pow(2)).clamp_(0)).sqrt() + eps) + eps).log() * 0.5
-    bd = (t1 + t2 + t3).clamp(eps, 100.0)
-    hd = (1.0 - (-bd).exp() + eps).sqrt()
+    a2, b2, c2 = (x[:, 0][None, :] for x in _get_covariance_matrix(obb2))
+
+    denominator = (a1 + a2) * (b1 + b2) - np.square(c1 + c2) + eps
+    t1 = (((a1 + a2) * np.square(y1 - y2) + (b1 + b2) * np.square(x1 - x2)) / denominator) * 0.25
+    t2 = (((c1 + c2) * (x2 - x1) * (y1 - y2)) / denominator) * 0.5
+
+    det1 = np.clip(a1 * b1 - np.square(c1), 0.0, None)
+    det2 = np.clip(a2 * b2 - np.square(c2), 0.0, None)
+    t3 = (
+        np.log((((a1 + a2) * (b1 + b2) - np.square(c1 + c2)) / (4 * np.sqrt(det1 * det2) + eps)) + eps)
+        * 0.5
+    )
+
+    bd = np.clip(t1 + t2 + t3, eps, 100.0)
+    hd = np.sqrt(1.0 - np.exp(-bd) + eps)
     return 1 - hd
 
 

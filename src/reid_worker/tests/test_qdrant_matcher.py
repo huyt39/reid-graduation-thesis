@@ -22,8 +22,14 @@ class MockQdrantStore:
         self.gated_update_result = True
         self.gated_update_calls = []
 
-    def search(self, embedding, top_k=5):
-        return self.search_results
+    def search(self, embedding, top_k=5, score_threshold=None):
+        results = self.search_results[:top_k]
+        if score_threshold is None:
+            return results
+        return [(pid, score) for pid, score in results if score >= score_threshold]
+
+    def search_person(self, person_id, embedding, min_score=0.70):
+        return None
 
     def add_person(self, person_id, embedding, metadata):
         self.persons[person_id] = {"embedding": embedding, "metadata": metadata}
@@ -167,6 +173,29 @@ def test_existing_match_returns_person_even_when_canonical_update_is_skipped():
     assert len(store.gated_update_calls) == 1
     assert store.gated_update_calls[0][1]["person_id"] == 42
     assert alloc_calls["n"] == 0
+
+
+def test_recent_reuse_hint_prevents_creating_new_person():
+    store = MockQdrantStore()
+    matcher = ReIDMatcher(
+        store,
+        id_allocator=_make_id_allocator(),
+        promote_v_threshold=0.6,
+        promote_consistency_threshold=0.7,
+    )
+    emb = np.random.randn(512).astype(np.float32)
+
+    pid = matcher.match_tracklet(
+        track_id=15,
+        embedding=emb,
+        v_avg=0.8,
+        embedding_consistency=0.9,
+        tracklet_len=10,
+        reuse_person_id=99,
+    )
+
+    assert pid == 99
+    assert store.persons == {}
 
 
 def test_id_allocator_failure_raises_person_id_allocation_error_and_does_not_create_person():

@@ -85,5 +85,25 @@ services:
   query_service:
     build: ../query_service
     env_file: ../query_service/.env
-    depends_on: [mongo, qdrant, redis, minio]
+    depends_on: [mongo, qdrant, redis, minio, vllm_service]
     ports: ["18090:8090"]
+
+  vllm_service:
+    build: ../vllm_service
+    env_file: ../vllm_service/.env
+    ports: ["18100:8100"]
+    # The upstream LLM endpoint is configured via VLLM_LLM_BASE_URL in the env file —
+    # point at any OpenAI-compatible API (local vLLM container, Ollama, OpenAI, etc.).
+    # query_service's NL parser falls back to a regex matcher if this service is down,
+    # so the readiness check (VLLM_REQUIRE_LLM_FOR_READY=false) lets the stack come up
+    # without a live LLM in dev environments.
+
+  ui:
+    build: ../ui
+    environment:
+      # Browser-side env: must point at the host-exposed gateway port (18080), not
+      # the in-cluster service name — the browser can't resolve "gateway" itself.
+      - NEXT_PUBLIC_GATEWAY_URL=http://localhost:18080
+      - NEXT_PUBLIC_STREAMING_WS=ws://localhost:8765
+    depends_on: [gateway]
+    ports: ["3000:3000"]

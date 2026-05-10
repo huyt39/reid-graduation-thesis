@@ -2,6 +2,17 @@ from kafka import KafkaProducer
 
 from src.kafka.serialization import load_avro_schema, serialize_avro
 
+_STRING_ATTRIBUTE_FIELDS = (
+    "gender",
+    "age_child",
+    "backpack",
+    "sidebag",
+    "hat",
+    "glasses",
+    "sleeve",
+    "lower",
+)
+
 
 class WorkerKafkaProducer:
     def __init__(
@@ -34,18 +45,21 @@ class WorkerKafkaProducer:
         if attributes is not None:
             attributes = {str(k): str(v) for k, v in attributes.items()}
 
-        return {
+        normalized = {
             "person_id": int(person["person_id"]),
             "bbox": [float(v) for v in person["bbox"]],
             "confidence": float(person["confidence"]),
-            "gender": str(person.get("gender", "unknown")),
-            "gender_confidence": float(person.get("gender_confidence", 0.0)),
             "tracklet_id": person.get("tracklet_id"),
             "tracklet_state": person.get("tracklet_state"),
             "visibility_score": float(person.get("visibility_score", 0.0)),
             "quality": quality,
             "attributes": attributes,
         }
+        for field in _STRING_ATTRIBUTE_FIELDS:
+            value = person.get(field)
+            normalized[field] = "unknown" if value in (None, "") else str(value)
+            normalized[f"{field}_confidence"] = float(person.get(f"{field}_confidence", 0.0) or 0.0)
+        return normalized
 
     def send(
         self,

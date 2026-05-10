@@ -15,6 +15,20 @@ def test_reid_output_serialization():
                 "confidence": 0.95,
                 "gender": "male",
                 "gender_confidence": 0.91,
+                "age_child": "adult",
+                "age_child_confidence": 0.77,
+                "backpack": "no",
+                "backpack_confidence": 0.88,
+                "sidebag": "no",
+                "sidebag_confidence": 0.86,
+                "hat": "no",
+                "hat_confidence": 0.9,
+                "glasses": "no",
+                "glasses_confidence": 0.92,
+                "sleeve": "long",
+                "sleeve_confidence": 0.83,
+                "lower": "pants",
+                "lower_confidence": 0.8,
                 "tracklet_id": "tracklet-123",
                 "tracklet_state": "matched",
                 "visibility_score": 0.87,
@@ -62,6 +76,41 @@ def test_normalize_tracked_person_defaults_and_types():
     assert normalized["visibility_score"] == 0.0
     assert normalized["quality"] is None
     assert normalized["attributes"] == {"gender": "male", "age": "25"}
+    assert normalized["age_child"] == "unknown"
+    assert normalized["age_child_confidence"] == 0.0
+    assert normalized["backpack"] == "unknown"
+    assert normalized["backpack_confidence"] == 0.0
+    assert normalized["sidebag"] == "unknown"
+    assert normalized["sidebag_confidence"] == 0.0
+    assert normalized["hat"] == "unknown"
+    assert normalized["hat_confidence"] == 0.0
+    assert normalized["glasses"] == "unknown"
+    assert normalized["glasses_confidence"] == 0.0
+    assert normalized["sleeve"] == "unknown"
+    assert normalized["sleeve_confidence"] == 0.0
+    assert normalized["lower"] == "unknown"
+    assert normalized["lower_confidence"] == 0.0
+
+
+def test_normalize_tracked_person_coerces_none_attribute_fields():
+    producer = WorkerKafkaProducer.__new__(WorkerKafkaProducer)
+
+    normalized = producer._normalize_tracked_person(
+        {
+            "person_id": 9,
+            "bbox": [1, 2, 3, 4],
+            "confidence": 0.8,
+            "age_child": None,
+            "age_child_confidence": None,
+            "hat": "",
+            "hat_confidence": None,
+        }
+    )
+
+    assert normalized["age_child"] == "unknown"
+    assert normalized["age_child_confidence"] == 0.0
+    assert normalized["hat"] == "unknown"
+    assert normalized["hat_confidence"] == 0.0
 
 
 def test_send_uses_normalized_tracked_persons(monkeypatch):

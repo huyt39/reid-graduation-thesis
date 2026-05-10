@@ -14,12 +14,41 @@
           {"name": "person_id", "type": "int"},
           {"name": "bbox", "type": {"type": "array", "items": "float"}},
           {"name": "confidence", "type": "float"},
-          {"name": "gender", "type": "string"},
-          {"name": "gender_confidence", "type": "float"}
+          {"name": "gender", "type": "string", "default": "unknown"},
+          {"name": "gender_confidence", "type": "float", "default": 0.0},
+          {"name": "age_child", "type": "string", "default": "unknown"},
+          {"name": "age_child_confidence", "type": "float", "default": 0.0},
+          {"name": "backpack", "type": "string", "default": "unknown"},
+          {"name": "backpack_confidence", "type": "float", "default": 0.0},
+          {"name": "sidebag", "type": "string", "default": "unknown"},
+          {"name": "sidebag_confidence", "type": "float", "default": 0.0},
+          {"name": "hat", "type": "string", "default": "unknown"},
+          {"name": "hat_confidence", "type": "float", "default": 0.0},
+          {"name": "glasses", "type": "string", "default": "unknown"},
+          {"name": "glasses_confidence", "type": "float", "default": 0.0},
+          {"name": "sleeve", "type": "string", "default": "unknown"},
+          {"name": "sleeve_confidence", "type": "float", "default": 0.0},
+          {"name": "lower", "type": "string", "default": "unknown"},
+          {"name": "lower_confidence", "type": "float", "default": 0.0},
+          {"name": "tracklet_id", "type": ["null", "string"], "default": null},
+          {"name": "tracklet_state", "type": ["null", "string"], "default": null},
+          {"name": "visibility_score", "type": "float", "default": 0.0},
+          {"name": "quality", "type": ["null", {
+            "type": "record",
+            "name": "TrackletQuality",
+            "fields": [
+              {"name": "v_avg", "type": "float", "default": 0.0},
+              {"name": "embedding_consistency", "type": "float", "default": 0.0},
+              {"name": "overall_consistency", "type": "float", "default": 0.0},
+              {"name": "good_frame_ratio", "type": "float", "default": 0.0}
+            ]
+          }], "default": null},
+          {"name": "attributes", "type": ["null", {"type": "map", "values": "string"}], "default": null}
         ]
       }
     }},
     {"name": "created_at", "type": "long"},
-    {"name": "image_data", "type": "bytes"}
+    {"name": "image_data", "type": "bytes"},
+    {"name": "schema_version", "type": "int", "default": 3}
   ]
 }

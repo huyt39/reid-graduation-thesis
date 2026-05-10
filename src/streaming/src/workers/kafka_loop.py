@@ -21,6 +21,7 @@ async def run_kafka_loop(
     *,
     max_poll_records: int = 50,
     jpeg_quality: int = 75,
+    source: str = "processed",
 ) -> None:
     """Poll Kafka, decode frames, update cache, and broadcast to WebSocket clients.
 
@@ -45,7 +46,7 @@ async def run_kafka_loop(
                 continue
 
             for msg in messages:
-                frame = _decode_frame(msg, jpeg_quality)
+                frame = _decode_frame(msg, jpeg_quality, source=source)
                 if frame is None:
                     continue
 
@@ -70,7 +71,7 @@ async def run_kafka_loop(
             await asyncio.sleep(1)
 
 
-def _decode_frame(msg: dict, jpeg_quality: int) -> FrameData | None:
+def _decode_frame(msg: dict, jpeg_quality: int, *, source: str) -> FrameData | None:
     try:
         image_bytes: bytes = msg["image_data"]
         nparr = np.frombuffer(image_bytes, np.uint8)
@@ -84,13 +85,37 @@ def _decode_frame(msg: dict, jpeg_quality: int) -> FrameData | None:
         )
         image_base64 = base64.b64encode(buf.tobytes()).decode("ascii")
 
+        tracked_persons = msg.get("tracked_persons")
+        if tracked_persons is None:
+            tracked_persons = [
+                {
+                    "person_id": None,
+                    "bbox": det["bbox"],
+                    "confidence": det.get("confidence", 0.0),
+                    "gender": "raw",
+                    "gender_confidence": 0.0,
+                    "tracklet_id": None,
+                    "tracklet_state": "raw_edge",
+                    "visibility_score": det.get("visibility_score", 0.0),
+                    "quality": None,
+                    "attributes": {
+                        "source": "raw_edge",
+                        "debug_label": f"raw conf={float(det.get('confidence', 0.0)):.2f}",
+                        "class_id": str(det.get("class_id", 0)),
+                        "overlap_ratio": f"{float(det.get('overlap_ratio', 0.0)):.4f}",
+                    },
+                }
+                for det in msg.get("detections", [])
+            ]
+
         return FrameData(
             device_id=msg["device_id"],
             frame_number=msg["frame_number"],
-            tracked_persons=msg["tracked_persons"],
+            tracked_persons=tracked_persons,
             created_at=msg["created_at"],
             image_base64=image_base64,
             schema_version=int(msg.get("schema_version", 2)),
+            source=source,
         )
     except Exception:
         logger.error("decode_frame.error", exc_info=True)

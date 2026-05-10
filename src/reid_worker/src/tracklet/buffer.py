@@ -29,8 +29,7 @@ class TrackletBuffer:
             if tracklet.state != TrackletState.ACTIVE:
                 continue
             has_enough = len(tracklet.entries) >= self.min_entries
-            window_expired = (current_time_ns - tracklet.created_at_ns) >= self.window_ns
-            if has_enough and window_expired:
+            if has_enough:
                 tracklet.state = TrackletState.READY
                 ready.append(tracklet)
         return ready

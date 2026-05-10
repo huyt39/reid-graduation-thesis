@@ -36,9 +36,7 @@ class EdgeKafkaProducer:
                     "confidence": d["confidence"],
                     "class_id": d["class_id"],
                     "visibility_score": d["visibility_score"],
-                    "visibility_tag": d["visibility_tag"],
                     "overlap_ratio": d["overlap_ratio"],
-                    "visibility_subscores": d["subscores"],
                 }
                 for d in detections
             ],

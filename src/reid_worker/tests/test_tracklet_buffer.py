@@ -14,11 +14,10 @@ def _make_entry(frame_idx: int, ts_offset_s: float = 0.0) -> TrackletEntry:
     )
 
 
-def test_ready_when_enough_entries_and_window_expired():
+def test_ready_as_soon_as_enough_entries_exist():
     buf = TrackletBuffer(min_entries=3, window_seconds=1.0)
     for i in range(5):
         buf.append(1, _make_entry(i, ts_offset_s=0.0))
-    assert len(buf.get_ready_tracklets(current_time_ns=int(0.5e9))) == 0
-    ready = buf.get_ready_tracklets(current_time_ns=int(1.5e9))
+    ready = buf.get_ready_tracklets(current_time_ns=int(0.5e9))
     assert len(ready) == 1
     assert ready[0].state == TrackletState.READY

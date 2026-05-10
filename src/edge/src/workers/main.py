@@ -49,6 +49,7 @@ class EdgePipeline:
             topic=self.settings.reid_topic,
             schema_path=self.settings.schema_path,
         )
+        self.detect_every_n_frames = max(1, self.settings.detect_every_n_frames)
 
     @staticmethod
     def _resolve_local_path(path_str: str) -> str:
@@ -60,8 +61,41 @@ class EdgePipeline:
         if cwd_candidate.exists():
             return str(cwd_candidate)
 
-        repo_root = Path(__file__).resolve().parents[4]
-        return str(repo_root / path)
+        parents = Path(__file__).resolve().parents
+        if len(parents) > 4:
+            repo_root = parents[4]
+            repo_candidate = repo_root / path
+            if repo_candidate.exists():
+                return str(repo_candidate)
+
+        return str(cwd_candidate)
+
+    @staticmethod
+    def _bbox_area_ratio(bbox: list[float], frame_w: int, frame_h: int) -> float:
+        x1, y1, x2, y2 = bbox
+        if frame_w <= 0 or frame_h <= 0 or x2 <= x1 or y2 <= y1:
+            return 0.0
+        return ((x2 - x1) * (y2 - y1)) / float(frame_w * frame_h)
+
+    def _should_force_send(
+        self,
+        *,
+        confidence: float,
+        visibility_score: float,
+        overlap_ratio: float,
+        cutoff_score: float,
+        bbox: list[float],
+        frame_w: int,
+        frame_h: int,
+    ) -> bool:
+        return (
+            confidence >= self.settings.always_send_conf_threshold
+            and visibility_score >= self.settings.always_send_visibility_threshold
+            and overlap_ratio <= self.settings.always_send_max_overlap_ratio
+            and cutoff_score >= self.settings.always_send_min_cutoff_score
+            and self._bbox_area_ratio(bbox, frame_w, frame_h)
+            >= self.settings.always_send_min_area_ratio
+        )
 
     @staticmethod
     def _make_spatial_key(bbox: list[float], frame_w: int, frame_h: int) -> str:
@@ -84,6 +118,48 @@ class EdgePipeline:
             source = int(source_url)
         return cv2.VideoCapture(source)
 
+    @staticmethod
+    def _synthetic_detection(frame_w: int, frame_h: int) -> dict:
+        x1 = frame_w * 0.30
+        y1 = frame_h * 0.15
+        x2 = frame_w * 0.70
+        y2 = frame_h * 0.92
+        return {
+            "bbox": [float(x1), float(y1), float(x2), float(y2)],
+            "confidence": 0.99,
+            "class_id": 0,
+        }
+
+    def _prepare_outbound_frame(
+        self,
+        frame,
+        detections: list[dict],
+    ) -> tuple:
+        max_encode_dim = self.settings.max_encode_dim
+        if max_encode_dim <= 0:
+            return frame, detections
+
+        frame_h, frame_w = frame.shape[:2]
+        longest_dim = max(frame_h, frame_w)
+        if longest_dim <= max_encode_dim:
+            return frame, detections
+
+        scale = max_encode_dim / float(longest_dim)
+        resized_w = max(1, int(round(frame_w * scale)))
+        resized_h = max(1, int(round(frame_h * scale)))
+        resized_frame = cv2.resize(frame, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
+
+        resized_detections = []
+        for det in detections:
+            resized_detections.append(
+                {
+                    **det,
+                    "bbox": [float(coord * scale) for coord in det["bbox"]],
+                }
+            )
+
+        return resized_frame, resized_detections
+
     def run(self) -> None:
         cap = self._open_capture(self.settings.source_url)
         if not cap.isOpened():
@@ -91,31 +167,79 @@ class EdgePipeline:
 
         frame_idx = 0
         processed_frames = 0
+        published_messages = 0
         fps_start = time.time()
+        total_detect_ms = 0.0
+        total_encode_ms = 0.0
+        total_publish_ms = 0.0
+        total_raw_detections = 0
+        total_outbound_detections = 0
         log.info(
             "edge_started",
             service=self.settings.service_name,
             source_url=self.settings.source_url,
             device_id=self.settings.device_id,
             topic=self.settings.reid_topic,
+            demo_mode=self.settings.demo_mode,
         )
 
         try:
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    log.info("edge_stream_ended", frame_idx=frame_idx)
+                    log.info(
+                        "edge_stream_ended",
+                        frame_idx=frame_idx,
+                        processed_frames=processed_frames,
+                        published_messages=published_messages,
+                    )
                     break
 
                 frame_idx += 1
+                if (
+                    self.settings.log_every_n_frames > 0
+                    and frame_idx % self.settings.log_every_n_frames == 0
+                ):
+                    log.info("edge_frame_read", frame_idx=frame_idx)
 
-                if not self.pre_skipper.should_process(frame):
+                if (
+                    not self.settings.demo_mode
+                    and self.detect_every_n_frames > 1
+                    and frame_idx % self.detect_every_n_frames != 0
+                ):
                     continue
 
+                if (
+                    not self.settings.demo_mode
+                    and self.detect_every_n_frames <= 1
+                    and not self.pre_skipper.should_process(frame)
+                ):
+                    continue
+
+                detect_started_at = time.perf_counter()
                 detections = self.detector.infer(frame)
-                self.pre_skipper.update_after_detection(detections)
-                if not detections:
-                    continue
+                detect_ms = (time.perf_counter() - detect_started_at) * 1000
+                total_detect_ms += detect_ms
+                if not self.settings.demo_mode:
+                    if self.detect_every_n_frames <= 1:
+                        self.pre_skipper.update_after_detection(detections)
+                    if not detections:
+                        continue
+                elif not detections:
+                    frame_h, frame_w = frame.shape[:2]
+                    detections = [self._synthetic_detection(frame_w, frame_h)]
+                    log.info(
+                        "edge_demo_synthetic_detection",
+                        frame_idx=frame_idx,
+                        bbox=detections[0]["bbox"],
+                    )
+
+                log.info(
+                    "edge_detections",
+                    frame_idx=frame_idx,
+                    detection_count=len(detections),
+                )
+                total_raw_detections += len(detections)
 
                 frame_h, frame_w = frame.shape[:2]
                 timestamp_ns = time.time_ns()
@@ -141,13 +265,24 @@ class EdgePipeline:
                     )
 
                     spatial_key = self._make_spatial_key(bbox, frame_w, frame_h)
-                    if not self.post_skipper.should_send(
-                        tag,
-                        visibility_score,
-                        spatial_key,
-                        frame_idx=frame_idx,
-                    ):
-                        continue
+                    if not self.settings.demo_mode:
+                        force_send = self._should_force_send(
+                            confidence=confidence,
+                            visibility_score=visibility_score,
+                            overlap_ratio=overlap_ratio,
+                            cutoff_score=subscores["cut_off"],
+                            bbox=bbox,
+                            frame_w=frame_w,
+                            frame_h=frame_h,
+                        )
+                        should_send = self.post_skipper.should_send(
+                            tag,
+                            visibility_score,
+                            spatial_key,
+                            frame_idx=frame_idx,
+                        )
+                        if not force_send and not should_send:
+                            continue
 
                     outbound_detections.append(
                         {
@@ -155,24 +290,30 @@ class EdgePipeline:
                             "confidence": confidence,
                             "class_id": det["class_id"],
                             "visibility_score": round(visibility_score, 4),
-                            "visibility_tag": tag.value,
                             "overlap_ratio": round(overlap_ratio, 4),
-                            "subscores": subscores,
                         }
                     )
 
                 if not outbound_detections:
                     continue
 
+                frame_to_encode, outbound_detections = self._prepare_outbound_frame(
+                    frame,
+                    outbound_detections,
+                )
+                encode_started_at = time.perf_counter()
                 ok, img_encoded = cv2.imencode(
                     ".jpg",
-                    frame,
+                    frame_to_encode,
                     [cv2.IMWRITE_JPEG_QUALITY, self.settings.jpeg_quality],
                 )
+                encode_ms = (time.perf_counter() - encode_started_at) * 1000
+                total_encode_ms += encode_ms
                 if not ok:
                     log.warning("frame_encode_failed", frame_idx=frame_idx)
                     continue
 
+                publish_started_at = time.perf_counter()
                 self.producer.send(
                     device_id=self.settings.device_id,
                     frame_number=frame_idx,
@@ -180,7 +321,17 @@ class EdgePipeline:
                     image_data=img_encoded.tobytes(),
                     timestamp_ns=timestamp_ns,
                 )
+                publish_ms = (time.perf_counter() - publish_started_at) * 1000
+                total_publish_ms += publish_ms
                 processed_frames += 1
+                published_messages += 1
+                total_outbound_detections += len(outbound_detections)
+                log.info(
+                    "edge_published",
+                    frame_idx=frame_idx,
+                    detection_count=len(outbound_detections),
+                    published_messages=published_messages,
+                )
 
                 if (
                     self.settings.log_every_n_processed_frames > 0
@@ -192,11 +343,22 @@ class EdgePipeline:
                         processed_frames=processed_frames,
                         frame_idx=frame_idx,
                         fps=round(processed_frames / elapsed, 2),
+                        source_fps=round(frame_idx / elapsed, 2),
+                        avg_detect_ms=round(total_detect_ms / processed_frames, 2),
+                        avg_encode_ms=round(total_encode_ms / processed_frames, 2),
+                        avg_publish_ms=round(total_publish_ms / processed_frames, 2),
+                        avg_raw_detections=round(total_raw_detections / processed_frames, 2),
+                        avg_outbound_detections=round(total_outbound_detections / processed_frames, 2),
                     )
         finally:
             cap.release()
             self.producer.close()
-            log.info("edge_stopped", processed_frames=processed_frames, frame_idx=frame_idx)
+            log.info(
+                "edge_stopped",
+                processed_frames=processed_frames,
+                published_messages=published_messages,
+                frame_idx=frame_idx,
+            )
 
 
 def run() -> None:

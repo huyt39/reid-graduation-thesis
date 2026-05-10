@@ -76,6 +76,7 @@ class WebSocketBroadcaster:
         return json.dumps(
             {
                 "type": "frame_update",
+                "source": frame.source,
                 "schema_version": frame.schema_version,
                 "device_id": frame.device_id,
                 "frame_number": frame.frame_number,

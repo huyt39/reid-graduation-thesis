@@ -180,9 +180,9 @@ class BYTETracker:
 
         strack_pool = self.joint_stracks(tracked_stracks, self.lost_stracks)
         self.multi_predict(strack_pool)
+
         dists = self.get_dists(strack_pool, detections)
         matches, u_track, u_detection = matching.linear_assignment(dists, thresh=self.args.match_thresh)
-
         for itracked, idet in matches:
             track = strack_pool[itracked]
             det = detections[idet]
@@ -206,7 +206,6 @@ class BYTETracker:
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
-
         for it in u_track:
             track = r_tracked_stracks[it]
             if track.state != TrackState.Lost:
@@ -220,10 +219,8 @@ class BYTETracker:
             unconfirmed[itracked].update(detections[idet], self.frame_id)
             activated_stracks.append(unconfirmed[itracked])
         for it in u_unconfirmed:
-            track = unconfirmed[it]
-            track.mark_removed()
-            removed_stracks.append(track)
-
+            unconfirmed[it].mark_removed()
+            removed_stracks.append(unconfirmed[it])
         for inew in u_detection:
             track = detections[inew]
             if track.score < self.args.new_track_thresh:
@@ -292,12 +289,9 @@ class BYTETracker:
         pairs = np.where(pdist < 0.15)
         dupa, dupb = [], []
         for p, q in zip(*pairs):
-            timep = stracksa[p].frame_id - stracksa[p].start_frame
-            timeq = stracksb[q].frame_id - stracksb[q].start_frame
-            if timep > timeq:
-                dupb.append(q)
-            else:
-                dupa.append(p)
+            # stracksa are actively-tracked; stracksb are lost.
+            # A current detection always takes precedence over a stale lost track.
+            dupb.append(q)
         resa = [t for i, t in enumerate(stracksa) if i not in dupa]
         resb = [t for i, t in enumerate(stracksb) if i not in dupb]
         return resa, resb

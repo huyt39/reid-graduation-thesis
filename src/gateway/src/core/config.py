@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     # Rate limiting (requests per minute per client IP)
     rate_limit_rpm: int = 120
 
+    # CORS — comma-separated list of allowed browser origins
+    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+
     # Bootstrap admin credentials (for initial login)
     admin_username: str = "admin"
     admin_password: str = "admin"

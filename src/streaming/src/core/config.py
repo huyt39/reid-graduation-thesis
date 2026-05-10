@@ -8,8 +8,11 @@ class Settings(BaseSettings):
     # Kafka
     kafka_bootstrap_servers: str = "localhost:29092"
     output_topic: str = "reid_output"
+    input_topic: str = "reid_input"
     consumer_group: str = "streaming_consumer_group"
+    raw_consumer_group: str = "streaming_raw_consumer_group"
     schema_path: str = "src/contracts/reid_output.avsc"
+    input_schema_path: str = "src/contracts/reid_input.avsc"
     max_poll_records: int = 50
 
     # WebSocket

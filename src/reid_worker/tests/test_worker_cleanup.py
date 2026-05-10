@@ -19,6 +19,12 @@ def _make_pipeline(stale_seconds: float = 5.0) -> WorkerPipeline:
         1: int(1e9),
         2: int(4e9),
     }
+    pipeline.person_last_observation = {}
+    pipeline.processed_messages = 0
+    pipeline.ready_tracklets = 0
+    pipeline.embedded_tracklets = 0
+    pipeline.matched_tracklets = 0
+    pipeline.worker_started_at = 0.0
     return pipeline
 
 
@@ -57,7 +63,13 @@ def test_process_message_with_empty_track_results_keeps_recent_state(monkeypatch
     pipeline.track_id_to_person_id = {1: 101}
     pipeline.track_metadata = {1: {"tracklet_id": "tracklet-1"}}
     pipeline.track_last_seen_ns = {1: int(1e9)}
+    pipeline.person_last_observation = {}
     pipeline._current_device_id = ""
+    pipeline.processed_messages = 0
+    pipeline.ready_tracklets = 0
+    pipeline.embedded_tracklets = 0
+    pipeline.matched_tracklets = 0
+    pipeline.worker_started_at = 0.0
 
     class DummyTracker:
         def update(self, *args, **kwargs):
@@ -99,7 +111,13 @@ def test_process_message_with_empty_track_results_removes_stale_state(monkeypatc
     pipeline.track_id_to_person_id = {1: 101}
     pipeline.track_metadata = {1: {"tracklet_id": "tracklet-1"}}
     pipeline.track_last_seen_ns = {1: int(1e9)}
+    pipeline.person_last_observation = {}
     pipeline._current_device_id = ""
+    pipeline.processed_messages = 0
+    pipeline.ready_tracklets = 0
+    pipeline.embedded_tracklets = 0
+    pipeline.matched_tracklets = 0
+    pipeline.worker_started_at = 0.0
 
     class DummyTracker:
         def update(self, *args, **kwargs):

@@ -54,10 +54,29 @@ class ModelServiceClient:
         raise Exception(f"Batch feature extraction failed: {response.status_code}: {response.text}")
 
     async def classify_gender(self, image_data: bytes) -> dict[str, Any]:
-        """Call POST /gender/classify. Returns {"gender", "confidence", "probabilities"}."""
+        """Call POST /gender/classify. Returns {"gender", "confidence", "probabilities"}.
+
+        Note: the inference engine serves this endpoint from the multi-attribute model
+        when available, so the response shape is preserved for backward compat but the
+        underlying weights are the regularized 8-task model.
+        """
         self._ensure_client()
         files = {"image": ("image.jpg", image_data, "image/jpeg")}
         response = await self.client.post(f"{self.base_url}/gender/classify", files=files)
         if response.status_code == 200:
             return response.json()
         raise Exception(f"Gender classification failed: {response.status_code}: {response.text}")
+
+    async def classify_attributes(self, image_data: bytes) -> dict[str, Any]:
+        """Call POST /attributes/classify — full 8-task person-attribute prediction.
+
+        Returns a dict keyed by task name; each value carries ``label``, ``confidence``,
+        and ``probabilities``. See ``inference_engine/src/models/multi_attr_classifier.py``
+        for the task list and label vocabularies.
+        """
+        self._ensure_client()
+        files = {"image": ("image.jpg", image_data, "image/jpeg")}
+        response = await self.client.post(f"{self.base_url}/attributes/classify", files=files)
+        if response.status_code == 200:
+            return response.json()
+        raise Exception(f"Attribute classification failed: {response.status_code}: {response.text}")

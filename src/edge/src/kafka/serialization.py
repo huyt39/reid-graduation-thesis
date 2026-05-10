@@ -14,10 +14,12 @@ def _resolve_schema_path(schema_path: str) -> Path:
     if cwd_candidate.exists():
         return cwd_candidate
 
-    repo_root = Path(__file__).resolve().parents[4]
-    repo_candidate = repo_root / path
-    if repo_candidate.exists():
-        return repo_candidate
+    parents = Path(__file__).resolve().parents
+    if len(parents) > 4:
+        repo_root = parents[4]
+        repo_candidate = repo_root / path
+        if repo_candidate.exists():
+            return repo_candidate
 
     return cwd_candidate
 

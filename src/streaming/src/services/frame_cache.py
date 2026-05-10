@@ -12,6 +12,7 @@ class FrameData:
     created_at: int
     image_base64: str
     schema_version: int = 2
+    source: str = "processed"
 
 
 class FrameCache:

@@ -10,14 +10,20 @@ def _resolve_schema_path(schema_path: str) -> Path:
     path = Path(schema_path)
     if path.is_absolute():
         return path
-    cwd_candidate = Path.cwd() / path
-    if cwd_candidate.exists():
-        return cwd_candidate
-    repo_root = Path(__file__).resolve().parents[4]
-    repo_candidate = repo_root / path
-    if repo_candidate.exists():
-        return repo_candidate
-    return cwd_candidate
+
+    cwd_path = Path.cwd() / path
+    if cwd_path.exists():
+        return cwd_path
+
+    parents = Path(__file__).resolve().parents
+    if len(parents) > 4:
+        repo_root = parents[4]
+        repo_path = repo_root / path
+        if repo_path.exists():
+            return repo_path
+
+    return cwd_path
+
 
 
 def load_avro_schema(schema_path: str) -> avro.schema.Schema:

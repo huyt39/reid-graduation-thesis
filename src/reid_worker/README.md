@@ -7,3 +7,8 @@ Worker service skeleton with uv.
 ## Runtime Notes
 - `RedisPersonIdAllocator` is used to allocate globally unique `person_id` values across worker instances.
 - The worker uses fail-fast behavior for ID allocation: if Redis allocation fails, it logs the error and skips creating a new person for that tracklet instead of falling back to an in-memory counter.
+
+## Deploy Notes
+- `reid_worker` is a background consumer/processor and does not expose an HTTP endpoint.
+- The worker should start only after Kafka, MongoDB, Qdrant, Redis, MinIO, and the inference service are reachable.
+- In Kubernetes, deploy it as a `Deployment` without a `Service` unless you add an explicit operational endpoint later.

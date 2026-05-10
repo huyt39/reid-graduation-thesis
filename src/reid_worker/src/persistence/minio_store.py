@@ -20,7 +20,12 @@ class MinIOSnapshotStore:
     ) -> None:
         from minio import Minio
         self._client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
-        self._ensure_bucket()
+        self._available = False
+        try:
+            self._ensure_bucket()
+            self._available = True
+        except Exception as err:
+            log.error("minio.init_failed", error=str(err), exc_info=True)
 
     def _ensure_bucket(self) -> None:
         if not self._client.bucket_exists(_BUCKET):
@@ -29,6 +34,8 @@ class MinIOSnapshotStore:
 
     def upload_snapshot(self, key: str, image_bytes: bytes) -> str:
         """Upload JPEG bytes and return the object key."""
+        if not self._available:
+            return "    "
         try:
             self._client.put_object(
                 _BUCKET,
@@ -38,8 +45,8 @@ class MinIOSnapshotStore:
                 content_type="image/jpeg",
             )
             return key
-        except Exception:
-            log.error("minio.upload_failed", key=key, exc_info=True)
+        except Exception as err:
+            log.error("minio.upload_failed", key=key, error=str(err), exc_info=True)
             return ""
 
     def upload_person_snapshot(self, person_id: int, image_bytes: bytes) -> str:
@@ -50,8 +57,10 @@ class MinIOSnapshotStore:
 
     def presigned_url(self, key: str, expires_hours: int = 1) -> str:
         from datetime import timedelta
+        if not key or not self._available:
+            return ""
         try:
             return self._client.presigned_get_object(_BUCKET, key, expires=timedelta(hours=expires_hours))
-        except Exception:
-            log.error("minio.presigned_failed", key=key, exc_info=True)
+        except Exception as err:
+            log.error("minio.presigned_failed", key=key, error=str(err), exc_info=True)
             return ""

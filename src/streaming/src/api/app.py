@@ -19,12 +19,18 @@ logger = structlog.get_logger()
 
 # Shared state initialised during lifespan
 frame_cache = FrameCache()
+raw_frame_cache = FrameCache()
 broadcaster = WebSocketBroadcaster(
     frame_cache, semaphore_limit=settings.broadcast_semaphore,
+)
+raw_broadcaster = WebSocketBroadcaster(
+    raw_frame_cache, semaphore_limit=settings.broadcast_semaphore,
 )
 streaming_state = {
     "kafka_loop_running": False,
     "kafka_loop_failed": False,
+    "raw_kafka_loop_running": False,
+    "raw_kafka_loop_failed": False,
 }
 
 
@@ -37,9 +43,17 @@ async def lifespan(app: FastAPI):
         group_id=settings.consumer_group,
         schema_path=settings.schema_path,
     )
+    raw_consumer = StreamingKafkaConsumer(
+        bootstrap_servers=settings.kafka_bootstrap_servers,
+        topic=settings.input_topic,
+        group_id=settings.raw_consumer_group,
+        schema_path=settings.input_schema_path,
+    )
 
     streaming_state["kafka_loop_running"] = True
     streaming_state["kafka_loop_failed"] = False
+    streaming_state["raw_kafka_loop_running"] = True
+    streaming_state["raw_kafka_loop_failed"] = False
 
     kafka_task = asyncio.create_task(
         run_kafka_loop(
@@ -48,8 +62,20 @@ async def lifespan(app: FastAPI):
             broadcaster,
             max_poll_records=settings.max_poll_records,
             jpeg_quality=settings.jpeg_quality,
+            source="processed",
         ),
         name="kafka-consumer-loop",
+    )
+    raw_kafka_task = asyncio.create_task(
+        run_kafka_loop(
+            raw_consumer,
+            raw_frame_cache,
+            raw_broadcaster,
+            max_poll_records=settings.max_poll_records,
+            jpeg_quality=settings.jpeg_quality,
+            source="raw",
+        ),
+        name="raw-kafka-consumer-loop",
     )
     logger.info("streaming.started")
 
@@ -65,17 +91,36 @@ async def lifespan(app: FastAPI):
 
     kafka_task.add_done_callback(_on_kafka_task_done)
 
+    def _on_raw_kafka_task_done(task: asyncio.Task) -> None:
+        streaming_state["raw_kafka_loop_running"] = False
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            streaming_state["raw_kafka_loop_failed"] = True
+            logger.error("streaming.raw_kafka_loop_failed", exc_info=exc)
+
+    raw_kafka_task.add_done_callback(_on_raw_kafka_task_done)
+
 
     yield
 
     # Shutdown
     kafka_task.cancel()
+    raw_kafka_task.cancel()
     try:
         await kafka_task
     except asyncio.CancelledError:
         pass
+    try:
+        await raw_kafka_task
+    except asyncio.CancelledError:
+        pass
     streaming_state["kafka_loop_running"] = False
+    streaming_state["raw_kafka_loop_running"] = False
     consumer.close()
+    raw_consumer.close()
     logger.info("streaming.stopped")
 
 
@@ -114,8 +159,15 @@ def readyz():
     checks = {
         "kafka_loop_running": bool(streaming_state["kafka_loop_running"]),
         "kafka_loop_failed": bool(streaming_state["kafka_loop_failed"]),
+        "raw_kafka_loop_running": bool(streaming_state["raw_kafka_loop_running"]),
+        "raw_kafka_loop_failed": bool(streaming_state["raw_kafka_loop_failed"]),
     }
-    ready = checks["kafka_loop_running"] and not checks["kafka_loop_failed"]
+    ready = (
+        checks["kafka_loop_running"]
+        and not checks["kafka_loop_failed"]
+        and checks["raw_kafka_loop_running"]
+        and not checks["raw_kafka_loop_failed"]
+    )
 
     if not ready:
         raise HTTPException(
@@ -126,6 +178,8 @@ def readyz():
                 "checks": checks,
                 "connections": broadcaster.connection_count,
                 "devices": frame_cache.device_ids(),
+                "raw_connections": raw_broadcaster.connection_count,
+                "raw_devices": raw_frame_cache.device_ids(),
             },
         )
 
@@ -135,24 +189,25 @@ def readyz():
         "checks": checks,
         "connections": broadcaster.connection_count,
         "devices": frame_cache.device_ids(),
+        "raw_connections": raw_broadcaster.connection_count,
+        "raw_devices": raw_frame_cache.device_ids(),
     }
 
 
 # WebSocket endpoint
 
-@app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    if broadcaster.connection_count >= settings.websocket_max_connections:
+async def _serve_websocket(ws: WebSocket, ws_broadcaster: WebSocketBroadcaster):
+    if ws_broadcaster.connection_count >= settings.websocket_max_connections:
         await ws.close(code=1013, reason="Too many connections")
         return
 
     await ws.accept()
-    broadcaster.add(ws)
+    ws_broadcaster.add(ws)
     logger.info("ws.connected", client=ws.client)
 
     try:
         # Send current device list on connect
-        await broadcaster.send_device_list(ws)
+        await ws_broadcaster.send_device_list(ws)
 
         while True:
             raw = await ws.receive_text()
@@ -160,7 +215,7 @@ async def websocket_endpoint(ws: WebSocket):
                 data = json.loads(raw)
                 if data.get("type") == "subscribe_device":
                     device_id = data.get("device_id", "")
-                    await broadcaster.send_latest_frame(ws, device_id)
+                    await ws_broadcaster.send_latest_frame(ws, device_id)
             except json.JSONDecodeError:
                 logger.warning("ws.invalid_json")
     except WebSocketDisconnect:
@@ -168,5 +223,15 @@ async def websocket_endpoint(ws: WebSocket):
     except Exception:
         logger.error("ws.error", exc_info=True)
     finally:
-        broadcaster.remove(ws)
+        ws_broadcaster.remove(ws)
         logger.info("ws.disconnected", client=ws.client)
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await _serve_websocket(ws, broadcaster)
+
+
+@app.websocket("/ws/raw")
+async def raw_websocket_endpoint(ws: WebSocket):
+    await _serve_websocket(ws, raw_broadcaster)

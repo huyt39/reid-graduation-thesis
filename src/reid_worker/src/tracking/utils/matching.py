@@ -42,7 +42,7 @@ def iou_distance(atracks, btracks):
             ious = batch_probiou(
                 np.ascontiguousarray(atlbrs, dtype=np.float32),
                 np.ascontiguousarray(btlbrs, dtype=np.float32),
-            ).numpy()
+            )
         else:
             ious = bbox_ioa(
                 np.ascontiguousarray(atlbrs, dtype=np.float32),
