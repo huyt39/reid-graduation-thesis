@@ -1,7 +1,8 @@
-FROM node:20-alpine
+FROM node:22-alpine
 WORKDIR /app
+RUN corepack enable
 COPY package.json /app/
-RUN npm install
+RUN pnpm install --no-frozen-lockfile
 COPY . /app
 EXPOSE 3000
-CMD ["npm", "run", "dev"]
+CMD ["pnpm", "dev"]
