@@ -6,6 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
+import { PersonSnapshot } from "@/components/person-snapshot";
 import { usePersons } from "@/hooks/use-persons";
 import { formatRelative } from "@/lib/date-format";
 
@@ -25,11 +26,7 @@ export function PersonsList() {
   }
 
   if (error) {
-    return (
-      <div className="text-sm text-destructive">
-        Failed to load persons: {error.message}
-      </div>
-    );
+    return <div className="text-sm text-destructive">Failed to load persons: {error.message}</div>;
   }
 
   const items = data?.items ?? [];
@@ -51,6 +48,12 @@ export function PersonsList() {
           <Link key={person.person_id} href={`/persons/${person.person_id}`}>
             <Card className="hover:border-primary/40 transition-colors h-full">
               <CardHeader className="pb-3">
+                <PersonSnapshot
+                  src={person.snapshot_url}
+                  alt={`Person ${person.person_id} snapshot`}
+                  label={`#${person.person_id}`}
+                  className="mb-4 aspect-[4/5]"
+                />
                 <CardTitle className="flex items-center justify-between text-base">
                   <span>#{person.person_id}</span>
                   <Badge variant={person.is_active ? "default" : "secondary"}>
@@ -73,9 +76,7 @@ export function PersonsList() {
                 </div>
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Last device</span>
-                  <span className="font-mono text-xs">
-                    {person.stats.last_seen_device || "—"}
-                  </span>
+                  <span className="font-mono text-xs">{person.stats.last_seen_device || "—"}</span>
                 </div>
               </CardContent>
             </Card>

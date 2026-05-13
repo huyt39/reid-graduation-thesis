@@ -32,6 +32,7 @@
           {"name": "lower_confidence", "type": "float", "default": 0.0},
           {"name": "tracklet_id", "type": ["null", "string"], "default": null},
           {"name": "tracklet_state", "type": ["null", "string"], "default": null},
+          {"name": "snapshot_key", "type": ["null", "string"], "default": null},
           {"name": "visibility_score", "type": "float", "default": 0.0},
           {"name": "quality", "type": ["null", {
             "type": "record",

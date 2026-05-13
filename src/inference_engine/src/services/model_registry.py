@@ -44,6 +44,7 @@ class ModelRegistry:
         self.lmbn = None
         self.gender_model = None
         self.multi_attr_model = None  # 8-task PA-100K classifier; takes priority over gender_model
+        self.standalone_gender_model = None  # PETA-trained gender classifier; overrides multi_attr gender head
 
         self.embedding_transform = transforms.Compose([
             transforms.ToTensor(),
@@ -106,6 +107,26 @@ class ModelRegistry:
         else:
             log.info("model_registry.multi_attr_weights_missing", path=str(multi_attr_path))
 
+        # Standalone gender classifier (PETA-trained, 88% acc). Overrides the gender
+        # head of the multi-attr model when present.
+        standalone_gender_path = _resolve_path(settings.standalone_gender_weights)
+        if standalone_gender_path.exists():
+            try:
+                from src.models.standalone_gender import StandaloneGenderModel
+                self.standalone_gender_model = StandaloneGenderModel(
+                    str(standalone_gender_path), self.device
+                )
+                log.info("model_registry.standalone_gender_loaded", path=str(standalone_gender_path))
+            except Exception as exc:
+                self.standalone_gender_model = None
+                log.warning(
+                    "model_registry.standalone_gender_load_failed",
+                    path=str(standalone_gender_path),
+                    error=str(exc),
+                )
+        else:
+            log.info("model_registry.standalone_gender_weights_missing", path=str(standalone_gender_path))
+
         # Legacy single-task gender classifier (loaded only if multi-attr is absent).
         if self.multi_attr_model is None:
             eff_path = _resolve_path(settings.efficientnet_weights)
@@ -138,6 +159,8 @@ class ModelRegistry:
                 self.multi_attr_model(dummy_cls)
             elif self.gender_model:
                 self.gender_model(dummy_cls)
+            if self.standalone_gender_model:
+                self.standalone_gender_model.model(dummy_cls)
         log.info("model_registry.warmup_done")
 
     # ── Inference helpers ─────────────────────────────────────────────
@@ -218,16 +241,27 @@ class ModelRegistry:
         if self.multi_attr_model is None:
             raise RuntimeError("Multi-attribute model not loaded")
         tensor = self.preprocess_classification(image_bytes)
-        return self.multi_attr_model.predict(tensor)
+        result = self.multi_attr_model.predict(tensor)
+        if self.standalone_gender_model is not None:
+            result["gender"] = self.standalone_gender_model.predict(tensor)
+        return result
 
     @torch.no_grad()
     def classify_gender(self, image_bytes: bytes) -> dict:
         """Backward-compatible gender endpoint.
 
-        Prefers the multi-attribute model (better accuracy, regularized training)
-        and extracts its gender head. Falls back to the legacy single-task model.
+        Prefers the standalone PETA-trained gender model (88% acc).
+        Falls back to the multi-attribute model gender head, then the legacy model.
         Response shape is unchanged — callers like ``GenderVoter`` keep working.
         """
+        if self.standalone_gender_model is not None:
+            tensor = self.preprocess_classification(image_bytes)
+            gen = self.standalone_gender_model.predict(tensor)
+            return {
+                "gender": gen["label"],
+                "confidence": gen["confidence"],
+                "probabilities": gen["probabilities"],
+            }
         if self.multi_attr_model is not None:
             tensor = self.preprocess_classification(image_bytes)
             attrs = self.multi_attr_model.predict(tensor)

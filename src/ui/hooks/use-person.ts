@@ -13,7 +13,7 @@ export function usePerson(id: number | null) {
   return useSWR<Person>(
     id ? ["person", id] : null,
     async ([, personId]) => {
-      const response = await personsClient.get(personId as number);
+      const response = await personsClient.getById(personId as number);
       if (response.error || !response.data) {
         throw new Error(response.error || "Failed to load person");
       }

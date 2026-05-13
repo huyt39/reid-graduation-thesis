@@ -10,6 +10,7 @@ import structlog
 from src.kafka.consumer import StreamingKafkaConsumer
 from src.services.broadcaster import WebSocketBroadcaster
 from src.services.frame_cache import FrameCache, FrameData
+from src.services.minio_urls import MinIOURLBuilder
 
 logger = structlog.get_logger()
 
@@ -18,6 +19,7 @@ async def run_kafka_loop(
     consumer: StreamingKafkaConsumer,
     frame_cache: FrameCache,
     broadcaster: WebSocketBroadcaster,
+    minio_urls: MinIOURLBuilder | None = None,
     *,
     max_poll_records: int = 50,
     jpeg_quality: int = 75,
@@ -46,7 +48,7 @@ async def run_kafka_loop(
                 continue
 
             for msg in messages:
-                frame = _decode_frame(msg, jpeg_quality, source=source)
+                frame = _decode_frame(msg, jpeg_quality, minio_urls=minio_urls, source=source)
                 if frame is None:
                     continue
 
@@ -71,7 +73,23 @@ async def run_kafka_loop(
             await asyncio.sleep(1)
 
 
-def _decode_frame(msg: dict, jpeg_quality: int, *, source: str) -> FrameData | None:
+def _with_snapshot_urls(
+    tracked_persons: list[dict], minio_urls: MinIOURLBuilder | None,
+) -> list[dict]:
+    if minio_urls is None:
+        return tracked_persons
+
+    enriched: list[dict] = []
+    for person in tracked_persons:
+        item = dict(person)
+        item["snapshot_url"] = minio_urls.presigned_url(item.get("snapshot_key"))
+        enriched.append(item)
+    return enriched
+
+
+def _decode_frame(
+    msg: dict, jpeg_quality: int, *, minio_urls: MinIOURLBuilder | None, source: str,
+) -> FrameData | None:
     try:
         image_bytes: bytes = msg["image_data"]
         nparr = np.frombuffer(image_bytes, np.uint8)
@@ -96,6 +114,7 @@ def _decode_frame(msg: dict, jpeg_quality: int, *, source: str) -> FrameData | N
                     "gender_confidence": 0.0,
                     "tracklet_id": None,
                     "tracklet_state": "raw_edge",
+                    "snapshot_key": None,
                     "visibility_score": det.get("visibility_score", 0.0),
                     "quality": None,
                     "attributes": {
@@ -107,6 +126,8 @@ def _decode_frame(msg: dict, jpeg_quality: int, *, source: str) -> FrameData | N
                 }
                 for det in msg.get("detections", [])
             ]
+        else:
+            tracked_persons = _with_snapshot_urls(tracked_persons, minio_urls)
 
         return FrameData(
             device_id=msg["device_id"],

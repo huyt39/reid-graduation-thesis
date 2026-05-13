@@ -21,7 +21,7 @@ class PersonsClient extends BaseApiClient {
     return this.get<PaginatedPersons>("/persons", { ...rest, page, page_size });
   }
 
-  get(id: number): Promise<ApiResponse<Person>> {
+  getById(id: number): Promise<ApiResponse<Person>> {
     return super.get<Person>(`/persons/${id}`);
   }
 

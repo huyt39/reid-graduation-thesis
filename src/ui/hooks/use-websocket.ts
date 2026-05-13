@@ -24,6 +24,7 @@ export interface TrackedPerson {
   lower_confidence?: number;
   tracklet_id: string | null;
   tracklet_state: string | null;
+  snapshot_url?: string | null;
   visibility_score: number;
   quality: {
     v_avg: number;

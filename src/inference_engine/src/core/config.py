@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     # Multi-attribute classifier (8 PA-100K tasks on shared EfficientNet-B0 backbone).
     # When loaded, takes priority over `efficientnet_weights` for /gender/classify.
     multi_attr_weights: str = "src/assets/models/multi_attr/best_model_multi_attr_b0.pth"
+    # Standalone gender classifier trained on PETA (88% val_acc). When loaded,
+    # overrides the gender head of multi_attr_weights for all gender predictions.
+    standalone_gender_weights: str = "src/assets/models/gender/gender_model.pth"
 
     # Inference
     device: str = "auto"  # "auto", "cuda", "cpu"

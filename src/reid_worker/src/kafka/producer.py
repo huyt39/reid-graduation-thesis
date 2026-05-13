@@ -51,6 +51,7 @@ class WorkerKafkaProducer:
             "confidence": float(person["confidence"]),
             "tracklet_id": person.get("tracklet_id"),
             "tracklet_state": person.get("tracklet_state"),
+            "snapshot_key": person.get("snapshot_key"),
             "visibility_score": float(person.get("visibility_score", 0.0)),
             "quality": quality,
             "attributes": attributes,

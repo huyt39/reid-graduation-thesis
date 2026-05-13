@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     # Image encoding
     jpeg_quality: int = 75
 
+    # MinIO (for presigned snapshot URLs)
+    minio_internal_endpoint: str = "localhost:9000"
+    minio_public_endpoint: str = "localhost:9002"
+    minio_access_key: str = "minio"
+    minio_secret_key: str = "minio123"
+    minio_secure: bool = False
+
     model_config = SettingsConfigDict(
         env_file=".env", env_prefix="STREAMING_", extra="ignore",
     )

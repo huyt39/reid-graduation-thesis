@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { PersonSnapshot } from "@/components/person-snapshot";
 import {
   Table,
   TableBody,
@@ -52,24 +53,25 @@ export function PersonDetail({ personId }: { personId: number }) {
             </Badge>
           </CardTitle>
         </CardHeader>
-        <CardContent className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 text-sm">
-          <Field label="Gender" value={person.attributes.gender || "—"} />
-          <Field
-            label="Gender confidence"
-            value={`${(person.attributes.gender_confidence * 100).toFixed(1)}%`}
+        <CardContent className="grid gap-6 lg:grid-cols-[240px_minmax(0,1fr)]">
+          <PersonSnapshot
+            src={person.snapshot_url}
+            alt={`Person ${person.person_id} snapshot`}
+            label={`#${person.person_id}`}
+            className="aspect-[4/5] min-h-64"
           />
-          <Field
-            label="Sightings"
-            value={person.stats.sighting_count.toLocaleString()}
-          />
-          <Field
-            label="Last device"
-            value={person.stats.last_seen_device || "—"}
-            mono
-          />
-          <Field label="First seen" value={formatDateTime(person.stats.first_seen_at)} />
-          <Field label="Last seen" value={formatDateTime(person.stats.last_seen_at)} />
-          <Field label="Source" value={person.source} mono />
+          <div className="grid gap-4 text-sm sm:grid-cols-2 lg:grid-cols-3">
+            <Field label="Gender" value={person.attributes.gender || "—"} />
+            <Field
+              label="Gender confidence"
+              value={`${(person.attributes.gender_confidence * 100).toFixed(1)}%`}
+            />
+            <Field label="Sightings" value={person.stats.sighting_count.toLocaleString()} />
+            <Field label="Last device" value={person.stats.last_seen_device || "—"} mono />
+            <Field label="First seen" value={formatDateTime(person.stats.first_seen_at)} />
+            <Field label="Last seen" value={formatDateTime(person.stats.last_seen_at)} />
+            <Field label="Source" value={person.source} mono />
+          </div>
         </CardContent>
       </Card>
 
@@ -120,6 +122,7 @@ function SightingsTab({ personId }: { personId: number }) {
         <Table>
           <TableHeader>
             <TableRow>
+              <TableHead>Snapshot</TableHead>
               <TableHead>Device</TableHead>
               <TableHead>Started</TableHead>
               <TableHead>Ended</TableHead>
@@ -130,15 +133,19 @@ function SightingsTab({ personId }: { personId: number }) {
           <TableBody>
             {items.map((s) => (
               <TableRow key={s.tracklet_id}>
+                <TableCell>
+                  <PersonSnapshot
+                    src={s.snapshot_url}
+                    alt={`Sighting ${s.tracklet_id} snapshot`}
+                    label="Shot"
+                    className="h-16 w-12 rounded-md"
+                  />
+                </TableCell>
                 <TableCell className="font-mono text-xs">{s.device_id}</TableCell>
                 <TableCell>{formatDateTime(s.started_at)}</TableCell>
                 <TableCell>{formatDateTime(s.ended_at)}</TableCell>
-                <TableCell className="text-right">
-                  {s.duration_seconds.toFixed(1)}
-                </TableCell>
-                <TableCell className="text-right">
-                  {(s.quality_score * 100).toFixed(0)}%
-                </TableCell>
+                <TableCell className="text-right">{s.duration_seconds.toFixed(1)}</TableCell>
+                <TableCell className="text-right">{(s.quality_score * 100).toFixed(0)}%</TableCell>
               </TableRow>
             ))}
           </TableBody>
@@ -205,8 +212,14 @@ function SimilarTab({ personId }: { personId: number }) {
       {items.map((s) => (
         <Link key={s.person_id} href={`/persons/${s.person_id}`}>
           <Card className="hover:border-primary/40 transition-colors">
-            <CardContent className="p-4 flex items-center justify-between">
-              <div>
+            <CardContent className="flex items-center gap-3 p-4">
+              <PersonSnapshot
+                src={s.person?.snapshot_url}
+                alt={`Person ${s.person_id} snapshot`}
+                label={`#${s.person_id}`}
+                className="h-20 w-16 shrink-0 rounded-md"
+              />
+              <div className="min-w-0 flex-1">
                 <div className="font-medium">Person #{s.person_id}</div>
                 {s.person && (
                   <div className="text-xs text-muted-foreground">

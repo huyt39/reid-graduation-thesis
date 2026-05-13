@@ -376,6 +376,7 @@ class WorkerPipeline:
                     "confidence": float(track[5]),
                     "tracklet_id": None,
                     "tracklet_state": "tentative",
+                    "snapshot_key": None,
                     "visibility_score": 0.0,
                     "quality": None,
                     "attributes": None,
@@ -397,6 +398,7 @@ class WorkerPipeline:
                     "confidence": float(track[5]),
                     "tracklet_id": meta.get("tracklet_id"),
                     "tracklet_state": meta.get("tracklet_state"),
+                    "snapshot_key": meta.get("snapshot_key"),
                     "visibility_score": float(meta.get("visibility_score", 0.0)),
                     "quality": meta.get("quality"),
                     "attributes": meta.get("attributes"),
@@ -578,6 +580,7 @@ class WorkerPipeline:
             self.track_metadata[tracklet.track_id] = {
                 "tracklet_id": tracklet_id,
                 "tracklet_state": tracklet.state.value,
+                "snapshot_key": None,
                 "visibility_score": round(v_avg, 4),
                 "quality": {
                     "v_avg": float(round(v_avg, 4)),
@@ -650,6 +653,8 @@ class WorkerPipeline:
                 crop_key = await asyncio.to_thread(
                     self.minio.upload_tracklet_snapshot, tracklet_id, buf.tobytes(),
                 )
+                if tracklet.track_id in self.track_metadata:
+                    self.track_metadata[tracklet.track_id]["snapshot_key"] = crop_key
 
         quality = {
             "v_avg": round(v_avg, 4),
