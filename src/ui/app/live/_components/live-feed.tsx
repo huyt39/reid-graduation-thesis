@@ -10,11 +10,7 @@ function visColor(score: number): string {
   return "#ef4444";
 }
 
-function drawOverlay(
-  canvas: HTMLCanvasElement,
-  img: HTMLImageElement,
-  persons: TrackedPerson[]
-) {
+function drawOverlay(canvas: HTMLCanvasElement, img: HTMLImageElement, persons: TrackedPerson[]) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
 
@@ -48,7 +44,7 @@ function drawOverlay(
     ctx.fillRect(rx1, ry1, bw, bh);
 
     const label = isTentative ? "?" : `#${p.person_id}`;
-    ctx.font = "bold 12px monospace";
+    ctx.font = "600 12px sans-serif";
     const tw = ctx.measureText(label).width;
     const labelY = ry1 > 18 ? ry1 - 4 : ry1 + 16;
     ctx.fillStyle = color + "cc";
@@ -103,10 +99,10 @@ export function LiveFeed({ frame }: Props) {
         className="absolute inset-0 w-full h-full pointer-events-none"
         style={{ objectFit: "contain" }}
       />
-      <div className="absolute bottom-2 right-2 text-xs text-white/80 bg-black/60 px-2 py-0.5 rounded font-mono">
+      <div className="absolute bottom-2 right-2 rounded bg-black/60 px-2 py-0.5 text-xs text-white/80">
         frame #{frame.frame_number}
       </div>
-      <div className="absolute top-2 left-2 text-xs text-white/80 bg-black/60 px-2 py-0.5 rounded font-mono">
+      <div className="absolute top-2 left-2 rounded bg-black/60 px-2 py-0.5 text-xs text-white/80">
         {frame.device_id}
       </div>
     </Card>

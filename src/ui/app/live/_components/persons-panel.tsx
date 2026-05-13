@@ -90,20 +90,20 @@ export function PersonsPanel({ persons }: { persons: TrackedPerson[] }) {
                         </span>
                       )}
                     </span>
-                    <span className="font-mono text-xs text-muted-foreground">
+                    <span className="text-xs text-muted-foreground">
                       {(p.confidence * 100).toFixed(0)}%
                     </span>
                   </CardTitle>
                   <div className="flex items-center justify-between">
                     <span className="text-muted-foreground">vis</span>
-                    <span className={cn("font-mono", visClass(p.visibility_score))}>
+                    <span className={visClass(p.visibility_score)}>
                       {p.visibility_score.toFixed(2)}
                     </span>
                   </div>
                   {p.quality && (
                     <div className="flex items-center justify-between">
                       <span className="text-muted-foreground">consist</span>
-                      <span className="font-mono text-muted-foreground">
+                      <span className="text-muted-foreground">
                         {p.quality.embedding_consistency.toFixed(2)}
                       </span>
                     </div>

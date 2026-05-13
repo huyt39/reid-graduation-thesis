@@ -83,11 +83,9 @@ export function TimelineView() {
                     <TableCell>
                       <Badge variant="outline">{ev.event_type}</Badge>
                     </TableCell>
-                    <TableCell className="font-mono text-xs">{ev.device_id}</TableCell>
-                    <TableCell className="font-mono text-xs text-muted-foreground">
-                      {Object.keys(ev.details ?? {}).length > 0
-                        ? JSON.stringify(ev.details)
-                        : "—"}
+                    <TableCell className="text-xs">{ev.device_id}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {Object.keys(ev.details ?? {}).length > 0 ? JSON.stringify(ev.details) : "—"}
                     </TableCell>
                   </TableRow>
                 ))}

@@ -67,10 +67,10 @@ export function PersonDetail({ personId }: { personId: number }) {
               value={`${(person.attributes.gender_confidence * 100).toFixed(1)}%`}
             />
             <Field label="Sightings" value={person.stats.sighting_count.toLocaleString()} />
-            <Field label="Last device" value={person.stats.last_seen_device || "—"} mono />
+            <Field label="Last device" value={person.stats.last_seen_device || "—"} />
             <Field label="First seen" value={formatDateTime(person.stats.first_seen_at)} />
             <Field label="Last seen" value={formatDateTime(person.stats.last_seen_at)} />
-            <Field label="Source" value={person.source} mono />
+            <Field label="Source" value={person.source} />
           </div>
         </CardContent>
       </Card>
@@ -95,11 +95,11 @@ export function PersonDetail({ personId }: { personId: number }) {
   );
 }
 
-function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+function Field({ label, value }: { label: string; value: string }) {
   return (
     <div>
       <div className="text-xs text-muted-foreground uppercase tracking-wide">{label}</div>
-      <div className={mono ? "font-mono text-sm" : "text-sm"}>{value}</div>
+      <div className="text-sm">{value}</div>
     </div>
   );
 }
@@ -141,7 +141,7 @@ function SightingsTab({ personId }: { personId: number }) {
                     className="h-16 w-12 rounded-md"
                   />
                 </TableCell>
-                <TableCell className="font-mono text-xs">{s.device_id}</TableCell>
+                <TableCell className="text-xs">{s.device_id}</TableCell>
                 <TableCell>{formatDateTime(s.started_at)}</TableCell>
                 <TableCell>{formatDateTime(s.ended_at)}</TableCell>
                 <TableCell className="text-right">{s.duration_seconds.toFixed(1)}</TableCell>
@@ -185,7 +185,7 @@ function TimelineTab({ personId }: { personId: number }) {
                 <TableCell>
                   <Badge variant="outline">{ev.event_type}</Badge>
                 </TableCell>
-                <TableCell className="font-mono text-xs">{ev.device_id}</TableCell>
+                <TableCell className="text-xs">{ev.device_id}</TableCell>
               </TableRow>
             ))}
           </TableBody>

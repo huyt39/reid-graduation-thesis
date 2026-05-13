@@ -40,7 +40,7 @@ export function DevicesList() {
           <Card className="hover:border-primary/40 transition-colors h-full">
             <CardHeader className="pb-3">
               <CardTitle className="flex items-center justify-between text-base">
-                <span className="font-mono text-sm">{d.device_id}</span>
+                <span className="text-sm">{d.device_id}</span>
                 <Badge variant={d.status === "online" ? "default" : "secondary"}>
                   {d.status || "unknown"}
                 </Badge>

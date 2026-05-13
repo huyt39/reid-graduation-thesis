@@ -76,7 +76,7 @@ export function PersonsList() {
                 </div>
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Last device</span>
-                  <span className="font-mono text-xs">{person.stats.last_seen_device || "—"}</span>
+                  <span className="text-xs">{person.stats.last_seen_device || "—"}</span>
                 </div>
               </CardContent>
             </Card>
