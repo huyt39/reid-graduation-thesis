@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useDeferredValue, useState } from "react";
 import { useWebSocket } from "@/hooks/use-websocket";
 import { DeviceSelector } from "./device-selector";
 import { ConnectionBadge } from "./connection-badge";
@@ -12,14 +12,10 @@ const WS_URL = process.env.NEXT_PUBLIC_STREAMING_WS || "ws://localhost:8765";
 export function LiveView() {
   const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
 
-  const { connectionState, deviceIds, framesByDevice } = useWebSocket(
-    `${WS_URL}/ws`,
-    selectedDevice
-  );
+  const { connectionState, deviceIds, currentFrame } = useWebSocket(`${WS_URL}/ws`, selectedDevice);
 
   const activeDevice = selectedDevice ?? deviceIds[0] ?? null;
-  const currentFrame = activeDevice ? (framesByDevice[activeDevice] ?? null) : null;
-  const persons = currentFrame?.tracked_persons ?? [];
+  const persons = useDeferredValue(currentFrame?.tracked_persons ?? []);
 
   return (
     <div className="flex flex-col gap-4">

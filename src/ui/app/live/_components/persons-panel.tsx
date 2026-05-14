@@ -5,6 +5,13 @@ import { Card, CardContent, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { PersonSnapshot } from "@/components/person-snapshot";
 import { cn } from "@/lib/utils";
+import {
+  buildLiveEvidenceSummary,
+  formatDecimal,
+  formatPct,
+  getLiveStatusLabel,
+  getStatusClasses,
+} from "@/lib/reid-evidence";
 import type { TrackedPerson } from "@/hooks/use-websocket";
 
 // Default threshold for most attributes. Glasses uses a lower value because
@@ -68,6 +75,7 @@ export function PersonsPanel({ persons }: { persons: TrackedPerson[] }) {
         {persons.map((p) => {
           const isTentative = p.tracklet_state === "tentative";
           const badges = collectAttributeBadges(p);
+          const status = p.status ?? (isTentative ? "tentative" : "confirmed");
           return (
             <Card
               key={`${p.person_id}-${p.tracklet_id ?? ""}`}
@@ -82,32 +90,61 @@ export function PersonsPanel({ persons }: { persons: TrackedPerson[] }) {
                 />
                 <div className="space-y-1 text-xs">
                   <CardTitle className="flex items-center justify-between text-sm">
-                    <span className={cn("font-semibold", isTentative && "text-muted-foreground")}>
-                      {isTentative ? "?" : `#${p.person_id}`}
-                      {p.tracklet_state && !isTentative && (
-                        <span className="ml-1 text-xs text-muted-foreground">
-                          {stateLabel(p.tracklet_state)}
-                        </span>
-                      )}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className={cn("font-semibold", isTentative && "text-muted-foreground")}>
+                        {isTentative ? "?" : `#${p.person_id}`}
+                        {p.tracklet_state && !isTentative && (
+                          <span className="ml-1 text-xs text-muted-foreground">
+                            {stateLabel(p.tracklet_state)}
+                          </span>
+                        )}
+                      </span>
+                      <Badge variant="outline" className={cn("text-[10px]", getStatusClasses(status))}>
+                        {getLiveStatusLabel(status)}
+                      </Badge>
+                    </div>
                     <span className="text-xs text-muted-foreground">
                       {(p.confidence * 100).toFixed(0)}%
                     </span>
                   </CardTitle>
                   <div className="flex items-center justify-between">
-                    <span className="text-muted-foreground">vis</span>
-                    <span className={visClass(p.visibility_score)}>
-                      {p.visibility_score.toFixed(2)}
+                    <span className="text-muted-foreground">live vis</span>
+                    <span className={visClass(p.live_visibility_score)}>
+                      {formatDecimal(p.live_visibility_score)}
                     </span>
                   </div>
                   {p.quality && (
-                    <div className="flex items-center justify-between">
-                      <span className="text-muted-foreground">consist</span>
-                      <span className="text-muted-foreground">
-                        {p.quality.embedding_consistency.toFixed(2)}
-                      </span>
-                    </div>
+                    <>
+                      <div className="flex items-center justify-between">
+                        <span className="text-muted-foreground">tracklet vis</span>
+                        <span className="text-muted-foreground">{formatDecimal(p.quality.v_avg)}</span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-muted-foreground">consist</span>
+                        <span className="text-muted-foreground">
+                          {formatDecimal(p.quality.embedding_consistency)}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-muted-foreground">good frames</span>
+                        <span className="text-muted-foreground">
+                          {formatPct(p.quality.good_frame_ratio)}
+                        </span>
+                      </div>
+                    </>
                   )}
+                  <div className="flex items-center justify-between">
+                    <span className="text-muted-foreground">overlap</span>
+                    <span className={visClass(1 - p.overlap_ratio)}>{formatPct(p.overlap_ratio)}</span>
+                  </div>
+                  <p className="pt-1 text-[11px] leading-4 text-muted-foreground">
+                    {buildLiveEvidenceSummary(
+                      p.matching,
+                      p.quality,
+                      p.live_visibility_score,
+                      p.overlap_ratio
+                    )}
+                  </p>
                   {badges.length > 0 && (
                     <div className="flex flex-wrap gap-1 pt-1">
                       {badges.map((badge) => (

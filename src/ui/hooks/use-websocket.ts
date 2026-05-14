@@ -26,13 +26,26 @@ export interface TrackedPerson {
   tracklet_state: string | null;
   snapshot_url?: string | null;
   visibility_score: number;
+  live_visibility_score: number;
+  overlap_ratio: number;
   quality: {
     v_avg: number;
     embedding_consistency: number;
     overall_consistency: number;
     good_frame_ratio: number;
   } | null;
+  matching: {
+    method: string;
+    source: string;
+    similarity_score: number | null;
+    runner_up_score: number | null;
+    margin_to_runner_up: number | null;
+    reuse_person_id: number | null;
+    tentative_attempts: number | null;
+    canonical_update_applied: boolean | null;
+  } | null;
   attributes: Record<string, string> | null;
+  status?: string | null;
 }
 
 export interface FrameUpdate {
@@ -50,7 +63,7 @@ export type ConnectionState = "connecting" | "connected" | "disconnected";
 interface UseWebSocketResult {
   connectionState: ConnectionState;
   deviceIds: string[];
-  framesByDevice: Record<string, FrameUpdate>;
+  currentFrame: FrameUpdate | null;
 }
 
 interface FrameUpdateMessage extends FrameUpdate {
@@ -70,12 +83,33 @@ export function useWebSocket(
 ): UseWebSocketResult {
   const [connectionState, setConnectionState] = useState<ConnectionState>("disconnected");
   const [deviceIds, setDeviceIds] = useState<string[]>([]);
-  const [framesByDevice, setFramesByDevice] = useState<Record<string, FrameUpdate>>({});
+  const [currentFrame, setCurrentFrame] = useState<FrameUpdate | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const backoffRef = useRef(1000);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const rafRef = useRef<number | null>(null);
   const unmountedRef = useRef(false);
+  const framesByDeviceRef = useRef<Record<string, FrameUpdate>>({});
+  const pendingFrameRef = useRef<FrameUpdate | null>(null);
+  const activeDeviceRef = useRef<string | null>(selectedDevice);
+
+  const flushPendingFrame = useCallback(() => {
+    rafRef.current = null;
+    if (pendingFrameRef.current) {
+      setCurrentFrame(pendingFrameRef.current);
+      pendingFrameRef.current = null;
+    }
+  }, []);
+
+  const scheduleFrameUpdate = useCallback(
+    (frame: FrameUpdate) => {
+      pendingFrameRef.current = frame;
+      if (rafRef.current !== null) return;
+      rafRef.current = window.requestAnimationFrame(flushPendingFrame);
+    },
+    [flushPendingFrame]
+  );
 
   const connect = useCallback(() => {
     if (!url || unmountedRef.current) return;
@@ -109,16 +143,26 @@ export function useWebSocket(
           ? maybeDevices.filter((v): v is string => typeof v === "string")
           : [];
         setDeviceIds(devices);
-        subscribeToDevice(ws, selectedDevice ?? devices[0] ?? null);
+        const nextActiveDevice = selectedDevice ?? devices[0] ?? null;
+        activeDeviceRef.current = nextActiveDevice;
+        if (nextActiveDevice) {
+          const cachedFrame = framesByDeviceRef.current[nextActiveDevice] ?? null;
+          pendingFrameRef.current = null;
+          setCurrentFrame(cachedFrame);
+        }
+        subscribeToDevice(ws, nextActiveDevice);
         return;
       }
 
       if (m.type === "frame_update") {
         const frame = m as unknown as FrameUpdateMessage;
-        setFramesByDevice((prev) => ({ ...prev, [frame.device_id]: frame }));
+        framesByDeviceRef.current[frame.device_id] = frame;
         setDeviceIds((prev) =>
           prev.includes(frame.device_id) ? prev : [...prev, frame.device_id]
         );
+        if (frame.device_id === activeDeviceRef.current) {
+          scheduleFrameUpdate(frame);
+        }
       }
     };
 
@@ -132,7 +176,7 @@ export function useWebSocket(
     };
 
     ws.onerror = () => ws.close();
-  }, [url, selectedDevice]);
+  }, [scheduleFrameUpdate, selectedDevice, url]);
 
   useEffect(() => {
     unmountedRef.current = false;
@@ -140,13 +184,20 @@ export function useWebSocket(
     return () => {
       unmountedRef.current = true;
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      if (rafRef.current !== null) window.cancelAnimationFrame(rafRef.current);
       wsRef.current?.close();
     };
   }, [connect]);
 
   useEffect(() => {
-    subscribeToDevice(wsRef.current, selectedDevice ?? deviceIds[0] ?? null);
+    const nextActiveDevice = selectedDevice ?? deviceIds[0] ?? null;
+    activeDeviceRef.current = nextActiveDevice;
+    pendingFrameRef.current = null;
+    setCurrentFrame(
+      nextActiveDevice ? (framesByDeviceRef.current[nextActiveDevice] ?? null) : null
+    );
+    subscribeToDevice(wsRef.current, nextActiveDevice);
   }, [selectedDevice, deviceIds]);
 
-  return { connectionState, deviceIds, framesByDevice };
+  return { connectionState, deviceIds, currentFrame };
 }

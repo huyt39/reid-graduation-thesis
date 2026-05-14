@@ -34,6 +34,54 @@ export interface Sighting {
   attributes: PersonAttributes;
 }
 
+export interface TrackletQuality {
+  v_avg: number;
+  embedding_consistency: number;
+  bbox_size_stability: number;
+  position_stability: number;
+  good_frame_ratio: number;
+  overall_consistency: number;
+}
+
+export interface TrackletMatching {
+  method: string;
+  source: string;
+  similarity_score: number | null;
+  runner_up_score: number | null;
+  margin_to_runner_up: number | null;
+  reuse_person_id: number | null;
+  tentative_attempts: number | null;
+  canonical_update_applied: boolean | null;
+}
+
+export interface TrackletFrameSample {
+  frame_idx: number;
+  visibility_score: number;
+  overlap_ratio: number;
+  selected: boolean;
+}
+
+export interface TrackletEvidence {
+  selected_frame_count: number;
+  selected_frame_indices: number[];
+  frame_samples: TrackletFrameSample[];
+}
+
+export interface Tracklet {
+  tracklet_id: string;
+  track_id: number;
+  person_id: number | null;
+  device_id: string;
+  state: string;
+  frame_range: Record<string, number>;
+  entry_count: number;
+  quality: TrackletQuality;
+  matching: TrackletMatching;
+  evidence: TrackletEvidence;
+  best_crop_url: string | null;
+  created_at: string | null;
+}
+
 export interface TimelineEvent {
   person_id: number;
   event_type: string;
@@ -80,6 +128,13 @@ export interface PaginatedPersons {
 
 export interface PaginatedSightings {
   items: Sighting[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface PaginatedTracklets {
+  items: Tracklet[];
   total: number;
   page: number;
   page_size: number;

@@ -4,6 +4,7 @@ import useSWR from "swr";
 import { personsClient } from "@/lib/api/persons-client";
 import type {
   PaginatedSightings,
+  PaginatedTracklets,
   PaginatedTimeline,
   Person,
   SimilarPersonsResponse,
@@ -50,6 +51,23 @@ export function usePersonTimeline(id: number | null, page = 1, pageSize = 50) {
       });
       if (response.error || !response.data) {
         throw new Error(response.error || "Failed to load timeline");
+      }
+      return response.data;
+    },
+    { keepPreviousData: true }
+  );
+}
+
+export function usePersonTracklets(id: number | null, page = 1, pageSize = 20) {
+  return useSWR<PaginatedTracklets>(
+    id ? ["person:tracklets", id, page, pageSize] : null,
+    async ([, personId, p, ps]) => {
+      const response = await personsClient.tracklets(personId as number, {
+        page: p as number,
+        page_size: ps as number,
+      });
+      if (response.error || !response.data) {
+        throw new Error(response.error || "Failed to load tracklets");
       }
       return response.data;
     },

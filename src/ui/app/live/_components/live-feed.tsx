@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import { Card } from "@/components/ui/card";
+import { getLiveStatusLabel } from "@/lib/reid-evidence";
 import type { FrameUpdate, TrackedPerson } from "@/hooks/use-websocket";
 
 function visColor(score: number): string {
@@ -32,7 +33,13 @@ function drawOverlay(canvas: HTMLCanvasElement, img: HTMLImageElement, persons: 
     const bh = ry2 - ry1;
 
     const isTentative = p.tracklet_state === "tentative";
-    const color = isTentative ? "#94a3b8" : visColor(p.visibility_score);
+    const status = p.status ?? (isTentative ? "tentative" : "confirmed");
+    const color =
+      status === "recovering"
+        ? "#f59e0b"
+        : isTentative
+          ? "#94a3b8"
+          : visColor(p.live_visibility_score);
 
     ctx.strokeStyle = color;
     ctx.lineWidth = isTentative ? 1.5 : 2;
@@ -43,7 +50,9 @@ function drawOverlay(canvas: HTMLCanvasElement, img: HTMLImageElement, persons: 
     ctx.fillStyle = color + "18";
     ctx.fillRect(rx1, ry1, bw, bh);
 
-    const label = isTentative ? "?" : `#${p.person_id}`;
+    const label = isTentative
+      ? "?"
+      : `#${p.person_id} ${getLiveStatusLabel(status)} ${p.live_visibility_score.toFixed(2)}`;
     ctx.font = "600 12px sans-serif";
     const tw = ctx.measureText(label).width;
     const labelY = ry1 > 18 ? ry1 - 4 : ry1 + 16;

@@ -3,6 +3,7 @@ import type {
   Person,
   PaginatedPersons,
   PaginatedSightings,
+  PaginatedTracklets,
   PaginatedTimeline,
   SimilarPersonsResponse,
 } from "@/types";
@@ -32,6 +33,17 @@ class PersonsClient extends BaseApiClient {
     const { page = 1, page_size = 20, ...rest } = params;
     return super.get<PaginatedSightings>(`/persons/${id}/sightings`, {
       ...rest,
+      page,
+      page_size,
+    });
+  }
+
+  tracklets(
+    id: number,
+    params: { page?: number; page_size?: number } = {}
+  ): Promise<ApiResponse<PaginatedTracklets>> {
+    const { page = 1, page_size = 20 } = params;
+    return super.get<PaginatedTracklets>(`/persons/${id}/tracklets`, {
       page,
       page_size,
     });

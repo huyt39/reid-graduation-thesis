@@ -17,13 +17,26 @@ import {
 import {
   usePerson,
   usePersonSightings,
-  usePersonTimeline,
   usePersonSimilar,
+  usePersonTimeline,
+  usePersonTracklets,
 } from "@/hooks/use-person";
+import {
+  buildLiveEvidenceSummary,
+  describeMatchMethod,
+  formatDecimal,
+  formatPct,
+  getStatusClasses,
+  getTrackletConfidenceLabel,
+  summarizeTracklets,
+} from "@/lib/reid-evidence";
+import { cn } from "@/lib/utils";
 import { formatDateTime, formatRelative } from "@/lib/date-format";
+import type { Tracklet } from "@/types";
 
 export function PersonDetail({ personId }: { personId: number }) {
   const { data: person, isLoading, error } = usePerson(personId);
+  const { data: trackletsData, isLoading: isTrackletsLoading } = usePersonTracklets(personId);
 
   if (isLoading && !person) {
     return (
@@ -41,6 +54,9 @@ export function PersonDetail({ personId }: { personId: number }) {
       </div>
     );
   }
+
+  const tracklets = trackletsData?.items ?? [];
+  const trackletsById = new Map(tracklets.map((tracklet) => [tracklet.tracklet_id, tracklet]));
 
   return (
     <div className="space-y-6">
@@ -60,17 +76,20 @@ export function PersonDetail({ personId }: { personId: number }) {
             label={`#${person.person_id}`}
             className="aspect-[4/5] min-h-64"
           />
-          <div className="grid gap-4 text-sm sm:grid-cols-2 lg:grid-cols-3">
-            <Field label="Gender" value={person.attributes.gender || "—"} />
-            <Field
-              label="Gender confidence"
-              value={`${(person.attributes.gender_confidence * 100).toFixed(1)}%`}
-            />
-            <Field label="Sightings" value={person.stats.sighting_count.toLocaleString()} />
-            <Field label="Last device" value={person.stats.last_seen_device || "—"} />
-            <Field label="First seen" value={formatDateTime(person.stats.first_seen_at)} />
-            <Field label="Last seen" value={formatDateTime(person.stats.last_seen_at)} />
-            <Field label="Source" value={person.source} />
+          <div className="space-y-5">
+            <div className="grid gap-4 text-sm sm:grid-cols-2 lg:grid-cols-3">
+              <Field label="Gender" value={person.attributes.gender || "—"} />
+              <Field
+                label="Gender confidence"
+                value={`${(person.attributes.gender_confidence * 100).toFixed(1)}%`}
+              />
+              <Field label="Sightings" value={person.stats.sighting_count.toLocaleString()} />
+              <Field label="Last device" value={person.stats.last_seen_device || "—"} />
+              <Field label="First seen" value={formatDateTime(person.stats.first_seen_at)} />
+              <Field label="Last seen" value={formatDateTime(person.stats.last_seen_at)} />
+              <Field label="Source" value={person.source} />
+            </div>
+            <EvidenceSummary tracklets={tracklets} isLoading={isTrackletsLoading} />
           </div>
         </CardContent>
       </Card>
@@ -78,11 +97,15 @@ export function PersonDetail({ personId }: { personId: number }) {
       <Tabs defaultValue="sightings">
         <TabsList>
           <TabsTrigger value="sightings">Sightings</TabsTrigger>
+          <TabsTrigger value="evidence">Evidence</TabsTrigger>
           <TabsTrigger value="timeline">Timeline</TabsTrigger>
           <TabsTrigger value="similar">Similar</TabsTrigger>
         </TabsList>
         <TabsContent value="sightings">
-          <SightingsTab personId={personId} />
+          <SightingsTab personId={personId} trackletsById={trackletsById} />
+        </TabsContent>
+        <TabsContent value="evidence">
+          <EvidenceTab tracklets={tracklets} isLoading={isTrackletsLoading} />
         </TabsContent>
         <TabsContent value="timeline">
           <TimelineTab personId={personId} />
@@ -104,7 +127,47 @@ function Field({ label, value }: { label: string; value: string }) {
   );
 }
 
-function SightingsTab({ personId }: { personId: number }) {
+function EvidenceSummary({ tracklets, isLoading }: { tracklets: Tracklet[]; isLoading: boolean }) {
+  if (isLoading) {
+    return <Skeleton className="h-24 w-full" />;
+  }
+
+  if (tracklets.length === 0) {
+    return (
+      <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
+        Evidence will appear after matched tracklets are persisted.
+      </div>
+    );
+  }
+
+  const summary = summarizeTracklets(tracklets);
+
+  return (
+    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <SummaryCard label="Avg consistency" value={formatPct(summary.avgConsistency)} />
+      <SummaryCard label="Avg good frames" value={formatPct(summary.avgGoodFrameRatio)} />
+      <SummaryCard label="Recovery matches" value={summary.recoveryCount.toString()} />
+      <SummaryCard label="High-quality tracklets" value={summary.highQualityCount.toString()} />
+    </div>
+  );
+}
+
+function SummaryCard({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg border bg-muted/30 px-4 py-3">
+      <div className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className="mt-1 text-lg font-semibold">{value}</div>
+    </div>
+  );
+}
+
+function SightingsTab({
+  personId,
+  trackletsById,
+}: {
+  personId: number;
+  trackletsById: Map<string, Tracklet>;
+}) {
   const { data, isLoading, error } = usePersonSightings(personId);
   if (isLoading && !data) return <Skeleton className="h-48 w-full" />;
   if (error) return <p className="text-destructive text-sm">{error.message}</p>;
@@ -128,31 +191,188 @@ function SightingsTab({ personId }: { personId: number }) {
               <TableHead>Ended</TableHead>
               <TableHead className="text-right">Duration (s)</TableHead>
               <TableHead className="text-right">Quality</TableHead>
+              <TableHead>Evidence</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {items.map((s) => (
-              <TableRow key={s.tracklet_id}>
-                <TableCell>
-                  <PersonSnapshot
-                    src={s.snapshot_url}
-                    alt={`Sighting ${s.tracklet_id} snapshot`}
-                    label="Shot"
-                    className="h-16 w-12 rounded-md"
-                  />
-                </TableCell>
-                <TableCell className="text-xs">{s.device_id}</TableCell>
-                <TableCell>{formatDateTime(s.started_at)}</TableCell>
-                <TableCell>{formatDateTime(s.ended_at)}</TableCell>
-                <TableCell className="text-right">{s.duration_seconds.toFixed(1)}</TableCell>
-                <TableCell className="text-right">{(s.quality_score * 100).toFixed(0)}%</TableCell>
-              </TableRow>
-            ))}
+            {items.map((s) => {
+              const tracklet = trackletsById.get(s.tracklet_id);
+              return (
+                <TableRow key={s.tracklet_id}>
+                  <TableCell>
+                    <PersonSnapshot
+                      src={s.snapshot_url}
+                      alt={`Sighting ${s.tracklet_id} snapshot`}
+                      label="Shot"
+                      className="h-16 w-12 rounded-md"
+                    />
+                  </TableCell>
+                  <TableCell className="text-xs">{s.device_id}</TableCell>
+                  <TableCell>{formatDateTime(s.started_at)}</TableCell>
+                  <TableCell>{formatDateTime(s.ended_at)}</TableCell>
+                  <TableCell className="text-right">{s.duration_seconds.toFixed(1)}</TableCell>
+                  <TableCell className="text-right">{(s.quality_score * 100).toFixed(0)}%</TableCell>
+                  <TableCell className="min-w-56">
+                    {tracklet ? (
+                      <div className="space-y-2">
+                        <Badge variant="outline">{describeMatchMethod(tracklet.matching)}</Badge>
+                        <QualityStrip tracklet={tracklet} compact />
+                      </div>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">Tracklet evidence pending</span>
+                    )}
+                  </TableCell>
+                </TableRow>
+              );
+            })}
           </TableBody>
         </Table>
       </CardContent>
     </Card>
   );
+}
+
+function EvidenceTab({ tracklets, isLoading }: { tracklets: Tracklet[]; isLoading: boolean }) {
+  if (isLoading) return <Skeleton className="h-64 w-full" />;
+  if (tracklets.length === 0) {
+    return (
+      <p className="text-sm text-muted-foreground rounded-lg border border-dashed p-8 text-center">
+        No tracklet evidence recorded yet.
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {tracklets.map((tracklet) => (
+        <Card key={tracklet.tracklet_id}>
+          <CardContent className="grid gap-5 p-5 lg:grid-cols-[160px_minmax(0,1fr)]">
+            <PersonSnapshot
+              src={tracklet.best_crop_url}
+              alt={`Tracklet ${tracklet.tracklet_id} best crop`}
+              label={`T#${tracklet.track_id}`}
+              className="aspect-[4/5]"
+            />
+            <div className="space-y-4">
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="text-base font-semibold">{describeMatchMethod(tracklet.matching)}</div>
+                <Badge variant="outline" className={cn("text-[11px]", getStatusClasses("confirmed"))}>
+                  {getTrackletConfidenceLabel(tracklet.quality)}
+                </Badge>
+                <Badge variant="secondary">{tracklet.device_id}</Badge>
+              </div>
+
+              <p className="text-sm text-muted-foreground">
+                {buildLiveEvidenceSummary(
+                  tracklet.matching,
+                  {
+                    v_avg: tracklet.quality.v_avg,
+                    embedding_consistency: tracklet.quality.embedding_consistency,
+                    overall_consistency: tracklet.quality.overall_consistency,
+                    good_frame_ratio: tracklet.quality.good_frame_ratio,
+                  },
+                  tracklet.quality.v_avg,
+                  averageOverlap(tracklet)
+                )}
+              </p>
+
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                <Metric label="Similarity" value={formatDecimal(tracklet.matching.similarity_score)} />
+                <Metric label="Embedding consistency" value={formatDecimal(tracklet.quality.embedding_consistency)} />
+                <Metric label="Overall consistency" value={formatPct(tracklet.quality.overall_consistency)} />
+                <Metric
+                  label="Selected / total"
+                  value={`${tracklet.evidence.selected_frame_count}/${tracklet.entry_count}`}
+                />
+              </div>
+
+              <QualityStrip tracklet={tracklet} />
+
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                <Metric label="Average visibility" value={formatDecimal(tracklet.quality.v_avg)} />
+                <Metric label="Good frame ratio" value={formatPct(tracklet.quality.good_frame_ratio)} />
+                <Metric label="Runner-up score" value={formatDecimal(tracklet.matching.runner_up_score)} />
+                <Metric
+                  label="Margin"
+                  value={formatDecimal(tracklet.matching.margin_to_runner_up)}
+                />
+              </div>
+
+              <div className="rounded-lg border bg-muted/20 p-3 text-xs text-muted-foreground">
+                <div>
+                  Tracklet {tracklet.tracklet_id} spans frames{" "}
+                  {tracklet.frame_range.start ?? "—"} to {tracklet.frame_range.end ?? "—"}.
+                </div>
+                <div>
+                  Created {formatDateTime(tracklet.created_at)} with {tracklet.entry_count} observations and{" "}
+                  {tracklet.evidence.selected_frame_count} selected frames.
+                </div>
+                {tracklet.matching.reuse_person_id ? (
+                  <div>Recovery hint pointed to person #{tracklet.matching.reuse_person_id}.</div>
+                ) : null}
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+function QualityStrip({ tracklet, compact = false }: { tracklet: Tracklet; compact?: boolean }) {
+  const samples = tracklet.evidence.frame_samples;
+
+  if (samples.length === 0) {
+    return <div className="text-xs text-muted-foreground">No frame-level evidence saved.</div>;
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className={cn("flex items-end gap-1", compact ? "h-8" : "h-14")}>
+        {samples.map((sample) => {
+          const heightClass = compact ? "min-h-3" : "min-h-4";
+          return (
+            <div key={sample.frame_idx} className="flex min-w-0 flex-1 flex-col items-center gap-1">
+              <div
+                className={cn(
+                  "w-full rounded-sm border transition-colors",
+                  heightClass,
+                  sample.selected ? "border-slate-900" : "border-transparent",
+                  sample.visibility_score >= 0.7
+                    ? "bg-emerald-500/80"
+                    : sample.visibility_score >= 0.45
+                      ? "bg-amber-400/80"
+                      : "bg-rose-400/80"
+                )}
+                style={{ height: `${Math.max(20, sample.visibility_score * 100)}%` }}
+                title={`frame ${sample.frame_idx} • vis ${sample.visibility_score.toFixed(2)} • overlap ${sample.overlap_ratio.toFixed(2)}${sample.selected ? " • selected" : ""}`}
+              />
+            </div>
+          );
+        })}
+      </div>
+      <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+        <span>Occluded / weak</span>
+        <span>Selected frames are outlined</span>
+        <span>Clean / strong</span>
+      </div>
+    </div>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg border bg-background px-3 py-2">
+      <div className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className="mt-1 text-sm font-medium">{value}</div>
+    </div>
+  );
+}
+
+function averageOverlap(tracklet: Tracklet): number {
+  const samples = tracklet.evidence.frame_samples;
+  if (samples.length === 0) return 0;
+  return samples.reduce((sum, sample) => sum + sample.overlap_ratio, 0) / samples.length;
 }
 
 function TimelineTab({ personId }: { personId: number }) {
@@ -208,7 +428,7 @@ function SimilarTab({ personId }: { personId: number }) {
     );
   }
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
       {items.map((s) => (
         <Link key={s.person_id} href={`/persons/${s.person_id}`}>
           <Card className="hover:border-primary/40 transition-colors">
