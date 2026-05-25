@@ -16,6 +16,7 @@ class _PersonAttrHistory:
     current_confidence: float = 0.0
     consecutive_agree: int = 0
     last_tracklet_label: str = "unknown"
+    stable_support: int = 0
 
 
 @dataclass
@@ -36,9 +37,15 @@ class AttributeVoter:
     ``{task: {"label": str, "confidence": float, "probabilities": ...}}``.
     """
 
-    def __init__(self, person_threshold: float = 0.7, flip_threshold: float = 0.85) -> None:
+    def __init__(
+        self,
+        person_threshold: float = 0.7,
+        flip_threshold: float = 0.85,
+        task_flip_thresholds: dict[str, float] | None = None,
+    ) -> None:
         self.person_threshold = person_threshold
         self.flip_threshold = flip_threshold
+        self.task_flip_thresholds = task_flip_thresholds or {}
         # track_id -> task -> running vote tally
         self._tracklet_votes: dict[int, dict[str, _TrackletTaskVote]] = {}
         # person_id -> task -> hysteresis state
@@ -98,11 +105,11 @@ class AttributeVoter:
         for task, (t_label, t_conf) in tracklet_attrs.items():
             h = per_person.setdefault(task, _PersonAttrHistory())
 
-            # First confident assignment for this (person, task) pair.
             if h.current_label == "unknown":
                 if t_conf >= self.person_threshold:
                     h.current_label = t_label
                     h.current_confidence = t_conf
+                    h.stable_support = 1
                 out[task] = (h.current_label, h.current_confidence)
                 continue
 
@@ -110,6 +117,7 @@ class AttributeVoter:
             if t_label == h.current_label:
                 h.consecutive_agree = 0
                 h.last_tracklet_label = t_label
+                h.stable_support += 1
                 h.current_confidence = 0.8 * h.current_confidence + 0.2 * t_conf
                 out[task] = (h.current_label, round(h.current_confidence, 4))
                 continue
@@ -121,11 +129,13 @@ class AttributeVoter:
                 h.consecutive_agree = 1
             h.last_tracklet_label = t_label
 
-            # Flip only on 3 consecutive high-confidence agreements.
-            if h.consecutive_agree >= 3 and t_conf >= self.flip_threshold:
+            # Flip only on 2 consecutive high-confidence agreements.
+            flip_threshold = float(self.task_flip_thresholds.get(task, self.flip_threshold))
+            if h.consecutive_agree >= 2 and t_conf >= flip_threshold:
                 h.current_label = t_label
                 h.current_confidence = t_conf
                 h.consecutive_agree = 0
+                h.stable_support = 1
 
             out[task] = (h.current_label, round(h.current_confidence, 4))
         return out
@@ -136,3 +146,15 @@ class AttributeVoter:
         """Return ``{task: (current_label, current_confidence)}`` for tasks seen so far."""
         per_person = self._person_history.get(person_id, {})
         return {task: (h.current_label, h.current_confidence) for task, h in per_person.items()}
+
+    def known_person_ids(self) -> set[int]:
+        """Return the set of person_ids that already have person-level history."""
+        return set(self._person_history.keys())
+
+    def person_task_stable_support(self, person_id: int, task: str) -> int:
+        """Return how many resolved tracklets have reinforced the current task label."""
+        per_person = self._person_history.get(person_id, {})
+        history = per_person.get(task)
+        if history is None or history.current_label == "unknown":
+            return 0
+        return history.stable_support

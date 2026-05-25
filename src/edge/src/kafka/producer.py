@@ -37,6 +37,7 @@ class EdgeKafkaProducer:
                     "class_id": d["class_id"],
                     "visibility_score": d["visibility_score"],
                     "overlap_ratio": d["overlap_ratio"],
+                    "visibility_tag": d.get("visibility_tag", "mid"),
                 }
                 for d in detections
             ],
@@ -45,6 +46,23 @@ class EdgeKafkaProducer:
         }
         msg_bytes = serialize_avro(self.schema, datum)
         self.producer.send(self.topic, value=msg_bytes)
+
+    def send_end_of_stream(
+        self,
+        device_id: str,
+        frame_number: int,
+        timestamp_ns: int,
+    ):
+        datum = {
+            "device_id": device_id,
+            "frame_number": -1,
+            "detections": [],
+            "created_at": timestamp_ns,
+            "image_data": b"",
+        }
+        msg_bytes = serialize_avro(self.schema, datum)
+        self.producer.send(self.topic, value=msg_bytes)
+        self.producer.flush()
 
     def close(self):
         self.producer.flush()

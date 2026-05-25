@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 import httpx
 import structlog
+from fastapi.encoders import jsonable_encoder
 
 log = structlog.get_logger()
 
@@ -44,6 +45,35 @@ class NLQueryParser:
                     return result
                 return {"query_type": "error", "message": "Invalid params shape from vLLM"}
             return {"query_type": "error", "message": "Unknown query type from vLLM"}
+
+    async def summarize(
+        self,
+        *,
+        question: str,
+        query_type: str,
+        params: dict,
+        results: object,
+    ) -> str:
+        if not self.vllm_url:
+            return ""
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{self.vllm_url}/summarize",
+                    json=jsonable_encoder({
+                        "question": question,
+                        "query_type": query_type,
+                        "params": params,
+                        "results": results,
+                    }),
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                summary = data.get("summary", "")
+                return summary if isinstance(summary, str) else ""
+        except Exception:
+            log.warning("nl_parser.summary_failed", exc_info=True)
+            return ""
 
     @staticmethod
     def _fallback_keyword_parse(text: str) -> dict:

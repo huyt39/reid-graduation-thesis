@@ -7,7 +7,7 @@ import time
 from fastapi import FastAPI, HTTPException, Request
 
 from src.api import deps
-from src.api.routes import devices, persons, search, stats
+from src.api.routes import devices, occlusion, persons, search, stats
 from src.core.config import settings
 from src.db.mongo_client import MongoQueryClient
 from src.db.qdrant_client import QdrantQueryClient
@@ -53,6 +53,8 @@ async def attach_request_id(request: Request, call_next):
     started_at = time.perf_counter()
     response = await call_next(request)
     response.headers.setdefault("x-request-id", request_id)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
 
     log.info(
         "query_service.http_response",
@@ -66,6 +68,7 @@ async def attach_request_id(request: Request, call_next):
 
 
 app.include_router(persons.router)
+app.include_router(occlusion.router)
 app.include_router(devices.router)
 app.include_router(search.router)
 app.include_router(stats.router)

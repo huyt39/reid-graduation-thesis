@@ -51,6 +51,13 @@ class PersonSearchFilters(BaseModel):
     person_id: int | None = None
     gender: str | None = None
     gender_confidence_min: float | None = None
+    age_child: str | None = None
+    backpack: str | None = None
+    sidebag: str | None = None
+    hat: str | None = None
+    glasses: str | None = None
+    sleeve: str | None = None
+    lower: str | None = None
     last_seen_device: str | None = None
     first_seen_after: datetime | None = None
     first_seen_before: datetime | None = None
@@ -152,6 +159,72 @@ class SightingResponse(BaseModel):
     attributes: PersonAttributes = Field(default_factory=PersonAttributes)
 
 
+class TrackletQuality(BaseModel):
+    v_avg: float = 0.0
+    embedding_consistency: float = 0.0
+    bbox_size_stability: float = 0.0
+    position_stability: float = 0.0
+    good_frame_ratio: float = 0.0
+    overall_consistency: float = 0.0
+
+
+class TrackletMatching(BaseModel):
+    method: str = ""
+    source: str = ""
+    similarity_score: float | None = None
+    runner_up_score: float | None = None
+    margin_to_runner_up: float | None = None
+    reuse_person_id: int | None = None
+    tentative_attempts: int | None = None
+    canonical_update_applied: bool | None = None
+
+
+class TrackletFrameSample(BaseModel):
+    frame_idx: int
+    visibility_score: float = 0.0
+    overlap_ratio: float = 0.0
+    selected: bool = False
+    selection_reason: str = ""
+    crop_url: str | None = None
+
+
+class TrackletEvidence(BaseModel):
+    selected_frame_count: int = 0
+    selected_frame_indices: list[int] = Field(default_factory=list)
+    frame_samples: list[TrackletFrameSample] = Field(default_factory=list)
+
+
+class TrackletResponse(BaseModel):
+    tracklet_id: str
+    track_id: int
+    person_id: int | None = None
+    device_id: str
+    state: str
+    frame_range: dict[str, int] = Field(default_factory=dict)
+    entry_count: int = 0
+    quality: TrackletQuality = Field(default_factory=TrackletQuality)
+    matching: TrackletMatching = Field(default_factory=TrackletMatching)
+    evidence: TrackletEvidence = Field(default_factory=TrackletEvidence)
+    best_crop_url: str | None = None
+    created_at: datetime | None = None
+
+
+class OcclusionCandidateResponse(BaseModel):
+    candidate_id: str
+    track_id: int
+    device_id: str
+    reason: str
+    status: str = "unconfirmed"
+    frame_range: dict[str, int] = Field(default_factory=dict)
+    entry_count: int = 0
+    quality: TrackletQuality = Field(default_factory=TrackletQuality)
+    matching: TrackletMatching = Field(default_factory=TrackletMatching)
+    evidence: TrackletEvidence = Field(default_factory=TrackletEvidence)
+    best_crop_url: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 class TimelineEvent(BaseModel):
     person_id: int
     event_type: str
@@ -201,6 +274,20 @@ class PaginatedPersonsResponse(BaseModel):
 
 class PaginatedSightingsResponse(BaseModel):
     items: list[SightingResponse] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    page_size: int = 20
+
+
+class PaginatedTrackletsResponse(BaseModel):
+    items: list[TrackletResponse] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    page_size: int = 20
+
+
+class PaginatedOcclusionCandidatesResponse(BaseModel):
+    items: list[OcclusionCandidateResponse] = Field(default_factory=list)
     total: int = 0
     page: int = 1
     page_size: int = 20

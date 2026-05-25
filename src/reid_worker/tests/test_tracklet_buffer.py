@@ -21,3 +21,43 @@ def test_ready_as_soon_as_enough_entries_exist():
     ready = buf.get_ready_tracklets(current_time_ns=int(0.5e9))
     assert len(ready) == 1
     assert ready[0].state == TrackletState.READY
+
+
+def test_pop_ready_tracklets_closes_window_before_more_appends():
+    buf = TrackletBuffer(min_entries=3, window_seconds=1.0)
+    for i in range(3):
+        buf.append(1, _make_entry(i, ts_offset_s=0.0))
+
+    ready = buf.pop_ready_tracklets(current_time_ns=int(0.5e9))
+    assert len(ready) == 1
+    assert [entry.frame_idx for entry in ready[0].entries] == [0, 1, 2]
+
+    buf.append(1, _make_entry(3, ts_offset_s=0.1))
+    assert [entry.frame_idx for entry in ready[0].entries] == [0, 1, 2]
+    assert [entry.frame_idx for entry in buf.tracklets[1].entries] == [3]
+
+
+def test_pop_ready_tracklets_skips_tracks_already_processing():
+    buf = TrackletBuffer(min_entries=3, window_seconds=1.0)
+    for i in range(3):
+        buf.append(1, _make_entry(i, ts_offset_s=0.0))
+        buf.append(2, _make_entry(i, ts_offset_s=0.0))
+
+    ready = buf.pop_ready_tracklets(current_time_ns=int(0.5e9), skip_track_ids={1})
+
+    assert [tracklet.track_id for tracklet in ready] == [2]
+    assert 1 in buf.tracklets
+    assert [entry.frame_idx for entry in buf.tracklets[1].entries] == [0, 1, 2]
+    assert 2 not in buf.tracklets
+
+
+def test_pop_stale_tracklets_skips_tracks_already_processing():
+    buf = TrackletBuffer(min_entries=3, stale_seconds=1.0)
+    buf.append(1, _make_entry(1, ts_offset_s=0.0))
+    buf.append(2, _make_entry(1, ts_offset_s=0.0))
+
+    stale = buf.pop_stale_tracklets(current_time_ns=int(2.0e9), skip_track_ids={1})
+
+    assert [tracklet.track_id for tracklet in stale] == [2]
+    assert 1 in buf.tracklets
+    assert 2 not in buf.tracklets

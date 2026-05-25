@@ -1,9 +1,7 @@
-"""EfficientNet-B0 gender classifier.
-
-Ported from reid-microservices/src/model_serving/src/models/efficientnet.py.
-"""
+"""EfficientNet-B0 gender classifier."""
 import torch
-from efficientnet_pytorch import EfficientNet
+import torch.nn as nn
+from torchvision.models import efficientnet_b0
 
 
 class GenderClassificationModel:
@@ -11,8 +9,8 @@ class GenderClassificationModel:
 
     def __init__(self, weight_path: str, device: torch.device | None = None):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = EfficientNet.from_pretrained("efficientnet-b0")
-        self.model._fc = torch.nn.Linear(self.model._fc.in_features, 2)
+        self.model = efficientnet_b0(weights=None)
+        self.model.classifier = nn.Sequential(nn.Dropout(0.2), nn.Linear(1280, 2))
         self.model.load_state_dict(
             torch.load(weight_path, map_location=self.device)
         )

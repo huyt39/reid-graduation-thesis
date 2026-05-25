@@ -1,8 +1,10 @@
 services:
   kafka:
     image: apache/kafka:4.1.2
+    restart: unless-stopped
     ports: ["19092:9092"]
     environment:
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
@@ -24,6 +26,7 @@ services:
 
   mongo:
     image: mongo:7
+    command: ["mongod", "--bind_ip_all", "--setParameter", "diagnosticDataCollectionEnabled=false"]
     ports: ["27018:27017"]
 
   qdrant:
@@ -45,7 +48,9 @@ services:
   edge:
     build: ../edge
     env_file: ../edge/.env
-    depends_on: [kafka]
+    depends_on:
+      kafka:
+        condition: service_healthy
     volumes:
       - ../contracts:/app/src/contracts:ro
       - ../../infer:/app/infer:ro
@@ -55,23 +60,59 @@ services:
     env_file: ../reid_worker/.env
     environment:
       - WORKER_PERSON_ID_SEQ_KEY=reid:seq:person_id
-    depends_on: [kafka, mongo, qdrant, redis, minio, inference_engine]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mongo:
+        condition: service_started
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+      inference_engine:
+        condition: service_started
     volumes:
       - ../contracts:/app/src/contracts:ro
+
+  triton:
+    image: nvcr.io/nvidia/tritonserver:24.04-py3
+    command: tritonserver --model-repository=/models --strict-model-config=false --log-info=1
+    volumes:
+      - ../../triton_models:/models:ro
+    ports: ["8011:8000", "8012:8001", "8013:8002"]
+    healthcheck:
+      test: ["CMD", "/bin/bash", "-lc", "curl -fsS http://localhost:8000/v2/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
 
   inference_engine:
     build: ../inference_engine
     env_file: ../inference_engine/.env
-    depends_on: [mongo]
+    depends_on:
+      mongo:
+        condition: service_started
+    environment:
+      - INFERENCE_USE_TRITON=false
+      - INFERENCE_TRITON_URL=triton:8000
+      - INFERENCE_OSNET_WEIGHTS=/app/models/osnet_good/model.pth.tar-150
+      - INFERENCE_OSNET_ONNX_PATH=
+      - INFERENCE_MULTI_ATTR_WEIGHTS=/app/src/assets/models/multi_attr/best_model_multi_attr_b0.pth
+      - INFERENCE_STANDALONE_GENDER_WEIGHTS=/app/src/assets/models/gender/gender_model.pth
     volumes:
-      - ../../poc-occlusion/weights/osnet_x1_0.pth.tar:/app/models/osnet_x1_0.pth.tar:ro
       - ../../efficientnet_b0_gender_classifier.pth:/app/models/efficientnet_b0_gender_classifier.pth:ro
+      - ../../reid-microservices/src/model_serving/src/assets/models/osnet/model.pth.tar-150:/app/models/osnet_good/model.pth.tar-150:ro
+      - ../../triton_models/osnet/1:/app/models/osnet:ro
     ports: ["8001:8000"]
 
   streaming:
     build: ../streaming
     env_file: ../streaming/.env
-    depends_on: [kafka]
+    depends_on:
+      kafka:
+        condition: service_healthy
     volumes:
       - ../contracts:/app/src/contracts:ro
     ports: ["8765:8765"]

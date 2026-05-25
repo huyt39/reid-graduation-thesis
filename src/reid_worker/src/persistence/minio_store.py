@@ -55,6 +55,14 @@ class MinIOSnapshotStore:
     def upload_tracklet_snapshot(self, tracklet_id: str, image_bytes: bytes) -> str:
         return self.upload_snapshot(f"tracklets/{tracklet_id}/best.jpg", image_bytes)
 
+    def upload_tracklet_frame_snapshot(
+        self,
+        tracklet_id: str,
+        frame_idx: int,
+        image_bytes: bytes,
+    ) -> str:
+        return self.upload_snapshot(f"tracklets/{tracklet_id}/frames/{frame_idx}.jpg", image_bytes)
+
     def presigned_url(self, key: str, expires_hours: int = 1) -> str:
         from datetime import timedelta
         if not key or not self._available:

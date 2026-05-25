@@ -13,6 +13,7 @@ from src.core.config import settings
 from src.kafka.consumer import StreamingKafkaConsumer
 from src.services.broadcaster import WebSocketBroadcaster
 from src.services.frame_cache import FrameCache
+from src.services.minio_urls import MinIOURLBuilder
 from src.workers.kafka_loop import run_kafka_loop
 
 logger = structlog.get_logger()
@@ -34,9 +35,24 @@ streaming_state = {
 }
 
 
+def _build_minio_urls() -> MinIOURLBuilder | None:
+    try:
+        return MinIOURLBuilder(
+            settings.minio_internal_endpoint,
+            settings.minio_public_endpoint,
+            settings.minio_access_key,
+            settings.minio_secret_key,
+            secure=settings.minio_secure,
+        )
+    except Exception:
+        logger.warning("streaming.minio_urls_unavailable", exc_info=True)
+        return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Start Kafka consumer in a background task
+    minio_urls = _build_minio_urls()
     consumer = StreamingKafkaConsumer(
         bootstrap_servers=settings.kafka_bootstrap_servers,
         topic=settings.output_topic,
@@ -60,8 +76,10 @@ async def lifespan(app: FastAPI):
             consumer,
             frame_cache,
             broadcaster,
+            minio_urls,
             max_poll_records=settings.max_poll_records,
             jpeg_quality=settings.jpeg_quality,
+            broadcast_max_fps=settings.broadcast_max_fps,
             source="processed",
         ),
         name="kafka-consumer-loop",
@@ -71,8 +89,10 @@ async def lifespan(app: FastAPI):
             raw_consumer,
             raw_frame_cache,
             raw_broadcaster,
+            None,
             max_poll_records=settings.max_poll_records,
             jpeg_quality=settings.jpeg_quality,
+            broadcast_max_fps=settings.broadcast_max_fps,
             source="raw",
         ),
         name="raw-kafka-consumer-loop",

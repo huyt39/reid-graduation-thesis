@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import time
 
 import cv2
 import numpy as np
@@ -10,6 +11,7 @@ import structlog
 from src.kafka.consumer import StreamingKafkaConsumer
 from src.services.broadcaster import WebSocketBroadcaster
 from src.services.frame_cache import FrameCache, FrameData
+from src.services.minio_urls import MinIOURLBuilder
 
 logger = structlog.get_logger()
 
@@ -18,9 +20,11 @@ async def run_kafka_loop(
     consumer: StreamingKafkaConsumer,
     frame_cache: FrameCache,
     broadcaster: WebSocketBroadcaster,
+    minio_urls: MinIOURLBuilder | None = None,
     *,
     max_poll_records: int = 50,
     jpeg_quality: int = 75,
+    broadcast_max_fps: float = 12.0,
     source: str = "processed",
 ) -> None:
     """Poll Kafka, decode frames, update cache, and broadcast to WebSocket clients.
@@ -32,6 +36,8 @@ async def run_kafka_loop(
     """
     logger.info("kafka_loop.started")
     _broadcast_task: asyncio.Task | None = None
+    min_broadcast_interval = 0.0 if broadcast_max_fps <= 0 else 1.0 / broadcast_max_fps
+    last_broadcast_at_by_device: dict[str, float] = {}
 
     while True:
         try:
@@ -46,12 +52,18 @@ async def run_kafka_loop(
                 continue
 
             for msg in messages:
-                frame = _decode_frame(msg, jpeg_quality, source=source)
+                frame = _decode_frame(msg, jpeg_quality, minio_urls=minio_urls, source=source)
                 if frame is None:
                     continue
 
                 # Cache always gets the freshest frame regardless of broadcast state
                 frame_cache.update(frame)
+
+                now = time.monotonic()
+                last_broadcast_at = last_broadcast_at_by_device.get(frame.device_id, 0.0)
+                if min_broadcast_interval > 0 and (now - last_broadcast_at) < min_broadcast_interval:
+                    continue
+                last_broadcast_at_by_device[frame.device_id] = now
 
                 # Cancel pending broadcast — newest frame wins
                 if _broadcast_task is not None and not _broadcast_task.done():
@@ -71,7 +83,23 @@ async def run_kafka_loop(
             await asyncio.sleep(1)
 
 
-def _decode_frame(msg: dict, jpeg_quality: int, *, source: str) -> FrameData | None:
+def _with_snapshot_urls(
+    tracked_persons: list[dict], minio_urls: MinIOURLBuilder | None,
+) -> list[dict]:
+    if minio_urls is None:
+        return tracked_persons
+
+    enriched: list[dict] = []
+    for person in tracked_persons:
+        item = dict(person)
+        item["snapshot_url"] = minio_urls.presigned_url(item.get("snapshot_key"))
+        enriched.append(item)
+    return enriched
+
+
+def _decode_frame(
+    msg: dict, jpeg_quality: int, *, minio_urls: MinIOURLBuilder | None, source: str,
+) -> FrameData | None:
     try:
         image_bytes: bytes = msg["image_data"]
         nparr = np.frombuffer(image_bytes, np.uint8)
@@ -96,17 +124,24 @@ def _decode_frame(msg: dict, jpeg_quality: int, *, source: str) -> FrameData | N
                     "gender_confidence": 0.0,
                     "tracklet_id": None,
                     "tracklet_state": "raw_edge",
+                    "snapshot_key": None,
                     "visibility_score": det.get("visibility_score", 0.0),
+                    "live_visibility_score": det.get("visibility_score", 0.0),
+                    "overlap_ratio": det.get("overlap_ratio", 0.0),
                     "quality": None,
+                    "matching": None,
                     "attributes": {
                         "source": "raw_edge",
                         "debug_label": f"raw conf={float(det.get('confidence', 0.0)):.2f}",
                         "class_id": str(det.get("class_id", 0)),
                         "overlap_ratio": f"{float(det.get('overlap_ratio', 0.0)):.4f}",
                     },
+                    "status": "recovering",
                 }
                 for det in msg.get("detections", [])
             ]
+        else:
+            tracked_persons = _with_snapshot_urls(tracked_persons, minio_urls)
 
         return FrameData(
             device_id=msg["device_id"],

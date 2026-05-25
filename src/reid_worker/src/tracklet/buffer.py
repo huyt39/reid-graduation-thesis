@@ -34,6 +34,26 @@ class TrackletBuffer:
                 ready.append(tracklet)
         return ready
 
+    def pop_ready_tracklets(
+        self,
+        current_time_ns: int,
+        skip_track_ids: set[int] | None = None,
+    ) -> list[Tracklet]:
+        skip_track_ids = skip_track_ids or set()
+        ready = []
+        for tid, tracklet in list(self.tracklets.items()):
+            if tid in skip_track_ids:
+                continue
+            if tracklet.state != TrackletState.ACTIVE:
+                continue
+            if len(tracklet.entries) < self.min_entries:
+                continue
+            del self.tracklets[tid]
+            tracklet.state = TrackletState.READY
+            tracklet.entries = list(tracklet.entries)
+            ready.append(tracklet)
+        return ready
+
     def evict_stale(self, current_time_ns: int) -> list[int]:
         evicted = []
         for tid, tracklet in list(self.tracklets.items()):
@@ -42,6 +62,22 @@ class TrackletBuffer:
                 del self.tracklets[tid]
                 evicted.append(tid)
         return evicted
+
+    def pop_stale_tracklets(
+        self,
+        current_time_ns: int,
+        skip_track_ids: set[int] | None = None,
+    ) -> list[Tracklet]:
+        skip_track_ids = skip_track_ids or set()
+        stale = []
+        for tid, tracklet in list(self.tracklets.items()):
+            if tid in skip_track_ids:
+                continue
+            last_ts = tracklet.entries[-1].timestamp_ns if tracklet.entries else 0
+            if current_time_ns - last_ts > self.stale_ns:
+                stale.append(tracklet)
+                del self.tracklets[tid]
+        return stale
 
     def remove(self, track_id: int) -> None:
         self.tracklets.pop(track_id, None)

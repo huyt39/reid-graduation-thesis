@@ -43,11 +43,73 @@ def test_person_search_with_filters():
     assert out["params"]["filters"]["last_seen_device"] == "cam-1"
 
 
+def test_person_count_query_uses_person_search_without_calling_llm():
+    llm = StubLLM('{"query_type": "timeline", "params": {}}')
+    parser = QueryParser(llm)  # type: ignore[arg-type]
+    out = _run(parser.parse("how many people are there"))
+    assert out == {
+        "query_type": "person_search",
+        "params": {"filters": {}, "page": 1, "page_size": 20},
+    }
+    assert llm.call_count == 0
+
+
+def test_gender_count_query_uses_gender_filter_without_calling_llm():
+    llm = StubLLM('{"query_type": "person_search", "params": {"filters": {}}}')
+    parser = QueryParser(llm)  # type: ignore[arg-type]
+    out = _run(parser.parse("how many female"))
+    assert out == {
+        "query_type": "person_search",
+        "params": {"filters": {"gender": "female"}, "page": 1, "page_size": 20},
+    }
+    assert llm.call_count == 0
+
+
+def test_attribute_count_query_uses_attribute_filter_without_calling_llm():
+    llm = StubLLM('{"query_type": "person_search", "params": {"filters": {}}}')
+    parser = QueryParser(llm)  # type: ignore[arg-type]
+    out = _run(parser.parse("how many people wear glasses"))
+    assert out == {
+        "query_type": "person_search",
+        "params": {"filters": {"glasses": "glasses"}, "page": 1, "page_size": 20},
+    }
+    assert llm.call_count == 0
+
+
+def test_multi_attribute_search_without_calling_llm():
+    llm = StubLLM('{"query_type": "person_search", "params": {"filters": {}}}')
+    parser = QueryParser(llm)  # type: ignore[arg-type]
+    out = _run(parser.parse("find female with backpack and hat"))
+    assert out == {
+        "query_type": "person_search",
+        "params": {"filters": {"gender": "female", "backpack": "backpack", "hat": "hat"}},
+    }
+    assert llm.call_count == 0
+
+
+def test_negative_attribute_is_not_overwritten_by_positive_term():
+    llm = StubLLM('{"query_type": "person_search", "params": {"filters": {}}}')
+    parser = QueryParser(llm)  # type: ignore[arg-type]
+    out = _run(parser.parse("how many people without glasses"))
+    assert out == {
+        "query_type": "person_search",
+        "params": {"filters": {"glasses": "no_glasses"}, "page": 1, "page_size": 20},
+    }
+    assert llm.call_count == 0
+
+
 def test_timeline_query():
     llm = StubLLM('{"query_type": "timeline", "params": {"person_id": 100}}')
     out = _run(QueryParser(llm).parse("where was 100"))  # type: ignore[arg-type]
     assert out["query_type"] == "timeline"
     assert out["params"]["person_id"] == 100
+
+
+def test_missing_required_person_id_returns_error():
+    llm = StubLLM('{"query_type": "timeline", "params": {}}')
+    out = _run(QueryParser(llm).parse("where was the person"))  # type: ignore[arg-type]
+    assert out["query_type"] == "error"
+    assert "requires person_id" in out["params"]["reason"]
 
 
 def test_similarity_search():
@@ -138,7 +200,15 @@ def test_llm_exception_returns_error():
 @pytest.mark.parametrize("qtype", sorted(VALID_QUERY_TYPES))
 def test_each_query_type_passes_through(qtype):
     """Smoke-test that each valid query_type round-trips correctly."""
-    llm = StubLLM(f'{{"query_type": "{qtype}", "params": {{}}}}')
+    params_by_type = {
+        "person_lookup": '{"person_id": 1}',
+        "person_search": '{}',
+        "timeline": '{"person_id": 1}',
+        "similarity_search": '{"person_id": 1}',
+        "sighting_aggregation": '{}',
+        "device_lookup": '{}',
+    }
+    llm = StubLLM(f'{{"query_type": "{qtype}", "params": {params_by_type[qtype]}}}')
     out = _run(QueryParser(llm).parse("blah"))  # type: ignore[arg-type]
     assert out["query_type"] == qtype
-    assert out["params"] == {}
+    assert isinstance(out["params"], dict)

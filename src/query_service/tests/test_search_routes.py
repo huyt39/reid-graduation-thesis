@@ -40,8 +40,10 @@ async def test_natural_language_query_validates_and_executes_structured_query(mo
     assert result == {
         "parsed_query": {"query_type": "person_lookup", "params": {"person_id": 7}},
         "result": {"person": {"person_id": 7}},
+        "summary": "Found person 7.",
     }
     executor.execute.assert_awaited_once()
+    parser.summarize.assert_not_awaited()
 
 
 @pytest.mark.asyncio

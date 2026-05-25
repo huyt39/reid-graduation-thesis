@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import cv2
+from kafka.errors import KafkaError, NoBrokersAvailable
 import numpy as np
 import structlog
 
@@ -40,6 +42,213 @@ _ATTRIBUTE_TASKS = ("gender", "age_child", "backpack", "sidebag",
                     "hat", "glasses", "sleeve", "lower")
 
 
+def _summarize_live_status(
+    live_visibility_score: float,
+    overlap_ratio: float,
+    quality: dict | None,
+) -> str:
+    if quality is None:
+        return "tentative"
+    if live_visibility_score < 0.45 or overlap_ratio >= 0.35:
+        return "recovering"
+    return "confirmed"
+
+
+def _build_attribute_crop(
+    frame: np.ndarray,
+    bbox_xyxy: np.ndarray,
+    *,
+    top_padding_ratio: float,
+    side_padding_ratio: float,
+    bottom_padding_ratio: float,
+) -> np.ndarray:
+    frame_h, frame_w = frame.shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
+    width = max(x2 - x1, 1.0)
+    height = max(y2 - y1, 1.0)
+    pad_x = width * side_padding_ratio
+    pad_top = height * top_padding_ratio
+    pad_bottom = height * bottom_padding_ratio
+
+    crop_x1 = max(0, int(round(x1 - pad_x)))
+    crop_y1 = max(0, int(round(y1 - pad_top)))
+    crop_x2 = min(frame_w, int(round(x2 + pad_x)))
+    crop_y2 = min(frame_h, int(round(y2 + pad_bottom)))
+    return frame[crop_y1:crop_y2, crop_x1:crop_x2]
+
+
+def _compute_person_snapshot_score(
+    *,
+    v_avg: float,
+    overall_consistency: float,
+    embedding_consistency: float,
+    overlap_ratio: float = 0.0,
+) -> float:
+    """Rank candidate person snapshots by visual quality, not recency.
+
+    We bias toward visibility because the UI avatar should remain a clear,
+    representative crop even when later tracklets are valid but partially
+    occluded or less frontal.
+    """
+    overlap_penalty = 0.35 * max(0.0, min(1.0, float(overlap_ratio or 0.0)))
+    score = (
+        (0.5 * v_avg)
+        + (0.3 * overall_consistency)
+        + (0.2 * embedding_consistency)
+        - overlap_penalty
+    )
+    return round(float(score), 4)
+
+
+def _rank_snapshot_entry(entry: TrackletEntry) -> tuple[float, float, int]:
+    """Prefer clear crops for person-facing snapshots."""
+    overlap = float(getattr(entry, "overlap_ratio", 0.0) or 0.0)
+    visibility = float(getattr(entry, "v_score", 0.0) or 0.0)
+    return (visibility - (0.7 * overlap), -overlap, int(getattr(entry, "frame_idx", 0)))
+
+
+def _choose_person_snapshot_entry(
+    entries: list[TrackletEntry],
+    selected: list[TrackletEntry],
+    *,
+    max_overlap_ratio: float,
+) -> TrackletEntry | None:
+    """Pick a clean representative frame, or None when every crop is ambiguous.
+
+    Tracklets can still be persisted as occlusion evidence. This helper only
+    gates the canonical/person-facing snapshot so a two-person crop cannot
+    overwrite the identity avatar or become high-scoring evidence.
+    """
+    unique: dict[int, TrackletEntry] = {}
+    for entry in list(selected or []) + list(entries or []):
+        if getattr(entry, "crop", None) is None or entry.crop.size <= 0:
+            continue
+        unique[int(entry.frame_idx)] = entry
+    clean = [
+        entry for entry in unique.values()
+        if float(getattr(entry, "overlap_ratio", 0.0) or 0.0) <= max_overlap_ratio
+    ]
+    if not clean:
+        return None
+    return max(clean, key=_rank_snapshot_entry)
+
+
+def _tracklet_motion_summary(entries: list[TrackletEntry]) -> dict[str, float]:
+    if not entries:
+        return {
+            "mean_width_px": 0.0,
+            "mean_height_px": 0.0,
+            "path_displacement_ratio": 0.0,
+            "endpoint_displacement_ratio": 0.0,
+            "boundary_contact_ratio": 0.0,
+        }
+
+    widths = []
+    heights = []
+    centers: list[np.ndarray] = []
+    boundary_hits = 0
+    boundary_eligible = 0
+    edge_tolerance_px = 2.0
+    for entry in entries:
+        x1, y1, x2, y2 = entry.bbox_xyxy
+        widths.append(max(float(x2 - x1), 1.0))
+        heights.append(max(float(y2 - y1), 1.0))
+        centers.append(np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=np.float32))
+        fw = float(getattr(entry, "frame_w", 0) or 0)
+        fh = float(getattr(entry, "frame_h", 0) or 0)
+        if fw > 0 and fh > 0:
+            boundary_eligible += 1
+            if (
+                x1 <= edge_tolerance_px
+                or y1 <= edge_tolerance_px
+                or x2 >= fw - edge_tolerance_px
+                or y2 >= fh - edge_tolerance_px
+            ):
+                boundary_hits += 1
+
+    norm = max(float(np.median(heights)), 1.0)
+    path_disp = 0.0
+    for prev, curr in zip(centers, centers[1:]):
+        path_disp += float(np.linalg.norm(curr - prev))
+    endpoint_disp = 0.0
+    if len(centers) >= 2:
+        endpoint_disp = float(np.linalg.norm(centers[-1] - centers[0]))
+
+    boundary_ratio = (boundary_hits / boundary_eligible) if boundary_eligible > 0 else 0.0
+
+    return {
+        "mean_width_px": round(float(sum(widths) / len(widths)), 4),
+        "mean_height_px": round(float(sum(heights) / len(heights)), 4),
+        "path_displacement_ratio": round(path_disp / norm, 4),
+        "endpoint_displacement_ratio": round(endpoint_disp / norm, 4),
+        "boundary_contact_ratio": round(float(boundary_ratio), 4),
+    }
+
+
+def _compute_max_good_streak(entries: list[TrackletEntry], threshold: float) -> int:
+    """PDF Bước 2: longest run of consecutive entries with v_score >= threshold.
+
+    Filters out random YOLO flicker — a real person produces sustained
+    high-quality frames; a noise detection rarely produces 4-in-a-row.
+    """
+    if not entries:
+        return 0
+    best = 0
+    current = 0
+    for entry in entries:
+        if float(getattr(entry, "v_score", 0.0) or 0.0) >= float(threshold):
+            current += 1
+            if current > best:
+                best = current
+        else:
+            current = 0
+    return best
+
+
+def _bbox_center(box: list[float] | np.ndarray) -> np.ndarray:
+    return np.array([(float(box[0]) + float(box[2])) / 2.0, (float(box[1]) + float(box[3])) / 2.0], dtype=np.float32)
+
+
+def _select_embedding_consensus_indices(
+    embeddings: list[np.ndarray],
+    v_scores: list[float],
+    *,
+    similarity_threshold: float,
+) -> list[int]:
+    """Return indices for the strongest appearance-consistent embedding cluster."""
+    if len(embeddings) <= 1:
+        return list(range(len(embeddings)))
+
+    stacked = np.stack(embeddings, axis=0).astype(np.float32)
+    norms = np.linalg.norm(stacked, axis=1, keepdims=True)
+    stacked = stacked / np.maximum(norms, 1e-8)
+    sims = stacked @ stacked.T
+
+    best_cluster: list[int] = []
+    best_score = -1.0
+    for idx in range(len(embeddings)):
+        cluster = [
+            other_idx
+            for other_idx in range(len(embeddings))
+            if other_idx == idx or float(sims[idx, other_idx]) >= similarity_threshold
+        ]
+        # Prefer more support first, then better visual quality.
+        score = (len(cluster) * 10.0) + sum(v_scores[i] for i in cluster)
+        if score > best_score:
+            best_cluster = cluster
+            best_score = score
+
+    return sorted(best_cluster)
+
+
+@dataclass
+class _MergeAttemptResult:
+    person_id: int
+    merged: bool = False
+    gender_blocked: bool = False
+    retryable_blocked: bool = False
+
+
 class WorkerPipeline:
     def __init__(self) -> None:
         self.settings = settings
@@ -66,7 +275,10 @@ class WorkerPipeline:
             min_high_quality_frames=self.settings.min_high_quality_frames,
             high_quality_threshold=self.settings.high_quality_threshold,
         )
-        self.aggregator = WeightedEmbeddingAggregator(gamma=self.settings.gamma)
+        self.aggregator = WeightedEmbeddingAggregator(
+            gamma=self.settings.gamma,
+            outlier_threshold=self.settings.agg_outlier_threshold,
+        )
         self.qdrant_store = QdrantPersonStore(
             host=self.settings.qdrant_host,
             port=self.settings.qdrant_port,
@@ -74,6 +286,7 @@ class WorkerPipeline:
             similarity_threshold=self.settings.similarity_threshold,
             momentum=self.settings.momentum,
             max_gallery_size=self.settings.max_gallery_size,
+            consensus_weight=self.settings.gallery_consensus_weight,
         )
         self.model_client = ModelServiceClient(base_url=self.settings.model_service_url)
 
@@ -91,22 +304,39 @@ class WorkerPipeline:
         )
         self.attribute_voter = AttributeVoter(
             person_threshold=self.settings.gender_person_threshold,
-            flip_threshold=self.settings.gender_flip_threshold,
+            flip_threshold=self.settings.attribute_flip_threshold,
+            task_flip_thresholds={"gender": self.settings.gender_flip_threshold},
         )
         self.matcher = ReIDMatcher(
             self.qdrant_store,
             id_allocator=self.person_id_allocator.allocate,
             promote_v_threshold=self.settings.promote_v_threshold,
             promote_consistency_threshold=self.settings.promote_consistency_threshold,
+            new_identity_min_tracklet_len=self.settings.new_identity_min_tracklet_len,
+            min_high_quality_frames=self.settings.min_high_quality_frames,
             tentative_max_attempts=self.settings.tentative_max_attempts,
             tentative_fallback_enabled=self.settings.tentative_fallback_enabled,
             update_v_threshold=self.settings.update_v_threshold,
             update_consistency_threshold=self.settings.update_consistency_threshold,
             update_min_tracklet_len=self.settings.update_min_tracklet_len,
             update_sim_threshold=self.settings.update_sim_threshold,
+            update_anchor_min_score=self.settings.gallery_update_anchor_min_score,
             match_margin=self.settings.match_margin,
             spatial_reuse_threshold=self.settings.spatial_reuse_threshold,
             soft_match_threshold=self.settings.soft_match_threshold,
+            eager_soft_match_threshold=self.settings.eager_soft_match_threshold,
+            match_consistency_threshold=self.settings.match_consistency_threshold,
+            low_visibility_threshold=self.settings.low_visibility_threshold,
+            low_visibility_match_threshold=self.settings.low_visibility_match_threshold,
+            blocked_match_score_threshold=self.settings.blocked_match_score_threshold,
+            current_identity_min_score=self.settings.current_identity_min_score,
+            current_identity_switch_min_score=self.settings.current_identity_switch_min_score,
+            current_identity_switch_min_margin=self.settings.current_identity_switch_min_margin,
+            current_identity_switch_max_current_score=self.settings.current_identity_switch_max_current_score,
+            capped_identity_soft_match_threshold=self.settings.capped_identity_soft_match_threshold,
+            near_gallery_defer_threshold=self.settings.near_gallery_defer_threshold,
+            good_streak_min_consecutive=self.settings.good_streak_min_consecutive,
+            good_streak_promotion_enabled=self.settings.good_streak_promotion_enabled,
         )
 
         self.consumer = WorkerKafkaConsumer(
@@ -125,7 +355,31 @@ class WorkerPipeline:
         self.track_metadata: dict[int, dict] = {}
         self.track_last_seen_ns: dict[int, int] = {}
         self.person_last_observation: dict[int, dict] = {}
+        self.current_track_metrics: dict[int, dict[str, float]] = {}
+        self.track_identity_memory: dict[int, dict] = {}
+        self.track_forbidden_person_ids: dict[int, set[int]] = {}
+        self.track_cooccurrence_counts: dict[int, dict[int, int]] = {}
+        self.occlusion_candidate_track_ids: set[int] = set()
+        self.untracked_detection_clusters: list[dict] = []
+        self.untracked_detection_cluster_seq = 0
+        self.processing_tracklet_ids: set[int] = set()
+        self.fragment_recovery_clusters: list[dict] = []
+        # Fix C — admission appearance-gate state. Per track_id, cache the
+        # embeddings of frames already accepted into the buffer so we can
+        # compare a new frame's embedding against the running mean cheaply.
+        # _track_id_split_counts assigns deterministic virtual track_ids when
+        # a frame diverges from its track's appearance (likely ByteTrack swap).
+        self._tracklet_embedding_cache: dict[int, list[np.ndarray]] = {}
+        self._track_id_split_counts: dict[int, int] = {}
+        self._tracklet_gate_last_check_frame: dict[int, int] = {}
+        # Tracks fire-and-forget background tasks so the worker can drain them
+        # on shutdown. Without this, idle-flush / fragment-recovery futures
+        # complete after the consumer closes, causing post-stream Mongo writes.
+        self._inflight: set[asyncio.Task] = set()
+        self._stream_finalizing = False
         self._current_device_id: str = ""
+        self.last_message_time_ns: int = 0
+        self.last_idle_flush_ns: int = 0
         self.processed_messages = 0
         self.ready_tracklets = 0
         self.embedded_tracklets = 0
@@ -145,6 +399,11 @@ class WorkerPipeline:
             self.track_id_to_person_id.pop(track_id, None)
             self.track_metadata.pop(track_id, None)
             self.track_last_seen_ns.pop(track_id, None)
+            self.current_track_metrics.pop(track_id, None)
+            self.track_forbidden_person_ids.pop(track_id, None)
+            self.track_cooccurrence_counts.pop(track_id, None)
+            getattr(self, "occlusion_candidate_track_ids", set()).discard(track_id)
+            getattr(self, "processing_tracklet_ids", set()).discard(track_id)
         stale_person_ids = {
             person_id
             for person_id, obs in self.person_last_observation.items()
@@ -182,6 +441,130 @@ class WorkerPipeline:
         size_b = max(box_b[2] - box_b[0], box_b[3] - box_b[1], 1.0)
         return distance / max(size_a, size_b, 1.0)
 
+    @staticmethod
+    def _cosine_similarity(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
+        norm_a = float(np.linalg.norm(vec_a))
+        norm_b = float(np.linalg.norm(vec_b))
+        if norm_a < 1e-8 or norm_b < 1e-8:
+            return 0.0
+        return float(np.dot(vec_a / norm_a, vec_b / norm_b))
+
+    def _tracklet_identity_shift_risk(self, tracklet) -> dict | None:
+        """Detect likely ByteTrack ID swaps inside one finalized tracklet.
+
+        This is deliberately geometry-only and conservative. A normal tracklet
+        may move or scale, but the high-risk pattern for contamination is a long
+        already-bound tracklet whose endpoint displacement and bbox growth both
+        cross large thresholds. Those tracklets should not enter a confirmed
+        identity through low-threshold continuity.
+        """
+        if not bool(getattr(self.settings, "tracklet_identity_shift_guard_enabled", True)):
+            return None
+        entries = list(getattr(tracklet, "entries", []) or [])
+        min_entries = int(getattr(self.settings, "tracklet_identity_shift_min_entries", 12))
+        if len(entries) < min_entries:
+            return None
+
+        first = [float(v) for v in entries[0].bbox_xyxy]
+        last = [float(v) for v in entries[-1].bbox_xyxy]
+        memory = getattr(self, "track_identity_memory", {}).get(tracklet.track_id) or {}
+        anchor = memory.get("anchor_bbox_xyxy")
+        anchor_frame_idx = memory.get("anchor_frame_idx")
+        if anchor and len(anchor) >= 4 and anchor_frame_idx is not None:
+            frame_gap = int(entries[-1].frame_idx) - int(anchor_frame_idx)
+            if frame_gap >= int(
+                getattr(self.settings, "tracklet_identity_shift_anchor_min_frame_gap", 24)
+            ):
+                anchor_risk = self._bbox_identity_shift_metrics(
+                    [float(v) for v in anchor],
+                    last,
+                    entry_count=len(entries),
+                    endpoint_threshold=float(
+                        getattr(
+                            self.settings,
+                            "tracklet_identity_shift_anchor_min_endpoint_displacement_ratio",
+                            0.40,
+                        )
+                    ),
+                    size_threshold=float(
+                        getattr(
+                            self.settings,
+                            "tracklet_identity_shift_anchor_min_size_ratio",
+                            1.45,
+                        )
+                    ),
+                    area_threshold=float(
+                        getattr(
+                            self.settings,
+                            "tracklet_identity_shift_anchor_min_area_ratio",
+                            1.90,
+                        )
+                    ),
+                )
+                if anchor_risk is not None:
+                    anchor_risk["reason"] = "anchor_shift"
+                    anchor_risk["anchor_frame_gap"] = int(frame_gap)
+                    return anchor_risk
+
+        return self._bbox_identity_shift_metrics(
+            first,
+            last,
+            entry_count=len(entries),
+            endpoint_threshold=float(
+                getattr(
+                    self.settings,
+                    "tracklet_identity_shift_min_endpoint_displacement_ratio",
+                    0.55,
+                )
+            ),
+            size_threshold=float(
+                getattr(self.settings, "tracklet_identity_shift_min_size_ratio", 1.60)
+            ),
+            area_threshold=float(
+                getattr(self.settings, "tracklet_identity_shift_min_area_ratio", 2.20)
+            ),
+        )
+
+    def _bbox_identity_shift_metrics(
+        self,
+        first: list[float],
+        last: list[float],
+        *,
+        entry_count: int,
+        endpoint_threshold: float,
+        size_threshold: float,
+        area_threshold: float,
+    ) -> dict | None:
+        if len(first) < 4 or len(last) < 4:
+            return None
+        first_w = max(first[2] - first[0], 1.0)
+        first_h = max(first[3] - first[1], 1.0)
+        last_w = max(last[2] - last[0], 1.0)
+        last_h = max(last[3] - last[1], 1.0)
+        first_area = first_w * first_h
+        last_area = last_w * last_h
+        endpoint_disp_ratio = float(
+            np.linalg.norm(_bbox_center(first) - _bbox_center(last))
+            / max(first_w, first_h, last_w, last_h, 1.0)
+        )
+        first_size = max(first_w, first_h, 1.0)
+        last_size = max(last_w, last_h, 1.0)
+        size_ratio = max(first_size, last_size) / max(min(first_size, last_size), 1.0)
+        area_ratio = max(first_area, last_area) / max(min(first_area, last_area), 1.0)
+
+        if (
+            endpoint_disp_ratio < endpoint_threshold
+            or size_ratio < size_threshold
+            or area_ratio < area_threshold
+        ):
+            return None
+        return {
+            "endpoint_displacement_ratio": round(endpoint_disp_ratio, 4),
+            "size_ratio": round(float(size_ratio), 4),
+            "area_ratio": round(float(area_ratio), 4),
+            "entry_count": int(entry_count),
+        }
+
     def _find_recent_person_hint(
         self,
         bbox_xyxy: list[float],
@@ -217,6 +600,1059 @@ class WorkerPipeline:
 
         return best_person_id
 
+    def _is_spatially_distinct(
+        self,
+        box_a: list[float],
+        box_b: list[float],
+    ) -> bool:
+        iou = self._bbox_iou(box_a, box_b)
+        center_ratio = self._center_distance_ratio(box_a, box_b)
+        return (
+            iou <= self.settings.cooccurrence_guard_max_iou
+            and center_ratio >= self.settings.cooccurrence_guard_min_center_distance_ratio
+        )
+
+    def _register_temporal_exclusion(
+        self,
+        track_id: int,
+        forbidden_person_id: int,
+    ) -> None:
+        counts = self.track_cooccurrence_counts.setdefault(track_id, {})
+        counts[forbidden_person_id] = counts.get(forbidden_person_id, 0) + 1
+        if counts[forbidden_person_id] >= self.settings.cooccurrence_guard_min_shared_frames:
+            self.track_forbidden_person_ids.setdefault(track_id, set()).add(forbidden_person_id)
+
+    def _update_temporal_exclusions(
+        self,
+        track_results: np.ndarray,
+    ) -> None:
+        if not self.settings.cooccurrence_guard_enabled:
+            return
+
+        visible = [
+            (int(track[4]), [float(v) for v in track[:4].tolist()])
+            for track in track_results
+        ]
+        for idx, (track_id_a, bbox_a) in enumerate(visible):
+            person_id_a = self.track_id_to_person_id.get(track_id_a)
+            for track_id_b, bbox_b in visible[idx + 1:]:
+                if not self._is_spatially_distinct(bbox_a, bbox_b):
+                    continue
+                person_id_b = self.track_id_to_person_id.get(track_id_b)
+                if person_id_a is not None:
+                    self._register_temporal_exclusion(track_id_b, person_id_a)
+                if person_id_b is not None:
+                    self._register_temporal_exclusion(track_id_a, person_id_b)
+
+    def _find_attribute_incompatible_person_ids(
+        self,
+        tracklet_attrs: dict[str, tuple[str, float]],
+        current_person_id: int | None,
+    ) -> set[int]:
+        if not self.settings.attribute_conflict_guard_enabled:
+            return set()
+
+        t_gender, t_gender_conf = tracklet_attrs.get("gender", ("unknown", 0.0))
+        if t_gender not in {"male", "female"}:
+            return set()
+
+        strong_tracklet_thresh = float(self.settings.attribute_conflict_tracklet_confidence)
+        # V23 L1: below this floor the gender classifier is effectively noise — don't
+        # let it influence matching at all.
+        weak_tracklet_floor = 0.55
+        if t_gender_conf < weak_tracklet_floor:
+            return set()
+
+        tracklet_is_strong = t_gender_conf >= strong_tracklet_thresh
+        if not tracklet_is_strong:
+            log.warning(
+                "attribute_guard_skipped_low_tracklet_conf",
+                tracklet_gender=t_gender,
+                tracklet_gender_conf=round(float(t_gender_conf), 3),
+                threshold=strong_tracklet_thresh,
+                current_person_id=current_person_id,
+            )
+
+        strong_person_conf = self._attribute_conflict_ready_person_confidence()
+        strong_person_support = self._attribute_conflict_ready_person_support()
+
+        incompatible: set[int] = set()
+        for person_id in self.attribute_voter.known_person_ids():
+            if current_person_id is not None and person_id == current_person_id:
+                continue
+            snapshot = self.attribute_voter.person_snapshot(person_id)
+            p_gender, p_gender_conf = snapshot.get("gender", ("unknown", 0.0))
+            p_gender_support = self.attribute_voter.person_task_stable_support(person_id, "gender")
+            if p_gender not in {"male", "female"} or p_gender == t_gender:
+                continue
+            if tracklet_is_strong:
+                if (
+                    p_gender_conf >= strong_person_conf
+                    or p_gender_support >= strong_person_support
+                ):
+                    incompatible.add(person_id)
+            else:
+                # Weak tracklet: block only against a person gender that is
+                # itself conflict-ready. A single weak singleton attribute is
+                # evidence for review, not a hard identity barrier.
+                if (
+                    p_gender_conf >= strong_person_conf
+                    or p_gender_support >= strong_person_support
+                ):
+                    incompatible.add(person_id)
+        return incompatible
+
+    def _attribute_conflict_ready_person_confidence(self) -> float:
+        return max(
+            0.80,
+            float(getattr(self.settings, "attribute_conflict_person_confidence", 0.88)),
+        )
+
+    def _attribute_conflict_ready_person_support(self) -> int:
+        return max(
+            2,
+            int(getattr(self.settings, "attribute_conflict_person_min_support", 2)),
+        )
+
+    def _has_current_identity_attribute_conflict(
+        self,
+        tracklet_attrs: dict[str, tuple[str, float]],
+        current_person_id: int | None,
+    ) -> bool:
+        if (
+            current_person_id is None
+            or not self.settings.attribute_conflict_guard_enabled
+        ):
+            return False
+
+        t_gender, t_gender_conf = tracklet_attrs.get("gender", ("unknown", 0.0))
+        if t_gender not in {"male", "female"}:
+            return False
+        if t_gender_conf < float(self.settings.attribute_conflict_tracklet_confidence):
+            return False
+
+        snapshot = self.attribute_voter.person_snapshot(current_person_id)
+        p_gender, p_gender_conf = snapshot.get("gender", ("unknown", 0.0))
+        if p_gender not in {"male", "female"} or p_gender == t_gender:
+            return False
+
+        p_gender_support = self.attribute_voter.person_task_stable_support(
+            current_person_id,
+            "gender",
+        )
+        return (
+            p_gender_conf >= self._attribute_conflict_ready_person_confidence()
+            or p_gender_support >= self._attribute_conflict_ready_person_support()
+        )
+
+    def _is_occlusion_attribute_unreliable(
+        self,
+        tracklet,
+        *,
+        v_avg: float,
+    ) -> bool:
+        """Return True when tracklet attributes should not update person state.
+
+        Synthetic negative track_ids come from untracked-detection clusters:
+        exactly the partial/body-overlap path where the PDF treats attributes
+        as weak supporting evidence, not canonical identity state.
+        """
+        entries = list(getattr(tracklet, "entries", []) or [])
+        max_overlap = max(
+            (float(getattr(entry, "overlap_ratio", 0.0) or 0.0) for entry in entries),
+            default=0.0,
+        )
+        return (
+            int(getattr(tracklet, "track_id", 0)) < 0
+            or float(v_avg) < float(getattr(self.settings, "low_visibility_threshold", 0.65))
+            or max_overlap >= 0.35
+        )
+
+    def _has_person_attribute_conflict(
+        self,
+        tracklet_attrs: dict[str, tuple[str, float]],
+        person_id: int | None,
+    ) -> bool:
+        """Conservative attribute veto for provisional occlusion attachment."""
+        if (
+            person_id is None
+            or not self.settings.attribute_conflict_guard_enabled
+        ):
+            return False
+
+        t_gender, t_gender_conf = tracklet_attrs.get("gender", ("unknown", 0.0))
+        if t_gender not in {"male", "female"}:
+            return False
+        if t_gender_conf < 0.55:
+            return False
+
+        snapshot = self.attribute_voter.person_snapshot(person_id)
+        p_gender, p_gender_conf = snapshot.get("gender", ("unknown", 0.0))
+        if p_gender not in {"male", "female"} or p_gender == t_gender:
+            return False
+
+        p_gender_support = self.attribute_voter.person_task_stable_support(
+            person_id,
+            "gender",
+        )
+        return (
+            p_gender_conf >= self._attribute_conflict_ready_person_confidence()
+            or p_gender_support >= self._attribute_conflict_ready_person_support()
+        )
+
+    def _maybe_accept_occlusion_provisional_match(
+        self,
+        *,
+        tracklet,
+        matching: dict,
+        v_avg: float,
+        tracklet_attrs: dict[str, tuple[str, float]],
+        forbidden_person_ids: set[int],
+        recent_incompatible_person_ids: set[int],
+        blocked_person_ids: set[int],
+    ) -> tuple[int | None, dict]:
+        """Attach near-gallery occlusion evidence without updating identity anchors.
+
+        This is intentionally narrower than a normal gallery match: it only
+        consumes a matcher decision that already deferred a near-gallery hit,
+        requires an occlusion/untracked signal, enforces margin + attribute
+        guards, and marks the result so persistence skips person snapshot and
+        attribute updates. The goal is realtime occlusion ReID evidence, not
+        lowering the global match threshold.
+        """
+        if not bool(getattr(self.settings, "occlusion_provisional_match_enabled", True)):
+            return None, matching
+        if not isinstance(matching, dict):
+            return None, matching
+        if matching.get("method") not in {
+            "near_gallery_deferred",
+            "fragment_recovery_deferred_near_gallery",
+        }:
+            return None, matching
+
+        reuse_pid = matching.get("reuse_person_id")
+        if reuse_pid is None:
+            return None, matching
+        try:
+            reuse_pid = int(reuse_pid)
+        except (TypeError, ValueError):
+            return None, matching
+
+        if (
+            reuse_pid in forbidden_person_ids
+            or reuse_pid in recent_incompatible_person_ids
+            or reuse_pid in blocked_person_ids
+        ):
+            return None, matching
+        if self._has_person_attribute_conflict(tracklet_attrs, reuse_pid):
+            log.warning(
+                "occlusion_provisional_match_rejected_attribute_conflict",
+                track_id=tracklet.track_id,
+                reuse_person_id=reuse_pid,
+                tracklet_gender=tracklet_attrs.get("gender"),
+                person_snapshot=self.attribute_voter.person_snapshot(reuse_pid),
+            )
+            return None, matching
+
+        score = matching.get("similarity_score")
+        try:
+            score_f = float(score)
+        except (TypeError, ValueError):
+            return None, matching
+        entries = list(getattr(tracklet, "entries", []) or [])
+        short_reentry = self._is_short_reentry_to_person(
+            tracklet=tracklet,
+            person_id=reuse_pid,
+            score=score_f,
+        )
+        base_min_score = float(getattr(self.settings, "occlusion_provisional_match_threshold", 0.62))
+        reentry_min_score = float(
+            getattr(self.settings, "occlusion_provisional_reentry_min_similarity", base_min_score)
+        )
+        min_score = min(base_min_score, reentry_min_score) if short_reentry else base_min_score
+        if score_f < min_score:
+            return None, matching
+
+        runner_up = matching.get("runner_up_score")
+        if runner_up is not None:
+            try:
+                margin = score_f - float(runner_up)
+            except (TypeError, ValueError):
+                margin = None
+            min_margin = float(getattr(self.settings, "occlusion_provisional_min_margin", 0.03))
+            if margin is not None and margin < min_margin:
+                return None, matching
+
+        max_overlap = max((float(getattr(entry, "overlap_ratio", 0.0) or 0.0) for entry in entries), default=0.0)
+        occlusion_like = (
+            int(tracklet.track_id) < 0
+            or float(v_avg) < float(getattr(self.settings, "low_visibility_threshold", 0.65))
+            or max_overlap >= 0.35
+            or short_reentry
+        )
+        if not occlusion_like:
+            return None, matching
+
+        accepted = {
+            **matching,
+            "method": "occlusion_provisional_match",
+            "source": matching.get("source") or "near_gallery_deferred",
+            "reuse_person_id": reuse_pid,
+            "similarity_score": score_f,
+            "canonical_update_applied": False,
+            "provisional": True,
+            "provisional_reason": matching.get("method"),
+        }
+        log.info(
+            "occlusion_provisional_match_accepted",
+            track_id=tracklet.track_id,
+            person_id=reuse_pid,
+            similarity_score=round(score_f, 4),
+            v_avg=round(float(v_avg), 4),
+            max_overlap=round(max_overlap, 4),
+            short_reentry=bool(short_reentry),
+        )
+        return reuse_pid, accepted
+
+    def _is_short_reentry_to_person(self, *, tracklet, person_id: int, score: float) -> bool:
+        if not bool(getattr(self.settings, "occlusion_provisional_short_reentry_enabled", False)):
+            return False
+        if float(score) < float(getattr(self.settings, "occlusion_provisional_reentry_min_similarity", 0.58)):
+            return False
+        entries = list(getattr(tracklet, "entries", []) or [])
+        if not entries:
+            return False
+        if len(entries) > int(getattr(self.settings, "occlusion_provisional_reentry_max_entries", 8)):
+            return False
+        obs = self.person_last_observation.get(int(person_id))
+        if not obs:
+            return False
+        obs_frame = obs.get("frame_idx")
+        if obs_frame is None:
+            return False
+        frame_gap = int(entries[0].frame_idx) - int(obs_frame)
+        if frame_gap <= 0 or frame_gap > int(getattr(self.settings, "occlusion_provisional_reentry_max_gap_frames", 180)):
+            return False
+        obs_bbox = obs.get("bbox_xyxy")
+        if not obs_bbox or len(obs_bbox) < 4:
+            return False
+        center_ratio = self._center_distance_ratio(
+            [float(v) for v in entries[0].bbox_xyxy],
+            [float(v) for v in obs_bbox],
+        )
+        return center_ratio <= float(
+            getattr(self.settings, "occlusion_provisional_reentry_max_center_distance_ratio", 2.0)
+        )
+
+    def _update_person_last_observation_from_tracklet(self, person_id: int, tracklet) -> None:
+        entries = list(getattr(tracklet, "entries", []) or [])
+        if not entries:
+            return
+        entry = entries[-1]
+        self.person_last_observation[int(person_id)] = {
+            "bbox_xyxy": [float(v) for v in entry.bbox_xyxy],
+            "timestamp_ns": int(entry.timestamp_ns),
+            "device_id": str(getattr(self, "_current_device_id", "")),
+            "frame_idx": int(entry.frame_idx),
+        }
+
+    def _find_blocked_duplicate_person_ids(
+        self,
+        bbox_xyxy: list[float],
+        blocked_person_ids: set[int],
+    ) -> set[int]:
+        duplicate_person_ids: set[int] = set()
+        for person_id in blocked_person_ids:
+            obs = self.person_last_observation.get(person_id)
+            if not obs:
+                continue
+            iou = self._bbox_iou(bbox_xyxy, obs["bbox_xyxy"])
+            if iou >= self.settings.duplicate_track_iou_threshold:
+                duplicate_person_ids.add(person_id)
+        return duplicate_person_ids
+
+    def _find_co_active_person_ids(
+        self,
+        own_track_id: int,
+        current_person_id: int | None,
+        current_time_ns: int,
+        co_active_window_ns: int = int(0.6 * 1e9),
+    ) -> set[int]:
+        """Person IDs currently bound to other live tracks.
+
+        If track A → person 3 was seen in the last `co_active_window_ns`,
+        person 3 cannot also be this new track. This catches the case where
+        a track fragments mid-life and the new track_id tries to merge into
+        the still-active twin's identity.
+        """
+        co_active: set[int] = set()
+        for other_track_id, person_id in self.track_id_to_person_id.items():
+            if other_track_id == own_track_id:
+                continue
+            if current_person_id is not None and person_id == current_person_id:
+                continue
+            last_seen_ns = self.track_last_seen_ns.get(other_track_id)
+            if last_seen_ns is None:
+                continue
+            if current_time_ns - last_seen_ns <= co_active_window_ns:
+                co_active.add(person_id)
+        return co_active
+
+    def _find_recent_incompatible_person_ids(
+        self,
+        bbox_xyxy: list[float],
+        current_time_ns: int,
+        current_person_id: int | None,
+    ) -> set[int]:
+        if not self.settings.recent_match_guard_enabled:
+            return set()
+
+        incompatible_person_ids: set[int] = set()
+        max_gap_ns = int(self.settings.recent_match_guard_seconds * 1e9)
+        for person_id, obs in self.person_last_observation.items():
+            if current_person_id is not None and person_id == current_person_id:
+                continue
+            gap_ns = current_time_ns - int(obs["timestamp_ns"])
+            if gap_ns < 0 or gap_ns > max_gap_ns:
+                continue
+
+            obs_bbox = obs["bbox_xyxy"]
+            iou = self._bbox_iou(bbox_xyxy, obs_bbox)
+            center_ratio = self._center_distance_ratio(bbox_xyxy, obs_bbox)
+            if (
+                iou < self.settings.recent_match_guard_min_iou
+                and center_ratio > self.settings.recent_match_guard_max_center_distance_ratio
+            ):
+                incompatible_person_ids.add(person_id)
+        return incompatible_person_ids
+
+    def _should_ignore_pretrack_static_artifact(
+        self,
+        track_id: int,
+        bbox_xyxy: list[float],
+        frame_w: int = 0,
+        frame_h: int = 0,
+    ) -> bool:
+        if not self.settings.pretrack_static_filter_enabled:
+            return False
+        # Preserve the PDF's cut_off/occlusion signal: small stationary boxes
+        # touching the frame boundary are often partial humans, not signage.
+        if frame_w > 0 and frame_h > 0:
+            x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
+            edge_tolerance_px = 2.0
+            if (
+                x1 <= edge_tolerance_px
+                or y1 <= edge_tolerance_px
+                or x2 >= float(frame_w) - edge_tolerance_px
+                or y2 >= float(frame_h) - edge_tolerance_px
+            ):
+                return False
+        history = self.prev_bboxes.get(track_id, [])
+        if len(history) < self.settings.pretrack_static_filter_min_frames:
+            return False
+
+        widths = [float(box[2] - box[0]) for box in history]
+        heights = [float(box[3] - box[1]) for box in history]
+        if (
+            max(widths) > self.settings.pretrack_static_filter_max_width_px
+            or max(heights) > self.settings.pretrack_static_filter_max_height_px
+        ):
+            return False
+
+        centers = [_bbox_center(box) for box in history]
+        anchor = centers[0]
+        max_center_drift = max(float(np.linalg.norm(center - anchor)) for center in centers[1:]) if len(centers) > 1 else 0.0
+        return max_center_drift <= self.settings.pretrack_static_filter_max_center_drift_px
+
+    def _should_suppress_new_identity(self, tracklet: Tracklet) -> bool:
+        if not self.settings.static_artifact_filter_enabled:
+            return False
+        if len(tracklet.entries) < self.settings.static_artifact_min_entries:
+            return False
+
+        motion = _tracklet_motion_summary(tracklet.entries)
+        # PDF Bước 1: boundary contact is an OCCLUSION signal (cut_off). A
+        # tracklet with substantial boundary contact is a partial-body person,
+        # not a static artifact — exempt from suppression even if it has small
+        # bbox and low motion.
+        boundary_skip = float(
+            getattr(self.settings, "static_artifact_boundary_contact_skip", 0.3)
+        )
+        if motion.get("boundary_contact_ratio", 0.0) >= boundary_skip:
+            return False
+        consistency = compute_tracklet_consistency(tracklet.entries)
+        size_ok = (
+            motion["mean_width_px"] <= self.settings.static_artifact_max_mean_width_px
+            and motion["mean_height_px"] <= self.settings.static_artifact_max_mean_height_px
+        )
+        low_motion_static = (
+            motion["path_displacement_ratio"] <= self.settings.static_artifact_max_path_displacement_ratio
+            and motion["endpoint_displacement_ratio"] <= self.settings.static_artifact_max_endpoint_displacement_ratio
+        )
+        stable_bbox_static = (
+            consistency.bbox_size_stability >= float(
+                getattr(self.settings, "static_artifact_min_bbox_stability", 0.97)
+            )
+            and consistency.position_stability >= float(
+                getattr(self.settings, "static_artifact_min_position_stability", 0.97)
+            )
+        )
+        suppressed = (
+            size_ok
+            and (low_motion_static or stable_bbox_static)
+        )
+        if suppressed:
+            # Diagnostic only — make data-driven threshold tuning possible without
+            # guessing. Lets us see exactly which boundary persons get caught and
+            # which static objects (WC icons, fire extinguishers) slip through.
+            log.warning(
+                "new_identity_suppressed_static_artifact",
+                track_id=tracklet.track_id,
+                entries=len(tracklet.entries),
+                mean_width_px=round(motion["mean_width_px"], 2),
+                mean_height_px=round(motion["mean_height_px"], 2),
+                path_displacement_ratio=round(motion["path_displacement_ratio"], 4),
+                endpoint_displacement_ratio=round(motion["endpoint_displacement_ratio"], 4),
+                bbox_size_stability=round(float(consistency.bbox_size_stability), 4),
+                position_stability=round(float(consistency.position_stability), 4),
+            )
+        return suppressed
+
+    def _track_inflight(self, task: asyncio.Task) -> asyncio.Task:
+        """Register a fire-and-forget task so it can be awaited on shutdown."""
+        # Tests that bypass __init__ via .__new__() won't have _inflight set;
+        # lazy-init to keep this resilient.
+        if not hasattr(self, "_inflight"):
+            self._inflight = set()
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
+        return task
+
+    def _remember_track_identity(self, person_id: int, tracklet: Tracklet) -> None:
+        if not tracklet.entries:
+            return
+        if not hasattr(self, "track_identity_memory"):
+            self.track_identity_memory = {}
+        first_entry = tracklet.entries[0]
+        last_entry = tracklet.entries[-1]
+        existing = self.track_identity_memory.get(tracklet.track_id) or {}
+        same_person = int(existing.get("person_id", person_id)) == int(person_id)
+        anchor_bbox = (
+            existing.get("anchor_bbox_xyxy")
+            if same_person and existing.get("anchor_bbox_xyxy")
+            else [float(v) for v in first_entry.bbox_xyxy]
+        )
+        anchor_frame_idx = (
+            existing.get("anchor_frame_idx")
+            if same_person and existing.get("anchor_frame_idx") is not None
+            else int(first_entry.frame_idx)
+        )
+        self.track_identity_memory[tracklet.track_id] = {
+            "person_id": int(person_id),
+            "anchor_frame_idx": int(anchor_frame_idx),
+            "anchor_bbox_xyxy": [float(v) for v in anchor_bbox],
+            "last_frame_idx": int(last_entry.frame_idx),
+            "last_bbox_xyxy": [float(v) for v in last_entry.bbox_xyxy],
+        }
+
+    def _find_recent_track_identity(self, tracklet: Tracklet) -> int | None:
+        if not tracklet.entries:
+            return None
+        memory = getattr(self, "track_identity_memory", {}).get(tracklet.track_id)
+        if not memory:
+            return None
+
+        first_entry = tracklet.entries[0]
+        frame_gap = int(first_entry.frame_idx) - int(memory.get("last_frame_idx", -10**9))
+        max_gap = int(getattr(self.settings, "track_identity_memory_max_gap_frames", 180))
+        if frame_gap < 0 or frame_gap > max_gap:
+            return None
+
+        previous_box = memory.get("last_bbox_xyxy")
+        if not previous_box:
+            return None
+        center_ratio = self._center_distance_ratio(
+            previous_box,
+            [float(v) for v in first_entry.bbox_xyxy],
+        )
+        max_center_ratio = float(
+            getattr(self.settings, "track_identity_memory_max_center_distance_ratio", 1.25)
+        )
+        if center_ratio > max_center_ratio:
+            return None
+        return int(memory["person_id"])
+
+    def _can_allocate_new_identity(self, tracklet: Tracklet | None = None) -> bool:
+        """Gate new person_id allocation on worker-side wall-clock idleness.
+
+        Reference is ``self.last_message_time_ns`` — the worker's wall-clock
+        time the last Kafka batch was received. NOT the message's claimed
+        ``timestamp_ns`` (that's the edge service's view of time, which can
+        be hours/months in the past for replays and breaks the gate entirely).
+
+        When ``stream_quiescence_seconds`` of wall-clock time have passed
+        since the last Kafka batch, the stream is considered finished and no
+        new identities should be minted. Set the threshold long enough that
+        legitimate end-of-stream tracklets (which finalize ~3s after last
+        frame, then process serially through the async task queue) all
+        complete BEFORE the gate fires. 20s default is empirical headroom
+        for typical workloads; bump via env var if your workload has more
+        end-of-stream tracklets than that.
+
+        ``max_new_identity_lag_seconds`` is a separate freshness guard keyed to
+        the edge publish timestamp in the tracklet entries. It covers Kafka
+        backlog: while the worker is still receiving old messages, quiescence
+        alone never fires because ``last_message_time_ns`` keeps refreshing.
+        """
+        if not getattr(self, "_stream_finalizing", False):
+            max_lag_s = float(getattr(self.settings, "max_new_identity_lag_seconds", 0.0) or 0.0)
+            if not self._tracklet_is_fresh_enough(
+                tracklet,
+                max_lag_s=max_lag_s,
+                log_event="new_identity_blocked_stale_tracklet",
+            ):
+                return False
+
+        quiescence_s = float(getattr(self.settings, "stream_quiescence_seconds", 0.0) or 0.0)
+        if quiescence_s <= 0:
+            return True
+        last_ns = getattr(self, "last_message_time_ns", None)
+        if not last_ns:
+            return True  # startup — no messages yet, allow
+        return (time.time_ns() - int(last_ns)) <= int(quiescence_s * 1e9)
+
+    def _tracklet_is_fresh_enough(
+        self,
+        tracklet: Tracklet | None,
+        *,
+        max_lag_s: float,
+        log_event: str,
+    ) -> bool:
+        if max_lag_s <= 0 or tracklet is None:
+            return True
+        entries = list(getattr(tracklet, "entries", []) or [])
+        if not entries:
+            return True
+        latest_entry_ns = max(int(getattr(entry, "timestamp_ns", 0) or 0) for entry in entries)
+        if latest_entry_ns <= 0:
+            return True
+        lag_ns = time.time_ns() - latest_entry_ns
+        if lag_ns <= int(max_lag_s * 1e9):
+            return True
+        log.info(
+            log_event,
+            track_id=getattr(tracklet, "track_id", None),
+            lag_seconds=round(lag_ns / 1e9, 3),
+            max_lag_seconds=max_lag_s,
+            frame_start=getattr(entries[0], "frame_idx", None),
+            frame_end=getattr(entries[-1], "frame_idx", None),
+        )
+        return False
+
+    def _known_identity_count(self) -> int:
+        known_person_ids: set[int] = set(self.track_id_to_person_id.values())
+        known_person_ids.update(self.person_last_observation.keys())
+        known_person_ids.update(self.attribute_voter.known_person_ids())
+        return len(known_person_ids)
+
+    def _identity_cap_reached(self) -> bool:
+        max_person_identities = int(getattr(self.settings, "max_person_identities", 0) or 0)
+        return max_person_identities > 0 and self._known_identity_count() >= max_person_identities
+
+    async def _persist_untracked_detection_candidates(
+        self,
+        *,
+        detections: list[dict],
+        track_results,
+        frame,
+        frame_number: int,
+        timestamp_ns: int,
+    ) -> None:
+        """Persist YOLO detections that ByteTrack did not keep as evidence only.
+
+        These crops are not promoted to identities. They exist to expose recall
+        failures under occlusion/small-person cases where the detector fires but
+        the tracker cannot maintain a tracklet long enough for ReID confirmation.
+        """
+        if not getattr(self.settings, "untracked_detection_candidates_enabled", True):
+            return
+        if not detections:
+            return
+
+        frame_h, frame_w = frame.shape[:2]
+        tracked_boxes = [np.asarray(track[:4], dtype=np.float32) for track in track_results]
+        min_conf = float(getattr(self.settings, "untracked_detection_min_confidence", 0.25))
+        min_visibility = float(getattr(self.settings, "untracked_detection_min_visibility", 0.35))
+        max_track_iou = float(getattr(self.settings, "untracked_detection_max_track_iou", 0.20))
+        cluster_enabled = bool(getattr(self.settings, "untracked_detection_cluster_enabled", True))
+        raw_enabled = bool(getattr(self.settings, "untracked_detection_raw_candidates_enabled", False))
+
+        for det_idx, det in enumerate(detections):
+            bbox = np.asarray(det["bbox"], dtype=np.float32)
+            confidence = float(det.get("confidence", 0.0) or 0.0)
+            visibility = float(det.get("visibility_score", 0.0) or 0.0)
+            if confidence < min_conf or visibility < min_visibility:
+                continue
+            best_iou = max((compute_iou_prev(bbox, box) for box in tracked_boxes), default=0.0)
+            if best_iou > max_track_iou:
+                continue
+
+            x1, y1, x2, y2 = map(int, bbox)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(frame_w, x2), min(frame_h, y2)
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            attribute_crop = _build_attribute_crop(
+                frame,
+                bbox,
+                top_padding_ratio=self.settings.attribute_crop_top_padding_ratio,
+                side_padding_ratio=self.settings.attribute_crop_side_padding_ratio,
+                bottom_padding_ratio=self.settings.attribute_crop_bottom_padding_ratio,
+            )
+            if attribute_crop.size == 0:
+                attribute_crop = crop
+
+            synthetic_track_id = -int(frame_number * 1000 + det_idx + 1)
+            tracklet = type(
+                "UntrackedDetectionTracklet",
+                (),
+                {
+                    "track_id": synthetic_track_id,
+                    "entries": [
+                        TrackletEntry(
+                            frame_idx=frame_number,
+                            crop=crop,
+                            v_score=visibility,
+                            bbox_xyxy=bbox.tolist(),
+                            timestamp_ns=timestamp_ns,
+                            attribute_crop=attribute_crop,
+                            overlap_ratio=float(det.get("overlap_ratio", 0.0) or 0.0),
+                            frame_w=int(frame_w),
+                            frame_h=int(frame_h),
+                        )
+                    ],
+                },
+            )()
+            if cluster_enabled:
+                await self._update_untracked_detection_cluster(
+                    tracklet.entries[0],
+                    detection_confidence=confidence,
+                    nearest_track_iou=best_iou,
+                )
+            if raw_enabled:
+                await self._persist_occlusion_candidate(
+                    tracklet,
+                    reason="untracked_detection",
+                    matching={
+                        "method": "unconfirmed",
+                        "source": "untracked_detection",
+                        "similarity_score": None,
+                        "nearest_track_iou": round(best_iou, 4),
+                        "detection_confidence": round(confidence, 4),
+                    },
+                    min_entries=1,
+                )
+
+        if cluster_enabled:
+            self._flush_stale_untracked_detection_clusters(frame_number)
+
+    def _find_untracked_detection_cluster(self, entry: TrackletEntry) -> dict | None:
+        if not hasattr(self, "untracked_detection_clusters"):
+            self.untracked_detection_clusters = []
+        max_gap = int(getattr(self.settings, "untracked_detection_cluster_max_gap_frames", 18))
+        max_distance = float(getattr(self.settings, "untracked_detection_cluster_max_center_distance_ratio", 1.25))
+        curr_center = _bbox_center(entry.bbox_xyxy)
+        curr_height = max(float(entry.bbox_xyxy[3] - entry.bbox_xyxy[1]), 1.0)
+        best_cluster = None
+        best_score = float("inf")
+
+        for cluster in self.untracked_detection_clusters:
+            last_frame = int(cluster["last_frame"])
+            frame_gap = int(entry.frame_idx) - last_frame
+            if frame_gap <= 0 or frame_gap > max_gap:
+                continue
+            last_bbox = cluster["last_bbox"]
+            last_center = _bbox_center(last_bbox)
+            last_height = max(float(last_bbox[3] - last_bbox[1]), 1.0)
+            norm = max(curr_height, last_height, 1.0)
+            center_distance = float(np.linalg.norm(curr_center - last_center)) / norm
+            if center_distance > max_distance:
+                continue
+            score = center_distance + (frame_gap / max(max_gap, 1))
+            if score < best_score:
+                best_cluster = cluster
+                best_score = score
+        return best_cluster
+
+    async def _update_untracked_detection_cluster(
+        self,
+        entry: TrackletEntry,
+        *,
+        detection_confidence: float,
+        nearest_track_iou: float,
+    ) -> None:
+        cluster = self._find_untracked_detection_cluster(entry)
+        if cluster is None:
+            self.untracked_detection_cluster_seq = int(getattr(self, "untracked_detection_cluster_seq", 0)) + 1
+            cluster = {
+                "cluster_id": -9_000_000 - self.untracked_detection_cluster_seq,
+                "entries": [],
+                "confidences": [],
+                "nearest_track_ious": [],
+                "last_bbox": entry.bbox_xyxy,
+                "last_frame": int(entry.frame_idx),
+            }
+            self.untracked_detection_clusters.append(cluster)
+
+        cluster["entries"].append(entry)
+        cluster["confidences"].append(float(detection_confidence))
+        cluster["nearest_track_ious"].append(float(nearest_track_iou))
+        cluster["last_bbox"] = entry.bbox_xyxy
+        cluster["last_frame"] = int(entry.frame_idx)
+
+        # MEMORY CAP: each TrackletEntry holds a full-resolution crop ndarray
+        # (~60 KB for a typical bbox). Without this cap one persistent cluster
+        # accumulated 100+ entries (≥6 MB just for crops), and several such
+        # clusters together OOM-killed the worker container. After promotion,
+        # the buffer copy is authoritative; the cluster only needs a sliding
+        # window of recent entries to keep growing if the person sticks around.
+        cluster_max_entries = int(getattr(self.settings, "untracked_detection_cluster_max_entries", 30))
+        if len(cluster["entries"]) > cluster_max_entries:
+            cluster["entries"] = cluster["entries"][-cluster_max_entries:]
+            cluster["confidences"] = cluster["confidences"][-cluster_max_entries:]
+            cluster["nearest_track_ious"] = cluster["nearest_track_ious"][-cluster_max_entries:]
+
+        # Once a cluster is promoted into the normal tracklet buffer, that
+        # buffer becomes the source of truth. Continuing to upsert diagnostic
+        # occlusion candidates for the same promoted cluster floods the UI and
+        # makes a successfully recovered occluded person look unresolved.
+        if self._maybe_promote_untracked_cluster(cluster, entry):
+            return
+
+        min_entries = int(getattr(self.settings, "untracked_detection_cluster_min_entries", 2))
+        if len(cluster["entries"]) < min_entries:
+            return
+
+        # Persistence is for diagnostic/UI purposes only — the in-memory cluster
+        # is authoritative for promotion decisions. Throttle Mongo writes to
+        # threshold crossings (min_entries, then logarithmic steps) rather than
+        # every entry, which was 16+ writes for one 17-entry cluster.
+        entry_count = len(cluster["entries"])
+        persistence_steps = {2, 3, 5, 8, 12, 16, 22, 30, 40, 55, 75, 100}
+        should_persist = (
+            entry_count == min_entries
+            or entry_count in persistence_steps
+        )
+
+        if should_persist:
+            tracklet = type(
+                "UntrackedDetectionClusterTracklet",
+                (),
+                {
+                    "track_id": int(cluster["cluster_id"]),
+                    "entries": list(cluster["entries"]),
+                },
+            )()
+            start_frame = int(cluster["entries"][0].frame_idx)
+            candidate_id = (
+                f"{self._current_device_id}:untracked_cluster:"
+                f"{abs(int(cluster['cluster_id']))}:{start_frame}"
+            )
+            await self._persist_occlusion_candidate(
+                tracklet,
+                reason="untracked_detection_cluster",
+                matching={
+                    "method": "unconfirmed",
+                    "source": "untracked_detection_cluster",
+                    "similarity_score": None,
+                    "cluster_entry_count": entry_count,
+                    "detection_confidence_avg": round(float(np.mean(cluster["confidences"])), 4),
+                    "detection_confidence_max": round(float(np.max(cluster["confidences"])), 4),
+                    "nearest_track_iou_min": round(float(np.min(cluster["nearest_track_ious"])), 4),
+                    "nearest_track_iou_max": round(float(np.max(cluster["nearest_track_ious"])), 4),
+                },
+                min_entries=min_entries,
+                candidate_id_override=candidate_id,
+            )
+
+    def _maybe_promote_untracked_cluster(self, cluster: dict, latest_entry: TrackletEntry) -> bool:
+        # Open a path for an untracked detection cluster (a person YOLO sees
+        # but ByteTrack can't track — small/distant or boundary-crossing) to
+        # reach the normal embedding+matcher pipeline. The synthetic negative
+        # track_id flows through tracklet_buffer → _process_tracklet, where
+        # every existing safeguard (consensus filter, near_gallery_defer,
+        # promote_consistency, fragment_recovery) still applies.
+        if not bool(getattr(self.settings, "untracked_cluster_promote_enabled", False)):
+            return False
+
+        entries = cluster["entries"]
+        if cluster.get("promoted_to_buffer", False):
+            synthetic_track_id = int(cluster["cluster_id"])
+            self.tracklet_buffer.append(synthetic_track_id, latest_entry)
+            cluster["entries"] = []
+            cluster["confidences"] = []
+            cluster["nearest_track_ious"] = []
+            return True
+
+        max_v = max(e.v_score for e in entries)
+        n_entries = len(entries)
+
+        # Two-tier promotion: long-evidence tier OR high-confidence brief tier.
+        # Match-consistency gate downstream rejects mixed-identity clusters so
+        # the brief tier cannot mint duplicates.
+        min_entries_slow = int(getattr(self.settings, "untracked_cluster_promote_min_entries", 6))
+        min_visibility_slow = float(getattr(self.settings, "untracked_cluster_promote_min_visibility", 0.65))
+        min_entries_fast = int(getattr(self.settings, "untracked_cluster_promote_min_entries_fast", 4))
+        min_visibility_fast = float(getattr(self.settings, "untracked_cluster_promote_min_visibility_fast", 0.85))
+
+        slow_tier_met = n_entries >= min_entries_slow and max_v >= min_visibility_slow
+        fast_tier_met = n_entries >= min_entries_fast and max_v >= min_visibility_fast
+
+        if not (slow_tier_met or fast_tier_met):
+            return False
+
+        # For logging only — which tier triggered.
+        tier = "slow" if slow_tier_met else "fast"
+        min_entries_required = min_entries_slow if slow_tier_met else min_entries_fast
+        min_visibility_required = min_visibility_slow if slow_tier_met else min_visibility_fast
+
+        synthetic_track_id = int(cluster["cluster_id"])
+
+        # First promotion: push all existing entries so the synthetic tracklet
+        # starts at full evidence rather than rebuilding one frame at a time.
+        for cluster_entry in entries:
+            self.tracklet_buffer.append(synthetic_track_id, cluster_entry)
+        cluster["promoted_to_buffer"] = True
+        # The buffer now owns the synthetic tracklet — release the cluster's
+        # own crop references so memory doesn't double up while the cluster
+        # continues to grow with new untracked detections.
+        cluster["entries"] = []
+        cluster["confidences"] = []
+        cluster["nearest_track_ious"] = []
+
+        log.info(
+            "untracked_cluster_promoted",
+            cluster_id=cluster["cluster_id"],
+            entries=n_entries,
+            max_visibility=round(max_v, 4),
+            tier=tier,
+            min_entries_required=min_entries_required,
+            min_visibility_required=min_visibility_required,
+        )
+        return True
+
+    async def _admission_gate_or_split(
+        self,
+        track_id: int,
+        crop: np.ndarray,
+        v_worker: float,
+        frame_idx: int | None = None,
+    ) -> int:
+        """Block contaminated frames from poisoning a tracklet buffer.
+
+        When ByteTrack swaps identities during occlusion, the original track_id
+        starts receiving crops of a different person. By the time the tracklet
+        is finalized and embedded, the buffer holds a mixture. This gate runs
+        BEFORE append: if the new high-quality frame's embedding disagrees with
+        the running mean of the buffer's accepted embeddings, the frame is
+        routed to a fresh virtual track_id so the original tracklet stays clean
+        and the new appearance gets its own chance at matching.
+
+        Returns the track_id under which the new frame should be appended —
+        either the original (frame is on-distribution) or a deterministic
+        virtual id of the form ``-(abs(track_id) * 1_000_000 + n)``.
+        """
+        if not getattr(self.settings, "tracklet_appearance_gate_enabled", True):
+            return track_id
+        min_v = float(getattr(self.settings, "tracklet_appearance_gate_min_v", 0.6))
+        if v_worker < min_v:
+            return track_id
+        cached = self._tracklet_embedding_cache.get(track_id, [])
+        if len(cached) < 2:
+            # Need at least two prior frames to form a reliable mean. First few
+            # frames go in unconditionally, but we still compute + cache their
+            # embeddings if v_worker is high so the gate is armed quickly.
+            emb = await self._extract_crop_embedding(crop)
+            if emb is not None:
+                self._tracklet_embedding_cache.setdefault(track_id, []).append(emb)
+            return track_id
+
+        check_interval = max(
+            1,
+            int(getattr(self.settings, "tracklet_appearance_gate_check_interval_frames", 1) or 1),
+        )
+        if frame_idx is not None:
+            if not hasattr(self, "_tracklet_gate_last_check_frame"):
+                self._tracklet_gate_last_check_frame = {}
+            last_checked = self._tracklet_gate_last_check_frame.get(track_id)
+            if last_checked is not None and int(frame_idx) - last_checked < check_interval:
+                return track_id
+            self._tracklet_gate_last_check_frame[track_id] = int(frame_idx)
+
+        new_emb = await self._extract_crop_embedding(crop)
+        if new_emb is None:
+            return track_id
+
+        ref = np.mean(np.stack(cached, axis=0), axis=0)
+        ref_norm = np.linalg.norm(ref)
+        new_norm = np.linalg.norm(new_emb)
+        if ref_norm < 1e-8 or new_norm < 1e-8:
+            return track_id
+        sim = float(np.dot(ref / ref_norm, new_emb / new_norm))
+        split_threshold = float(getattr(self.settings, "tracklet_split_threshold", 0.55))
+        if sim >= split_threshold:
+            self._tracklet_embedding_cache[track_id].append(new_emb)
+            # Bound cache size to avoid unbounded growth on long tracks.
+            if len(self._tracklet_embedding_cache[track_id]) > 16:
+                self._tracklet_embedding_cache[track_id] = (
+                    self._tracklet_embedding_cache[track_id][-16:]
+                )
+            return track_id
+
+        # Diverged — route to a virtual track_id so this person gets its own
+        # tracklet instead of being merged into the original's buffer.
+        n = self._track_id_split_counts.get(track_id, 0) + 1
+        self._track_id_split_counts[track_id] = n
+        virtual_id = -(abs(int(track_id)) * 1_000_000 + n)
+        self._tracklet_embedding_cache[virtual_id] = [new_emb]
+        log.info(
+            "tracklet_appearance_split",
+            original_track_id=int(track_id),
+            virtual_track_id=int(virtual_id),
+            similarity=round(sim, 4),
+            split_threshold=split_threshold,
+        )
+        return virtual_id
+
+    async def _extract_crop_embedding(self, crop: np.ndarray) -> np.ndarray | None:
+        """Encode crop to JPEG and call /embedding. Returns None on failure."""
+        try:
+            ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if not ok:
+                return None
+            _, result = await self.model_client.extract_features(
+                buf.tobytes(),
+                model=self.settings.embedding_model,
+            )
+            emb = result.get("embedding") if isinstance(result, dict) else None
+            if emb is None:
+                return None
+            return np.asarray(emb, dtype=np.float32)
+        except Exception as exc:
+            log.debug("admission_embedding_failed", error=str(exc))
+            return None
+
+    def _flush_stale_untracked_detection_clusters(self, frame_number: int) -> None:
+        if not hasattr(self, "untracked_detection_clusters"):
+            self.untracked_detection_clusters = []
+        flush_after = int(getattr(self.settings, "untracked_detection_cluster_flush_after_frames", 36))
+        self.untracked_detection_clusters = [
+            cluster
+            for cluster in self.untracked_detection_clusters
+            if int(frame_number) - int(cluster["last_frame"]) <= flush_after
+        ]
+
     def run(self) -> None:
         log.info("worker_started", service=self.settings.service_name)
         try:
@@ -228,20 +1664,73 @@ class WorkerPipeline:
 
     async def _run_loop(self) -> None:
         await self.mongo.ensure_indexes()
-        async with self.model_client:
-            while True:
-                messages = self.consumer.poll(timeout_ms=1000)
-                if not messages:
-                    continue
-                for msg in messages:
-                    await self._process_message(msg)
-                await asyncio.sleep(self.settings.poll_interval_s)
+        reconciler_task = None
+        interval = float(getattr(self.settings, "background_reconciler_interval_s", 0.0))
+        if interval > 0:
+            reconciler_task = asyncio.create_task(self._background_reconciler_loop(interval))
+        try:
+            async with self.model_client:
+                while True:
+                    messages = await asyncio.to_thread(self.consumer.poll, timeout_ms=1000)
+                    if not messages:
+                        await self._flush_idle_tracklets_if_needed(time.time_ns())
+                        continue
+                    self.last_message_time_ns = time.time_ns()
+                    for msg in messages:
+                        await self._process_message(msg)
+                        # Refresh per-message so the quiescence gate doesn't
+                        # mistake long batch processing time for stream end.
+                        # A batch that takes 30s to process must not look
+                        # idle from the matcher's perspective at second 21.
+                        self.last_message_time_ns = time.time_ns()
+                    await asyncio.sleep(self.settings.poll_interval_s)
+        finally:
+            if reconciler_task is not None:
+                reconciler_task.cancel()
+                try:
+                    await reconciler_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            # Drain fire-and-forget background work so the worker shutdown is
+            # deterministic. Without this, occlusion-candidate persists / late
+            # short-fragment tasks complete after the consumer closes.
+            if self._inflight:
+                await self._drain_inflight_tasks(timeout_s=10.0)
+
+    async def _background_reconciler_loop(self, interval_s: float) -> None:
+        """Periodically re-check recently-touched persons for duplicates.
+
+        The inline merge in _maybe_merge_duplicate_person fires once per
+        tracklet finalization, which is too rare to catch fragmentation that
+        only becomes evident after both sides have accumulated evidence. This
+        loop revisits persons asynchronously, leaning on the same
+        _maybe_merge_duplicate_person path so all guards (cooccurrence,
+        attribute, gender) apply identically.
+        """
+        max_persons = int(getattr(self.settings, "background_reconciler_max_persons", 50))
+        while True:
+            try:
+                await asyncio.sleep(interval_s)
+                await self._reconcile_recent_persons(
+                    max_persons=max_persons,
+                    passes=1,
+                    reason="background",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("background_reconciler_iter_failed", error=str(exc))
 
     async def _process_message(self, msg: dict) -> None:
         self.processed_messages += 1
         device_id = msg["device_id"]
         self._current_device_id = device_id
         frame_number = msg["frame_number"]
+        if self._is_end_of_stream_message(msg):
+            self.last_message_time_ns = time.time_ns()
+            await self._finalize_stream(device_id=device_id)
+            return
+
         detections = msg["detections"]
         image_data = msg["image_data"]
         timestamp_ns = msg["created_at"]
@@ -266,12 +1755,21 @@ class WorkerPipeline:
             frame,
         )
         current_time_ns = time.time_ns()
+        await self._persist_untracked_detection_candidates(
+            detections=detections,
+            track_results=track_results,
+            frame=frame,
+            frame_number=frame_number,
+            timestamp_ns=timestamp_ns,
+        )
         if len(track_results) == 0:
             self._cleanup_inactive_tracks(current_time_ns)
             return
 
         visible_track_ids = {int(track[4]) for track in track_results}
+        self._update_temporal_exclusions(track_results)
 
+        ignored_track_ids: set[int] = set()
         for track in track_results:
             bbox_xyxy = track[:4]
             track_id = int(track[4])
@@ -307,7 +1805,24 @@ class WorkerPipeline:
                 compute_vel_smooth(center_curr, center_prev, bbox_prev2_center, bbox_size),
             )
             self.prev_bboxes.setdefault(track_id, []).append(bbox_xyxy.copy())
-            self.prev_bboxes[track_id] = self.prev_bboxes[track_id][-3:]
+            keep_frames = max(3, int(self.settings.pretrack_static_filter_min_frames))
+            self.prev_bboxes[track_id] = self.prev_bboxes[track_id][-keep_frames:]
+            self.current_track_metrics[track_id] = {
+                "live_visibility_score": float(round(v_worker, 4)),
+                "overlap_ratio": float(round(overlap_ratio, 4)),
+            }
+            if (
+                track_id not in self.track_id_to_person_id
+                and self._should_ignore_pretrack_static_artifact(
+                    track_id,
+                    bbox_xyxy.tolist(),
+                    frame_w=frame_w,
+                    frame_h=frame_h,
+                )
+            ):
+                ignored_track_ids.add(track_id)
+                self.tracklet_buffer.remove(track_id)
+                continue
 
             x1, y1, x2, y2 = map(int, bbox_xyxy)
             x1, y1 = max(0, x1), max(0, y1)
@@ -315,22 +1830,68 @@ class WorkerPipeline:
             crop = frame[y1:y2, x1:x2]
             if crop.size == 0:
                 continue
+            attribute_crop = _build_attribute_crop(
+                frame,
+                bbox_xyxy,
+                top_padding_ratio=self.settings.attribute_crop_top_padding_ratio,
+                side_padding_ratio=self.settings.attribute_crop_side_padding_ratio,
+                bottom_padding_ratio=self.settings.attribute_crop_bottom_padding_ratio,
+            )
+            if attribute_crop.size == 0:
+                attribute_crop = crop
 
+            target_track_id = await self._admission_gate_or_split(
+                track_id=track_id,
+                crop=crop,
+                v_worker=float(v_worker),
+                frame_idx=int(frame_number),
+            )
             self.tracklet_buffer.append(
-                track_id,
+                target_track_id,
                 TrackletEntry(
                     frame_idx=frame_number,
                     crop=crop,
                     v_score=v_worker,
                     bbox_xyxy=bbox_xyxy.tolist(),
                     timestamp_ns=timestamp_ns,
+                    attribute_crop=attribute_crop,
                     overlap_ratio=overlap_ratio,
+                    frame_w=int(frame_w),
+                    frame_h=int(frame_h),
                 ),
             )
 
-        ready_tracklets = self.tracklet_buffer.get_ready_tracklets(current_time_ns)
+        pop_ready_tracklets = getattr(self.tracklet_buffer, "pop_ready_tracklets", None)
+        processing_tracklet_ids = set(getattr(self, "processing_tracklet_ids", set()))
+        ready_tracklets = (
+            pop_ready_tracklets(current_time_ns, skip_track_ids=processing_tracklet_ids)
+            if callable(pop_ready_tracklets)
+            else self.tracklet_buffer.get_ready_tracklets(current_time_ns)
+        )
         self.ready_tracklets += len(ready_tracklets)
-        self.tracklet_buffer.evict_stale(current_time_ns)
+        pop_stale_tracklets = getattr(self.tracklet_buffer, "pop_stale_tracklets", None)
+        stale_tracklets = (
+            pop_stale_tracklets(current_time_ns, skip_track_ids=processing_tracklet_ids)
+            if callable(pop_stale_tracklets)
+            else []
+        )
+        for stale_tracklet in stale_tracklets:
+            if stale_tracklet.person_id is not None:
+                continue
+            if stale_tracklet.state == TrackletState.MATCHED:
+                continue
+            if (
+                getattr(self.settings, "recover_stale_tracklets_enabled", True)
+                and len(stale_tracklet.entries) >= int(getattr(self.settings, "tracklet_min_entries", 4))
+            ):
+                self._schedule_tracklet_processing(stale_tracklet, reserved_person_ids=set())
+                continue
+            self._track_inflight(asyncio.ensure_future(
+                self._process_short_fragment_tracklet(
+                    stale_tracklet,
+                    reason="short_stale_tracklet",
+                )
+            ))
         self._cleanup_inactive_tracks(current_time_ns)
 
         frame_reserved_person_ids = {
@@ -347,6 +1908,8 @@ class WorkerPipeline:
         emitted_person_ids: set[int] = set()
         for track in track_results:
             track_id = int(track[4])
+            if track_id in ignored_track_ids:
+                continue
             person_id = self.track_id_to_person_id.get(track_id)
             is_tentative = person_id is None
             display_id = track_id if is_tentative else person_id
@@ -376,9 +1939,14 @@ class WorkerPipeline:
                     "confidence": float(track[5]),
                     "tracklet_id": None,
                     "tracklet_state": "tentative",
+                    "snapshot_key": None,
                     "visibility_score": 0.0,
+                    "live_visibility_score": float(self.current_track_metrics.get(track_id, {}).get("live_visibility_score", 0.0)),
+                    "overlap_ratio": float(self.current_track_metrics.get(track_id, {}).get("overlap_ratio", 0.0)),
                     "quality": None,
+                    "matching": None,
                     "attributes": None,
+                    "status": "tentative",
                 }
                 for task in _ATTRIBUTE_TASKS:
                     payload[task] = "unknown"
@@ -388,6 +1956,7 @@ class WorkerPipeline:
                     "bbox_xyxy": [float(v) for v in track[:4].tolist()],
                     "timestamp_ns": current_time_ns,
                     "device_id": device_id,
+                    "frame_idx": int(frame_number),
                 }
                 person_attrs = self.attribute_voter.person_snapshot(person_id)
                 meta = self.track_metadata.get(track_id, {})
@@ -397,9 +1966,18 @@ class WorkerPipeline:
                     "confidence": float(track[5]),
                     "tracklet_id": meta.get("tracklet_id"),
                     "tracklet_state": meta.get("tracklet_state"),
+                    "snapshot_key": meta.get("snapshot_key"),
                     "visibility_score": float(meta.get("visibility_score", 0.0)),
+                    "live_visibility_score": float(self.current_track_metrics.get(track_id, {}).get("live_visibility_score", 0.0)),
+                    "overlap_ratio": float(self.current_track_metrics.get(track_id, {}).get("overlap_ratio", 0.0)),
                     "quality": meta.get("quality"),
+                    "matching": meta.get("matching"),
                     "attributes": meta.get("attributes"),
+                    "status": _summarize_live_status(
+                        float(self.current_track_metrics.get(track_id, {}).get("live_visibility_score", 0.0)),
+                        float(self.current_track_metrics.get(track_id, {}).get("overlap_ratio", 0.0)),
+                        meta.get("quality"),
+                    ),
                 }
                 for task in _ATTRIBUTE_TASKS:
                     label, conf = person_attrs.get(task, ("unknown", 0.0))
@@ -424,12 +2002,247 @@ class WorkerPipeline:
             # subsequent tasks see it as blocked (asyncio is single-threaded, so
             # match_tracklet runs atomically between await points — no lock needed).
             for tracklet in ready_tracklets:
-                asyncio.ensure_future(
-                    self._process_tracklet(
-                        tracklet,
-                        reserved_person_ids=frame_reserved_person_ids,
-                    )
+                self._schedule_tracklet_processing(
+                    tracklet,
+                    reserved_person_ids=frame_reserved_person_ids,
                 )
+
+    @staticmethod
+    def _is_end_of_stream_message(msg: dict) -> bool:
+        return (
+            int(msg.get("frame_number", 0) or 0) < 0
+            and not msg.get("detections")
+            and not msg.get("image_data")
+        )
+
+    async def _finalize_stream(self, *, device_id: str) -> None:
+        """Flush buffered evidence immediately after a finite video reaches EOF.
+
+        The normal realtime path uses idle timers because a live camera has no
+        explicit end. File/demo inputs do have an end, so the edge service sends
+        a sentinel message. At that point every queued frame for the video has
+        already been consumed, and the right behavior is to finalize once,
+        drain persistence/snapshot tasks, then leave no buffered tracklets that
+        can keep growing UI counters after playback has stopped.
+        """
+        if getattr(self, "_stream_finalizing", False):
+            return
+
+        self._stream_finalizing = True
+        log.info(
+            "stream_finalization_started",
+            device_id=device_id,
+            buffered_tracklets=len(getattr(self.tracklet_buffer, "tracklets", {})),
+            inflight=len(getattr(self, "_inflight", set())),
+        )
+        try:
+            finalization_timeout_s = float(
+                getattr(self.settings, "stream_finalization_timeout_seconds", 60.0)
+            )
+            max_finalize_passes = max(
+                3,
+                int(getattr(self.settings, "tentative_max_attempts", 5)) + 1,
+            )
+            for _ in range(max_finalize_passes):
+                tracklets = list(getattr(self.tracklet_buffer, "tracklets", {}).values())
+                if not tracklets:
+                    if getattr(self, "_inflight", set()):
+                        drained = await self._drain_inflight_tasks(timeout_s=finalization_timeout_s)
+                        if not drained:
+                            break
+                        continue
+                    break
+
+                processing_tracklet_ids = set(getattr(self, "processing_tracklet_ids", set()))
+                processable_tracklets = [
+                    tracklet
+                    for tracklet in tracklets
+                    if tracklet.track_id not in processing_tracklet_ids
+                ]
+                for tracklet in processable_tracklets:
+                    self.tracklet_buffer.remove(tracklet.track_id)
+                    if tracklet.person_id is not None or tracklet.state == TrackletState.MATCHED:
+                        continue
+                    if len(tracklet.entries) >= int(getattr(self.settings, "tracklet_min_entries", 4)):
+                        self._schedule_tracklet_processing(
+                            tracklet,
+                            reserved_person_ids=set(),
+                            allow_tentative_fallback=True,
+                        )
+                    else:
+                        self._track_inflight(asyncio.ensure_future(
+                            self._process_short_fragment_tracklet(
+                                tracklet,
+                                reason="end_of_stream_short_tracklet",
+                            )
+                        ))
+
+                if not getattr(self, "_inflight", set()):
+                    break
+                drained = await self._drain_inflight_tasks(timeout_s=finalization_timeout_s)
+                if not drained:
+                    break
+
+            if getattr(self, "_inflight", set()):
+                await self._drain_inflight_tasks(timeout_s=finalization_timeout_s)
+
+            if getattr(self.tracklet_buffer, "tracklets", {}):
+                log.warning(
+                    "stream_finalization_dropped_unflushed_tracklets",
+                    remaining=len(self.tracklet_buffer.tracklets),
+                    processing=len(getattr(self, "processing_tracklet_ids", set())),
+                )
+            await self._reconcile_recent_persons(
+                max_persons=int(getattr(self.settings, "background_reconciler_max_persons", 50)),
+                passes=int(getattr(self.settings, "final_reconciler_passes", 3)),
+                reason="end_of_stream",
+            )
+            self.tracklet_buffer.tracklets.clear()
+            getattr(self, "untracked_detection_clusters", []).clear()
+            getattr(self, "fragment_recovery_clusters", []).clear()
+            self._reset_stream_state()
+            log.info("stream_finalization_completed", device_id=device_id)
+        finally:
+            self._stream_finalizing = False
+
+    async def _reconcile_recent_persons(self, *, max_persons: int, passes: int, reason: str) -> None:
+        if not getattr(self.settings, "duplicate_merge_enabled", False):
+            return
+        try:
+            person_ids = await self.mongo.list_recent_person_ids(limit=max_persons)
+        except Exception:
+            person_ids = list(self.person_last_observation.keys())[-max_persons:]
+        for pass_idx in range(max(1, int(passes))):
+            if not person_ids:
+                return
+            merged_count = 0
+            for pid in list(person_ids):
+                try:
+                    merged_pid = await self._maybe_merge_duplicate_person(int(pid))
+                    if int(merged_pid) != int(pid):
+                        merged_count += 1
+                except Exception as exc:
+                    log.warning(
+                        "reconciler_person_failed",
+                        person_id=pid,
+                        reason=reason,
+                        error=str(exc),
+                    )
+            try:
+                merged_count += await self._reconcile_spatial_split_persons(person_ids)
+            except Exception as exc:
+                log.warning(
+                    "reconciler_spatial_split_failed",
+                    reason=reason,
+                    error=str(exc),
+                )
+            log.info(
+                "reconciler_pass_completed",
+                reason=reason,
+                pass_idx=pass_idx,
+                candidates=len(person_ids),
+                merged_count=merged_count,
+            )
+            if merged_count <= 0:
+                return
+            try:
+                person_ids = await self.mongo.list_recent_person_ids(limit=max_persons)
+            except Exception:
+                person_ids = list(self.person_last_observation.keys())[-max_persons:]
+
+    async def _reconcile_spatial_split_persons(self, person_ids: list[int]) -> int:
+        """Repair tracker/detector splits that embedding search does not rank first.
+
+        Occluded crops can be bad enough that the correct duplicate is not the
+        nearest Qdrant neighbor. For those cases, use the PDF's temporal and bbox
+        continuity cues to propose narrow pairwise merge attempts, then run the
+        normal merge guards through _try_merge_candidate.
+        """
+        unique_ids = sorted({int(pid) for pid in person_ids})
+        if len(unique_ids) < 2:
+            return 0
+
+        counts = await asyncio.gather(
+            *(self.mongo.count_tracklets(pid) for pid in unique_ids)
+        )
+        count_by_pid = dict(zip(unique_ids, counts))
+        merged_count = 0
+        removed: set[int] = set()
+        for idx, person_a in enumerate(unique_ids):
+            if person_a in removed:
+                continue
+            for person_b in unique_ids[idx + 1:]:
+                if person_b in removed:
+                    continue
+                current_count, candidate_count = await asyncio.gather(
+                    self.mongo.count_tracklets(person_a),
+                    self.mongo.count_tracklets(person_b),
+                )
+                score = await asyncio.to_thread(
+                    self.qdrant_store.person_pair_similarity,
+                    person_a,
+                    person_b,
+                )
+                if not await self._persons_have_soft_split_transition(
+                    person_a,
+                    person_b,
+                    score=score,
+                    current_count=int(current_count),
+                    candidate_count=int(candidate_count),
+                ):
+                    continue
+                result = await self._try_merge_candidate(
+                    person_a,
+                    (person_b, float(score), None),
+                )
+                if result.merged:
+                    merged_count += 1
+                    source_candidates = {person_a, person_b} - {int(result.person_id)}
+                    removed.update(source_candidates)
+                    break
+        return merged_count
+
+    def _reset_stream_state(self) -> None:
+        """Clear short-lived tracking state while keeping persisted identity stores."""
+        tracker_args = SimpleNamespace(
+            track_high_thresh=self.settings.track_high_thresh,
+            track_low_thresh=self.settings.track_low_thresh,
+            match_thresh=self.settings.match_thresh,
+            new_track_thresh=self.settings.new_track_thresh,
+            track_buffer=self.settings.track_buffer,
+            fuse_score=self.settings.fuse_score,
+        )
+        self.tracker = BYTETracker(tracker_args, frame_rate=30)
+        self.prev_bboxes.clear()
+        self.track_id_to_person_id.clear()
+        self.track_metadata.clear()
+        self.track_last_seen_ns.clear()
+        self.person_last_observation.clear()
+        self.current_track_metrics.clear()
+        self.track_forbidden_person_ids.clear()
+        self.track_cooccurrence_counts.clear()
+        self.occlusion_candidate_track_ids.clear()
+        self.processing_tracklet_ids.clear()
+        self._tracklet_embedding_cache.clear()
+        self._track_id_split_counts.clear()
+        self._tracklet_gate_last_check_frame.clear()
+
+    async def _drain_inflight_tasks(self, *, timeout_s: float) -> bool:
+        deadline = time.monotonic() + max(float(timeout_s), 0.1)
+        while getattr(self, "_inflight", set()):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log.warning("inflight_drain_timeout", pending=len(self._inflight))
+                return False
+            pending = list(self._inflight)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=min(remaining, 5.0),
+                )
+            except asyncio.TimeoutError:
+                continue
+        return True
 
     def _maybe_log_progress(self, frame_number: int) -> None:
         every_n = self.settings.log_every_n_messages
@@ -449,10 +2262,2498 @@ class WorkerPipeline:
             identified_tracks=len(self.track_id_to_person_id),
         )
 
+    def _schedule_tracklet_processing(
+        self,
+        tracklet,
+        *,
+        reserved_person_ids: set[int],
+        allow_tentative_fallback: bool = True,
+    ) -> bool:
+        if not hasattr(self, "processing_tracklet_ids"):
+            self.processing_tracklet_ids = set()
+        if tracklet.track_id in self.processing_tracklet_ids:
+            return False
+
+        self.processing_tracklet_ids.add(tracklet.track_id)
+        task = asyncio.ensure_future(
+            self._process_tracklet(
+                tracklet,
+                reserved_person_ids=reserved_person_ids,
+                allow_tentative_fallback=allow_tentative_fallback,
+            )
+        )
+        self._track_inflight(task)
+
+        def _release_processing(done_task: asyncio.Future) -> None:
+            self.processing_tracklet_ids.discard(tracklet.track_id)
+            if done_task.cancelled():
+                return
+            try:
+                done_task.result()
+            except Exception:
+                log.error(
+                    "tracklet_processing_task_failed",
+                    track_id=tracklet.track_id,
+                    exc_info=True,
+                )
+
+        task.add_done_callback(_release_processing)
+        return True
+
+    async def _flush_idle_tracklets_if_needed(self, current_time_ns: int) -> None:
+        if not getattr(self.settings, "tracklet_idle_flush_enabled", True):
+            return
+        if self.last_message_time_ns <= 0:
+            return
+        idle_ns = int(float(getattr(self.settings, "tracklet_idle_flush_seconds", 1.5)) * 1e9)
+        if current_time_ns - self.last_message_time_ns < idle_ns:
+            return
+        if self.last_idle_flush_ns and current_time_ns - self.last_idle_flush_ns < idle_ns:
+            return
+        self.last_idle_flush_ns = current_time_ns
+
+        tracklets = list(getattr(self.tracklet_buffer, "tracklets", {}).values())
+        if not tracklets:
+            return
+        log.info("idle_tracklet_flush_started", tracklet_count=len(tracklets))
+        for tracklet in tracklets:
+            if tracklet.person_id is not None or tracklet.state == TrackletState.MATCHED:
+                self.tracklet_buffer.remove(tracklet.track_id)
+                continue
+            if tracklet.track_id in getattr(self, "processing_tracklet_ids", set()):
+                continue
+            self.tracklet_buffer.remove(tracklet.track_id)
+            if len(tracklet.entries) >= int(getattr(self.settings, "tracklet_min_entries", 4)):
+                self._schedule_tracklet_processing(
+                    tracklet,
+                    reserved_person_ids=set(),
+                    allow_tentative_fallback=False,
+                )
+            else:
+                self._track_inflight(asyncio.ensure_future(
+                    self._process_short_fragment_tracklet(
+                        tracklet,
+                        reason="idle_flush_short_tracklet",
+                    )
+                ))
+
+    def _prune_fragment_recovery_clusters(self, frame_idx: int) -> None:
+        if not hasattr(self, "fragment_recovery_clusters"):
+            self.fragment_recovery_clusters = []
+        max_gap = int(getattr(self.settings, "fragment_recovery_max_gap_frames", 180))
+        self.fragment_recovery_clusters = [
+            cluster for cluster in self.fragment_recovery_clusters
+            if int(frame_idx) - int(cluster["frame_end"]) <= max_gap
+        ]
+
+    def _find_fragment_recovery_cluster(
+        self,
+        *,
+        embedding: np.ndarray,
+        bbox_xyxy: list[float],
+        frame_start: int,
+    ) -> dict | None:
+        min_sim = float(getattr(self.settings, "fragment_recovery_min_similarity", 0.62))
+        max_gap = int(getattr(self.settings, "fragment_recovery_max_gap_frames", 180))
+        max_dist = float(getattr(self.settings, "fragment_recovery_max_center_distance_ratio", 1.8))
+        best_cluster = None
+        best_score = -1.0
+        for cluster in getattr(self, "fragment_recovery_clusters", []):
+            if int(frame_start) < int(cluster["frame_end"]):
+                continue
+            if int(frame_start) - int(cluster["frame_end"]) > max_gap:
+                continue
+            sim = self._cosine_similarity(embedding, cluster["embedding"])
+            if sim < min_sim:
+                continue
+            center_ratio = self._center_distance_ratio(bbox_xyxy, cluster["last_bbox"])
+            if center_ratio > max_dist:
+                continue
+            score = sim - (0.05 * center_ratio)
+            if score > best_score:
+                best_cluster = cluster
+                best_score = score
+        return best_cluster
+
+    def _add_fragment_recovery_candidate(
+        self,
+        *,
+        tracklet,
+        embedding: np.ndarray,
+        v_avg: float,
+        emb_consistency: float,
+    ) -> tuple[int | None, dict | None]:
+        if not getattr(self.settings, "fragment_recovery_enabled", True):
+            return None, None
+        entries = list(tracklet.entries or [])
+        if not entries:
+            return None, None
+        if float(v_avg) < float(getattr(self.settings, "fragment_recovery_min_visibility", 0.72)):
+            return None, None
+        # Close the bypass that lets stationary objects (WC icons, fire
+        # extinguishers) mint identities through fragment_recovery without ever
+        # being checked by _should_suppress_new_identity. Same static-artifact
+        # filter the regular tracklet path already obeys; no new policy.
+        if self._should_suppress_new_identity(tracklet):
+            return None, None
+
+        frame_start = int(entries[0].frame_idx)
+        frame_end = int(entries[-1].frame_idx)
+        last_bbox = [float(v) for v in entries[-1].bbox_xyxy]
+        self._prune_fragment_recovery_clusters(frame_start)
+        cluster = self._find_fragment_recovery_cluster(
+            embedding=embedding,
+            bbox_xyxy=last_bbox,
+            frame_start=frame_start,
+        )
+        if cluster is None:
+            cluster = {
+                "embedding": embedding.astype(np.float32),
+                "fragments": 0,
+                "total_entries": 0,
+                "track_ids": set(),
+                "frame_start": frame_start,
+                "frame_end": frame_end,
+                "last_bbox": last_bbox,
+                "v_sum": 0.0,
+                "min_emb_consistency": float(emb_consistency),
+            }
+            self.fragment_recovery_clusters.append(cluster)
+
+        if int(tracklet.track_id) in cluster["track_ids"]:
+            return None, None
+
+        cluster["track_ids"].add(int(tracklet.track_id))
+        cluster["fragments"] += 1
+        cluster["total_entries"] += len(entries)
+        cluster["frame_start"] = min(int(cluster["frame_start"]), frame_start)
+        cluster["frame_end"] = max(int(cluster["frame_end"]), frame_end)
+        cluster["last_bbox"] = last_bbox
+        cluster["v_sum"] += float(v_avg) * len(entries)
+        cluster["min_emb_consistency"] = min(float(cluster["min_emb_consistency"]), float(emb_consistency))
+
+        weight_old = max(int(cluster["total_entries"]) - len(entries), 0)
+        combined = (cluster["embedding"] * weight_old) + (embedding.astype(np.float32) * len(entries))
+        norm = float(np.linalg.norm(combined))
+        cluster["embedding"] = combined / norm if norm > 1e-8 else embedding.astype(np.float32)
+
+        min_fragments = int(getattr(self.settings, "fragment_recovery_min_fragments", 2))
+        min_entries = int(getattr(self.settings, "fragment_recovery_min_total_entries", 5))
+        if cluster["fragments"] < min_fragments or cluster["total_entries"] < min_entries:
+            return None, None
+
+        near_threshold = float(getattr(self.settings, "fragment_recovery_near_gallery_threshold", 0.52))
+        near_hits = self.qdrant_store.search(cluster["embedding"], top_k=1, score_threshold=near_threshold)
+        if near_hits:
+            pid, score = near_hits[0]
+            return None, {
+                "method": "fragment_recovery_deferred_near_gallery",
+                "source": "fragment_recovery",
+                "similarity_score": float(score),
+                "reuse_person_id": int(pid),
+                "fragment_count": int(cluster["fragments"]),
+                "total_entries": int(cluster["total_entries"]),
+            }
+
+        if not self._can_allocate_new_identity(tracklet):
+            # Tracklet evidence is stale — don't mint a fresh identity from
+            # a fragment-recovery cluster whose last entry was long ago. The
+            # cluster stays in self.fragment_recovery_clusters and can promote
+            # later if new observations arrive.
+            log.info(
+                "fragment_recovery_skipped_quiescence",
+                fragments=int(cluster.get("fragments", 0)),
+                total_entries=int(cluster.get("total_entries", 0)),
+            )
+            return None, None
+        try:
+            person_id = self.person_id_allocator.allocate()
+        except Exception as err:
+            raise PersonIdAllocationError(str(err)) from err
+
+        self.qdrant_store.add_person(
+            person_id,
+            cluster["embedding"],
+            {
+                "source": "fragment_recovery",
+                "fragment_count": int(cluster["fragments"]),
+                "total_entries": int(cluster["total_entries"]),
+            },
+        )
+        self.fragment_recovery_clusters = [
+            existing
+            for existing in self.fragment_recovery_clusters
+            if existing is not cluster
+        ]
+        return person_id, {
+            "method": "new_identity",
+            "source": "fragment_recovery",
+            "similarity_score": None,
+            "fragment_count": int(cluster["fragments"]),
+            "total_entries": int(cluster["total_entries"]),
+            "frame_start": int(cluster["frame_start"]),
+            "frame_end": int(cluster["frame_end"]),
+        }
+
+    async def _maybe_merge_duplicate_person(self, person_id: int) -> int:
+        """Merge weak duplicate identities using appearance + non-cooccurrence.
+
+        This is intentionally post-hoc: a short fragmented track may be too
+        ambiguous to merge immediately, but once both identities have gallery
+        evidence we can safely collapse the weaker one if they never co-occurred
+        on the same device.
+
+        V23 P5: when the top candidate is blocked by a gender conflict, retry
+        with the next-best candidate (up to ``_DUPLICATE_MERGE_MAX_RETRIES``
+        attempts). This lets same-gender same-person fragments unify even when
+        the top embedding match happens to be an opposite-gender identity (e.g.
+        LMBN cross-pose sim 0.78 between two women, but sim 0.85 to an unrelated
+        man).
+        """
+        if not getattr(self.settings, "duplicate_merge_enabled", False):
+            return person_id
+
+        min_score = float(getattr(self.settings, "duplicate_merge_singleton_min_score", 0.49))
+        if bool(getattr(self.settings, "duplicate_merge_temporal_continuity_enabled", False)):
+            min_score = min(
+                min_score,
+                float(getattr(self.settings, "duplicate_merge_temporal_continuity_min_score", 0.85)),
+            )
+        if bool(getattr(self.settings, "duplicate_merge_adjacent_fragment_enabled", False)):
+            min_score = min(
+                min_score,
+                float(getattr(self.settings, "duplicate_merge_adjacent_fragment_min_score", 0.70)),
+            )
+        if bool(getattr(self.settings, "duplicate_merge_occlusion_reentry_enabled", False)):
+            min_score = min(
+                min_score,
+                float(getattr(self.settings, "duplicate_merge_occlusion_reentry_min_score", 0.58)),
+            )
+        if bool(getattr(self.settings, "duplicate_merge_same_gender_singleton_enabled", False)):
+            min_score = min(
+                min_score,
+                float(getattr(self.settings, "duplicate_merge_same_gender_singleton_min_score", 0.80)),
+            )
+        min_score = min(
+            min_score,
+            float(getattr(self.settings, "duplicate_merge_soft_split_override_threshold", 0.75)),
+        )
+        max_retries = int(getattr(self.settings, "duplicate_merge_max_retries", 3))
+        tried: set[int] = set()
+        last_result_person_id = person_id
+
+        for _attempt in range(max_retries):
+            candidate = await asyncio.to_thread(
+                self.qdrant_store.find_duplicate_candidate,
+                last_result_person_id,
+                min_score=min_score,
+                exclude_person_ids=tried,
+            )
+            if candidate is None:
+                return last_result_person_id
+            result = await self._try_merge_candidate(
+                last_result_person_id, candidate
+            )
+            if result.merged:
+                # Stop after one successful merge — chain-merging is left to the
+                # next tracklet's invocation to keep merges traceable and bounded.
+                return result.person_id
+            if result.gender_blocked or result.retryable_blocked:
+                tried.add(candidate[0])
+                continue
+            return last_result_person_id
+        return last_result_person_id
+
+    async def _try_merge_candidate(
+        self, person_id: int, candidate: tuple[int, float, float | None]
+    ) -> "_MergeAttemptResult":
+        candidate_person_id, score, runner_up_score = candidate
+
+        current_count, candidate_count = await asyncio.gather(
+            self.mongo.count_tracklets(person_id),
+            self.mongo.count_tracklets(candidate_person_id),
+        )
+        weak_limit = int(getattr(self.settings, "duplicate_merge_weak_max_tracklets", 2))
+        standard_min_score = float(getattr(self.settings, "duplicate_merge_min_score", 0.535))
+        singleton_min_score = float(getattr(self.settings, "duplicate_merge_singleton_min_score", 0.49))
+        singleton_min_target_tracklets = int(getattr(self.settings, "duplicate_merge_singleton_min_target_tracklets", 3))
+        min_margin = float(getattr(self.settings, "duplicate_merge_min_margin", 0.08))
+        is_singleton_merge = current_count <= 1 or candidate_count <= 1
+        margin = float("inf") if runner_up_score is None else float(score - runner_up_score)
+        temporal_continuity_merge = False
+        adjacent_fragment_merge = False
+        occlusion_reentry_merge = False
+        same_gender_singleton_merge = False
+        soft_split_reason = await self._persons_have_soft_split_transition(
+            person_id,
+            candidate_person_id,
+            score=score,
+            current_count=current_count,
+            candidate_count=candidate_count,
+        )
+        soft_split_merge = soft_split_reason is not None
+        if soft_split_reason == "reentry_bridge":
+            reentry_bridge_max_tracklets = int(
+                getattr(self.settings, "duplicate_merge_reentry_bridge_max_tracklets", 4)
+            )
+            if max(int(current_count), int(candidate_count)) > reentry_bridge_max_tracklets:
+                supported_min_score = float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_reentry_bridge_supported_min_score",
+                        0.70,
+                    )
+                )
+                supported_min_margin = float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_reentry_bridge_supported_min_margin",
+                        0.12,
+                    )
+                )
+                if float(score) < supported_min_score or margin < supported_min_margin:
+                    log.info(
+                        "duplicate_merge_rejected_weak_to_supported_reentry_bridge",
+                        person_id=person_id,
+                        candidate_person_id=candidate_person_id,
+                        similarity_score=round(float(score), 4),
+                        runner_up_score=None if runner_up_score is None else round(float(runner_up_score), 4),
+                        margin_to_runner_up=None if runner_up_score is None else round(float(margin), 4),
+                        current_count=int(current_count),
+                        candidate_count=int(candidate_count),
+                        min_score=supported_min_score,
+                        min_margin=supported_min_margin,
+                    )
+                    return _MergeAttemptResult(person_id=person_id, retryable_blocked=True)
+        if score < standard_min_score:
+            target_support = max(current_count, candidate_count)
+            is_supported_singleton_merge = (
+                is_singleton_merge
+                and score >= singleton_min_score
+                and target_support >= singleton_min_target_tracklets
+            )
+            same_gender_singleton_merge = (
+                bool(getattr(self.settings, "duplicate_merge_same_gender_singleton_enabled", False))
+                and is_singleton_merge
+                and score >= float(getattr(self.settings, "duplicate_merge_same_gender_singleton_min_score", 0.80))
+                and target_support >= singleton_min_target_tracklets
+            )
+            frame_gap = None
+            if (
+                bool(getattr(self.settings, "duplicate_merge_temporal_continuity_enabled", False))
+                or bool(getattr(self.settings, "duplicate_merge_adjacent_fragment_enabled", False))
+                or bool(getattr(self.settings, "duplicate_merge_occlusion_reentry_enabled", False))
+            ):
+                frame_gap = await self.mongo.persons_min_frame_gap(person_id, candidate_person_id)
+            if (
+                bool(getattr(self.settings, "duplicate_merge_temporal_continuity_enabled", False))
+                and score >= float(getattr(self.settings, "duplicate_merge_temporal_continuity_min_score", 0.85))
+                and min(current_count, candidate_count) <= weak_limit
+            ):
+                temporal_continuity_merge = (
+                    frame_gap is not None
+                    and frame_gap > 0
+                    and frame_gap <= int(getattr(
+                        self.settings,
+                        "duplicate_merge_temporal_continuity_max_gap_frames",
+                        15,
+                    ))
+                )
+            if (
+                not temporal_continuity_merge
+                and bool(getattr(self.settings, "duplicate_merge_adjacent_fragment_enabled", False))
+                and is_singleton_merge
+                and score >= float(getattr(self.settings, "duplicate_merge_adjacent_fragment_min_score", 0.70))
+            ):
+                adjacent_fragment_merge = (
+                    frame_gap is not None
+                    and frame_gap > 0
+                    and frame_gap <= int(getattr(
+                        self.settings,
+                        "duplicate_merge_adjacent_fragment_max_gap_frames",
+                        3,
+                    ))
+                )
+            if (
+                not temporal_continuity_merge
+                and not adjacent_fragment_merge
+                and bool(getattr(self.settings, "duplicate_merge_occlusion_reentry_enabled", False))
+                and is_singleton_merge
+                and min(current_count, candidate_count) <= weak_limit
+                and score >= float(getattr(self.settings, "duplicate_merge_occlusion_reentry_min_score", 0.58))
+            ):
+                occlusion_reentry_merge = (
+                    frame_gap is not None
+                    and frame_gap > 0
+                    and frame_gap <= int(getattr(
+                        self.settings,
+                        "duplicate_merge_occlusion_reentry_max_gap_frames",
+                        180,
+                    ))
+                    and await self._person_observations_close_for_reentry(person_id, candidate_person_id)
+                )
+            if (
+                not temporal_continuity_merge
+                and not adjacent_fragment_merge
+                and not occlusion_reentry_merge
+                and not same_gender_singleton_merge
+                and not soft_split_merge
+                and not is_supported_singleton_merge
+                and (
+                    not is_singleton_merge
+                    or score < singleton_min_score
+                    or margin < min_margin
+                )
+            ):
+                return _MergeAttemptResult(person_id=person_id)
+
+        established_min_score = float(getattr(
+            self.settings, "duplicate_merge_established_min_score", 0.78
+        ))
+        if current_count <= weak_limit and candidate_count <= weak_limit:
+            source_person_id = max(person_id, candidate_person_id)
+            target_person_id = min(person_id, candidate_person_id)
+        elif current_count <= weak_limit:
+            source_person_id = person_id
+            target_person_id = candidate_person_id
+        elif candidate_count <= weak_limit:
+            source_person_id = candidate_person_id
+            target_person_id = person_id
+        elif soft_split_merge:
+            # Detector/tracker splits can accumulate several short fragments
+            # before the final reconciler runs. Preserve the better-supported
+            # identity, but allow the spatially-proven split below the normal
+            # established-identity embedding threshold.
+            if candidate_count <= current_count:
+                source_person_id = candidate_person_id
+                target_person_id = person_id
+            else:
+                source_person_id = person_id
+                target_person_id = candidate_person_id
+        elif score >= established_min_score:
+            # Both sides have accumulated evidence (no weak limit). Embedding
+            # similarity must clear a higher bar than the weak-merge path, and
+            # the cooccurrence + attribute guards below still apply. Source =
+            # smaller-evidence side so the more-anchored ID is preserved.
+            if candidate_count <= current_count:
+                source_person_id = candidate_person_id
+                target_person_id = person_id
+            else:
+                source_person_id = person_id
+                target_person_id = candidate_person_id
+        else:
+            return _MergeAttemptResult(person_id=person_id)
+
+        source_tracklet_count = int(
+            current_count if source_person_id == person_id else candidate_count
+        )
+        target_tracklet_count = int(
+            candidate_count if target_person_id == candidate_person_id else current_count
+        )
+        if bool(
+            getattr(self.settings, "duplicate_merge_weak_to_supported_guard_enabled", True)
+        ):
+            min_supported_target = int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_weak_to_supported_min_target_tracklets",
+                    5,
+                )
+            )
+            weak_source_into_supported = (
+                source_tracklet_count <= weak_limit
+                and target_tracklet_count >= min_supported_target
+            )
+            hard_geometry_reasons = {
+                "duplicate_box",
+                "boundary_duplicate_box",
+                "same_frame_established_duplicate",
+                "overlap_spatial_duplicate",
+                "trajectory_reentry",
+                "ultra_continuity",
+                "tight_spatial_reentry",
+                "adjacent_tight_continuation",
+                "boundary_weak_continuation",
+            }
+            if weak_source_into_supported and soft_split_reason not in hard_geometry_reasons:
+                max_supported_target = int(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_weak_to_supported_max_target_tracklets",
+                        8,
+                    )
+                )
+                weak_supported_min_score = float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_weak_to_supported_min_score",
+                        0.82,
+                    )
+                )
+                weak_supported_min_margin = float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_weak_to_supported_min_margin",
+                        0.12,
+                    )
+                )
+                strong_override_score = float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_weak_to_supported_strong_score",
+                        0.89,
+                    )
+                )
+                strong_override_margin = float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_weak_to_supported_strong_margin",
+                        0.18,
+                    )
+                )
+                strong_embedding_override = (
+                    float(score) >= strong_override_score
+                    and margin >= strong_override_margin
+                )
+                if (
+                    (target_tracklet_count > max_supported_target and not strong_embedding_override)
+                    or float(score) < weak_supported_min_score
+                    or margin < weak_supported_min_margin
+                ):
+                    log.info(
+                        "duplicate_merge_rejected_weak_to_supported_guard",
+                        source_person_id=source_person_id,
+                        target_person_id=target_person_id,
+                        similarity_score=round(float(score), 4),
+                        runner_up_score=None
+                        if runner_up_score is None
+                        else round(float(runner_up_score), 4),
+                        margin_to_runner_up=None
+                        if runner_up_score is None
+                        else round(float(margin), 4),
+                        source_tracklet_count=source_tracklet_count,
+                        target_tracklet_count=target_tracklet_count,
+                        soft_split_reason=soft_split_reason,
+                        min_score=weak_supported_min_score,
+                        min_margin=weak_supported_min_margin,
+                        max_supported_target=max_supported_target,
+                    )
+                    return _MergeAttemptResult(person_id=person_id, retryable_blocked=True)
+
+        # Per-sighting gender disagreement check. Robust against contamination:
+        # uses individual sighting confidences rather than the per-person voted
+        # gender_confidence, which gets silently muted when a person has already
+        # absorbed conflicting tracklets. See
+        # persons_have_clear_gender_disagreement docstring for the "pure gender"
+        # definition. Never overridden by embedding similarity.
+        if await self.mongo.persons_have_clear_gender_disagreement(
+            source_person_id,
+            target_person_id,
+            sighting_confidence_threshold=float(
+                getattr(self.settings, "gender_tracklet_flip_confidence",
+                        getattr(self.settings, "gender_block_sighting_confidence", 0.90))
+            ),
+            min_consecutive=int(
+                getattr(self.settings, "gender_tracklet_min_consecutive", 2)
+            ),
+        ):
+            # V23 P3: cooccurrence-safe rescue. Two identities that literally cannot
+            # have been simultaneously present, with strong embedding similarity, are
+            # the same person regardless of what the gender classifier said. Only
+            # rescues when at least one side is weak (≤ weak_limit tracklets) — never
+            # merges two well-established identities on this rule alone.
+            cooccurrence_safe_override_threshold = float(
+                getattr(self.settings, "duplicate_merge_gender_cooccurrence_override_threshold", 0.70)
+            )
+            cooccurred = await self.mongo.persons_cooccur(source_person_id, target_person_id)
+            soft_split_can_override_gender = soft_split_reason in {
+                "duplicate_box",
+                "boundary_duplicate_box",
+                "overlap_spatial_duplicate",
+            }
+            if (
+                soft_split_can_override_gender
+                or (
+                    not cooccurred
+                    and score >= cooccurrence_safe_override_threshold
+                    and current_count <= weak_limit
+                    and candidate_count <= weak_limit
+                )
+            ):
+                log.warning(
+                    "duplicate_merge_gender_conflict_override_soft_split"
+                    if soft_split_can_override_gender
+                    else "duplicate_merge_gender_conflict_override_cooccurrence",
+                    source_person_id=source_person_id,
+                    target_person_id=target_person_id,
+                    similarity_score=round(score, 4),
+                    threshold=cooccurrence_safe_override_threshold,
+                    current_count=current_count,
+                    candidate_count=candidate_count,
+                )
+            else:
+                log.info(
+                    "duplicate_merge_rejected_gender_conflict",
+                    source_person_id=source_person_id,
+                    target_person_id=target_person_id,
+                    similarity_score=round(score, 4),
+                    cooccurred=bool(cooccurred),
+                )
+                return _MergeAttemptResult(person_id=person_id, gender_blocked=True)
+
+        # Fetch both persons' attributes in ONE round trip and run the local
+        # conflict checks against the returned dicts. Saves a Mongo round-trip
+        # per merge attempt vs separate persons_have_*_conflict queries.
+        attrs_a, attrs_b = await self.mongo.fetch_two_persons_attributes(
+            source_person_id, target_person_id
+        )
+        if same_gender_singleton_merge and not self._attrs_allow_singleton_merge(
+            attrs_a,
+            attrs_b,
+            score=score,
+        ):
+            log.info(
+                "duplicate_merge_rejected_same_gender_singleton_guard",
+                source_person_id=source_person_id,
+                target_person_id=target_person_id,
+                similarity_score=round(score, 4),
+            )
+            return _MergeAttemptResult(person_id=person_id, retryable_blocked=True)
+
+        # Hard overrides only. At sim ≥ 0.85 (cooccurrence) / 0.80 (attribute),
+        # the embedding match is strong enough to override these guards on its
+        # own. Below those thresholds, attribute conflict is GENUINE evidence
+        # that the two persons are different.
+        attr_conflict_present = MongoPersonStore.attributes_have_strong_conflict(attrs_a, attrs_b)
+        attr_override_threshold = float(
+            getattr(self.settings, "duplicate_merge_attr_override_threshold", 0.80)
+        )
+        cooccurrence_override_threshold = float(
+            getattr(self.settings, "duplicate_merge_cooccurrence_override_threshold", 0.85)
+        )
+
+        cooccurrence_guard_overridden = (
+            score >= cooccurrence_override_threshold
+            and not temporal_continuity_merge
+            and not adjacent_fragment_merge
+            and not occlusion_reentry_merge
+        )
+        if cooccurrence_guard_overridden:
+            log.info(
+                "duplicate_merge_cooccurrence_override_applied",
+                source_person_id=source_person_id,
+                target_person_id=target_person_id,
+                similarity_score=round(score, 4),
+                threshold=cooccurrence_override_threshold,
+            )
+        soft_split_can_override_cooccurrence = soft_split_reason in {
+            "duplicate_box",
+            "boundary_duplicate_box",
+            "same_frame_established_duplicate",
+            "overlap_spatial_duplicate",
+            "trajectory_reentry",
+        }
+        if soft_split_can_override_cooccurrence:
+            log.info(
+                "duplicate_merge_cooccurrence_override_soft_split",
+                source_person_id=source_person_id,
+                target_person_id=target_person_id,
+                similarity_score=round(score, 4),
+                soft_split_reason=soft_split_reason,
+            )
+        elif (
+            not cooccurrence_guard_overridden
+            and await self.mongo.persons_cooccur(source_person_id, target_person_id)
+        ):
+            log.info(
+                "duplicate_merge_rejected_cooccurrence",
+                source_person_id=source_person_id,
+                target_person_id=target_person_id,
+                similarity_score=round(score, 4),
+            )
+            return _MergeAttemptResult(person_id=person_id, retryable_blocked=True)
+
+        soft_split_can_override_attributes = soft_split_reason in {
+            "duplicate_box",
+            "boundary_duplicate_box",
+            "same_frame_established_duplicate",
+            "overlap_spatial_duplicate",
+            "trajectory_reentry",
+        }
+        if score >= attr_override_threshold or soft_split_can_override_attributes:
+            if attr_conflict_present:
+                log.info(
+                    "duplicate_merge_attr_override_soft_split"
+                    if soft_split_can_override_attributes
+                    else "duplicate_merge_attr_override_applied",
+                    source_person_id=source_person_id,
+                    target_person_id=target_person_id,
+                    similarity_score=round(score, 4),
+                    threshold=attr_override_threshold,
+                    soft_split_reason=soft_split_reason,
+                )
+        elif attr_conflict_present:
+            log.info(
+                "duplicate_merge_rejected_attribute_conflict",
+                source_person_id=source_person_id,
+                target_person_id=target_person_id,
+                similarity_score=round(score, 4),
+                runner_up_score=None if runner_up_score is None else round(runner_up_score, 4),
+            )
+            return _MergeAttemptResult(person_id=person_id, retryable_blocked=True)
+
+        reason = {
+            "method": "temporal_continuity_gallery_merge" if temporal_continuity_merge else "adjacent_fragment_gallery_merge" if adjacent_fragment_merge else "occlusion_reentry_gallery_merge" if occlusion_reentry_merge else "soft_split_gallery_merge" if soft_split_merge else "same_gender_singleton_gallery_merge" if same_gender_singleton_merge else "singleton_reentry_gallery_merge" if is_singleton_merge and score < standard_min_score else "weak_identity_gallery_merge",
+            "similarity_score": round(float(score), 4),
+            "runner_up_score": None if runner_up_score is None else round(float(runner_up_score), 4),
+            "margin_to_runner_up": None if runner_up_score is None else round(float(margin), 4),
+            "source_tracklet_count": source_tracklet_count,
+            "target_tracklet_count": target_tracklet_count,
+        }
+        if soft_split_reason is not None:
+            reason["soft_split_reason"] = soft_split_reason
+        await asyncio.to_thread(
+            self.qdrant_store.merge_person_gallery,
+            source_person_id,
+            target_person_id,
+        )
+        await self.mongo.merge_person(
+            source_person_id=source_person_id,
+            target_person_id=target_person_id,
+            reason=reason,
+        )
+        await asyncio.gather(
+            self.redis_cache.invalidate(source_person_id),
+            self.redis_cache.invalidate(target_person_id),
+        )
+
+        for track_id, mapped_person_id in list(self.track_id_to_person_id.items()):
+            if mapped_person_id == source_person_id:
+                self.track_id_to_person_id[track_id] = target_person_id
+        source_obs = self.person_last_observation.pop(source_person_id, None)
+        if source_obs is not None:
+            self.person_last_observation[target_person_id] = source_obs
+        log.info(
+            "duplicate_identity_merged",
+            source_person_id=source_person_id,
+            target_person_id=target_person_id,
+            similarity_score=round(score, 4),
+        )
+        new_pid = target_person_id if person_id == source_person_id else person_id
+        return _MergeAttemptResult(person_id=new_pid, merged=True)
+
+    async def _persons_have_soft_split_transition(
+        self,
+        person_a: int,
+        person_b: int,
+        *,
+        score: float,
+        current_count: int,
+        candidate_count: int,
+    ) -> str | None:
+        appearance_threshold = float(
+            getattr(self.settings, "duplicate_merge_soft_split_override_threshold", 0.75)
+        )
+        max_weak_count = int(
+            getattr(self.settings, "duplicate_merge_soft_split_max_weak_tracklets", 4)
+        )
+        if min(int(current_count), int(candidate_count)) > max_weak_count:
+            return None
+
+        try:
+            transition = await self.mongo.persons_min_frame_gap_with_bboxes(
+                int(person_a),
+                int(person_b),
+            )
+        except AttributeError:
+            return None
+        if not transition:
+            return None
+
+        standard_max_gap = int(
+            getattr(
+                self.settings,
+                "duplicate_merge_temporal_continuity_max_gap_frames",
+                15,
+            )
+        )
+        bbox_a = transition.get("bbox_a") or []
+        bbox_b = transition.get("bbox_b") or []
+        if len(bbox_a) < 4 or len(bbox_b) < 4:
+            return None
+        gap = int(transition.get("gap", 10**9))
+        bbox_a = [float(v) for v in bbox_a]
+        bbox_b = [float(v) for v in bbox_b]
+        center_ratio = self._center_distance_ratio(
+            bbox_a,
+            bbox_b,
+        )
+        # Same-frame duplicate boxes are the tracker/detector equivalent of one
+        # physical person being split into two IDs. In that geometry, the crop
+        # can differ enough that ReID cosine is low, so require stronger bbox
+        # overlap and a weak side instead of a high embedding score.
+        weak_limit = int(getattr(self.settings, "duplicate_merge_weak_max_tracklets", 2))
+        max_center_ratio = float(
+            getattr(self.settings, "duplicate_merge_soft_split_max_center_distance_ratio", 0.35)
+        )
+        duplicate_iou_threshold = float(
+            getattr(self.settings, "duplicate_merge_soft_split_duplicate_iou_threshold", 0.45)
+        )
+        if gap == 0 and min(int(current_count), int(candidate_count)) <= weak_limit:
+            iou = self._bbox_iou(bbox_a, bbox_b)
+            duplicate_box_multitrack_min_score = float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_soft_split_duplicate_box_multitrack_min_score",
+                    0.58,
+                )
+            )
+            duplicate_box_score_allowed = (
+                min(int(current_count), int(candidate_count)) <= 1
+                or float(score) >= duplicate_box_multitrack_min_score
+            )
+            if (
+                duplicate_box_score_allowed
+                and (
+                    iou >= duplicate_iou_threshold
+                    or center_ratio <= (max_center_ratio * 0.6)
+                )
+            ):
+                return "duplicate_box"
+            boundary_duplicate_min_score = float(
+                getattr(self.settings, "duplicate_merge_boundary_duplicate_min_score", 0.68)
+            )
+            boundary_duplicate_min_iou = float(
+                getattr(self.settings, "duplicate_merge_boundary_duplicate_min_iou", 0.10)
+            )
+            boundary_duplicate_max_center_ratio = float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_boundary_duplicate_max_center_distance_ratio",
+                    0.45,
+                )
+            )
+            if (
+                float(score) >= boundary_duplicate_min_score
+                and iou >= boundary_duplicate_min_iou
+                and center_ratio <= boundary_duplicate_max_center_ratio
+                and self._bboxes_share_frame_boundary(bbox_a, bbox_b)
+            ):
+                return "boundary_duplicate_box"
+
+        if (
+            bool(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_overlap_spatial_duplicate_enabled",
+                    True,
+                )
+            )
+            and float(score)
+            >= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_overlap_spatial_duplicate_min_score",
+                    0.58,
+                )
+            )
+            and max(int(current_count), int(candidate_count))
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_overlap_spatial_duplicate_max_tracklets",
+                    24,
+                )
+            )
+        ):
+            try:
+                overlap_transition = (
+                    await self.mongo.persons_closest_spatial_transition_with_bboxes(
+                        int(person_a),
+                        int(person_b),
+                        max_gap_frames=int(
+                            getattr(
+                                self.settings,
+                                "duplicate_merge_overlap_spatial_duplicate_max_gap_frames",
+                                4,
+                            )
+                        ),
+                    )
+                )
+            except AttributeError:
+                overlap_transition = None
+            if overlap_transition:
+                overlap_gap = int(overlap_transition.get("gap", 10**9))
+                overlap_bbox_a = overlap_transition.get("bbox_a") or []
+                overlap_bbox_b = overlap_transition.get("bbox_b") or []
+                if len(overlap_bbox_a) >= 4 and len(overlap_bbox_b) >= 4:
+                    overlap_bbox_a = [float(v) for v in overlap_bbox_a]
+                    overlap_bbox_b = [float(v) for v in overlap_bbox_b]
+                    overlap_center_ratio = self._center_distance_ratio(
+                        overlap_bbox_a,
+                        overlap_bbox_b,
+                    )
+                    width_a = max(float(overlap_bbox_a[2] - overlap_bbox_a[0]), 1.0)
+                    height_a = max(float(overlap_bbox_a[3] - overlap_bbox_a[1]), 1.0)
+                    width_b = max(float(overlap_bbox_b[2] - overlap_bbox_b[0]), 1.0)
+                    height_b = max(float(overlap_bbox_b[3] - overlap_bbox_b[1]), 1.0)
+                    size_a = max(width_a, height_a)
+                    size_b = max(width_b, height_b)
+                    area_a = width_a * height_a
+                    area_b = width_b * height_b
+                    size_ratio = max(size_a, size_b) / max(min(size_a, size_b), 1.0)
+                    area_ratio = max(area_a, area_b) / max(min(area_a, area_b), 1.0)
+                    if (
+                        overlap_gap
+                        <= int(
+                            getattr(
+                                self.settings,
+                                "duplicate_merge_overlap_spatial_duplicate_max_gap_frames",
+                                4,
+                            )
+                        )
+                        and overlap_center_ratio
+                        <= float(
+                            getattr(
+                                self.settings,
+                                "duplicate_merge_overlap_spatial_duplicate_max_center_distance_ratio",
+                                0.08,
+                            )
+                        )
+                        and size_ratio
+                        <= float(
+                            getattr(
+                                self.settings,
+                                "duplicate_merge_overlap_spatial_duplicate_max_size_ratio",
+                                1.25,
+                            )
+                        )
+                        and area_ratio
+                        <= float(
+                            getattr(
+                                self.settings,
+                                "duplicate_merge_overlap_spatial_duplicate_max_area_ratio",
+                                1.60,
+                            )
+                        )
+                    ):
+                        return "overlap_spatial_duplicate"
+
+        if (
+            bool(getattr(self.settings, "duplicate_merge_trajectory_reentry_enabled", True))
+            and float(score)
+            >= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_trajectory_reentry_min_score",
+                    0.60,
+                )
+            )
+            and max(int(current_count), int(candidate_count))
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_trajectory_reentry_max_tracklets",
+                    24,
+                )
+            )
+        ):
+            try:
+                trajectory_transition = (
+                    await self.mongo.persons_closest_spatial_transition_with_bboxes(
+                        int(person_a),
+                        int(person_b),
+                        max_gap_frames=int(
+                            getattr(
+                                self.settings,
+                                "duplicate_merge_trajectory_reentry_max_gap_frames",
+                                240,
+                            )
+                        ),
+                    )
+                )
+            except AttributeError:
+                trajectory_transition = None
+            if trajectory_transition:
+                trajectory_gap = int(trajectory_transition.get("gap", 10**9))
+                trajectory_bbox_a = trajectory_transition.get("bbox_a") or []
+                trajectory_bbox_b = trajectory_transition.get("bbox_b") or []
+                if len(trajectory_bbox_a) >= 4 and len(trajectory_bbox_b) >= 4:
+                    trajectory_bbox_a = [float(v) for v in trajectory_bbox_a]
+                    trajectory_bbox_b = [float(v) for v in trajectory_bbox_b]
+                    trajectory_center_ratio = self._center_distance_ratio(
+                        trajectory_bbox_a,
+                        trajectory_bbox_b,
+                    )
+                    width_a = max(float(trajectory_bbox_a[2] - trajectory_bbox_a[0]), 1.0)
+                    height_a = max(float(trajectory_bbox_a[3] - trajectory_bbox_a[1]), 1.0)
+                    width_b = max(float(trajectory_bbox_b[2] - trajectory_bbox_b[0]), 1.0)
+                    height_b = max(float(trajectory_bbox_b[3] - trajectory_bbox_b[1]), 1.0)
+                    size_a = max(width_a, height_a)
+                    size_b = max(width_b, height_b)
+                    area_a = width_a * height_a
+                    area_b = width_b * height_b
+                    size_ratio = max(size_a, size_b) / max(min(size_a, size_b), 1.0)
+                    area_ratio = max(area_a, area_b) / max(min(area_a, area_b), 1.0)
+                    if (
+                        trajectory_gap
+                        <= int(
+                            getattr(
+                                self.settings,
+                                "duplicate_merge_trajectory_reentry_max_gap_frames",
+                                240,
+                            )
+                        )
+                        and trajectory_center_ratio
+                        <= float(
+                            getattr(
+                                self.settings,
+                                "duplicate_merge_trajectory_reentry_max_center_distance_ratio",
+                                0.06,
+                            )
+                        )
+                        and size_ratio
+                        <= float(
+                            getattr(
+                                self.settings,
+                                "duplicate_merge_trajectory_reentry_max_size_ratio",
+                                1.30,
+                            )
+                        )
+                        and area_ratio
+                        <= float(
+                            getattr(
+                                self.settings,
+                                "duplicate_merge_trajectory_reentry_max_area_ratio",
+                                1.80,
+                            )
+                        )
+                    ):
+                        attrs_a, attrs_b = await self.mongo.fetch_two_persons_attributes(
+                            int(person_a),
+                            int(person_b),
+                        )
+                        if not MongoPersonStore.attributes_have_strong_conflict(
+                            attrs_a,
+                            attrs_b,
+                        ):
+                            return "trajectory_reentry"
+
+        if (
+            bool(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_same_frame_established_duplicate_enabled",
+                    True,
+                )
+            )
+            and gap == 0
+            and float(score)
+            >= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_same_frame_established_duplicate_min_score",
+                    0.50,
+                )
+            )
+        ):
+            iou = self._bbox_iou(bbox_a, bbox_b)
+            width_a = max(float(bbox_a[2] - bbox_a[0]), 1.0)
+            height_a = max(float(bbox_a[3] - bbox_a[1]), 1.0)
+            width_b = max(float(bbox_b[2] - bbox_b[0]), 1.0)
+            height_b = max(float(bbox_b[3] - bbox_b[1]), 1.0)
+            size_a = max(width_a, height_a)
+            size_b = max(width_b, height_b)
+            area_a = width_a * height_a
+            area_b = width_b * height_b
+            size_ratio = max(size_a, size_b) / max(min(size_a, size_b), 1.0)
+            area_ratio = max(area_a, area_b) / max(min(area_a, area_b), 1.0)
+            if (
+                iou
+                >= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_same_frame_established_duplicate_min_iou",
+                        0.75,
+                    )
+                )
+                and center_ratio
+                <= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_same_frame_established_duplicate_max_center_distance_ratio",
+                        0.05,
+                    )
+                )
+                and size_ratio
+                <= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_same_frame_established_duplicate_max_size_ratio",
+                        1.15,
+                    )
+                )
+                and area_ratio
+                <= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_same_frame_established_duplicate_max_area_ratio",
+                        1.25,
+                    )
+                )
+            ):
+                attrs_a, attrs_b = await self.mongo.fetch_two_persons_attributes(
+                    int(person_a),
+                    int(person_b),
+                )
+                if self._attrs_support_reentry_bridge(attrs_a, attrs_b):
+                    return "same_frame_established_duplicate"
+
+        if (
+            gap <= standard_max_gap
+            and float(score) >= appearance_threshold
+            and center_ratio <= max_center_ratio
+        ):
+            return "appearance_continuity"
+
+        # Boundary/occlusion re-entry can create a singleton with a very poor
+        # appearance vector. Allow only a short temporal gap, a singleton side,
+        # and tight spatial continuity; this is not a general low-score merge.
+        spatial_only_center_ratio = float(
+            getattr(
+                self.settings,
+                "duplicate_merge_soft_split_spatial_only_max_center_distance_ratio",
+                0.50,
+            )
+        )
+        spatial_only_min_score = float(
+            getattr(
+                self.settings,
+                "duplicate_merge_soft_split_spatial_only_min_score",
+                0.52,
+            )
+        )
+        cooccurred = None
+        if (
+            gap > 0
+            and min(int(current_count), int(candidate_count))
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_ultra_continuity_max_weak_tracklets",
+                    weak_limit,
+                )
+            )
+            and max(int(current_count), int(candidate_count))
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_ultra_continuity_max_supported_tracklets",
+                    8,
+                )
+            )
+            and gap <= int(getattr(self.settings, "duplicate_merge_ultra_continuity_max_gap_frames", 6))
+            and center_ratio <= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_ultra_continuity_max_center_distance_ratio",
+                    0.12,
+                )
+            )
+            and float(score) >= float(getattr(self.settings, "duplicate_merge_ultra_continuity_min_score", 0.50))
+        ):
+            cooccurred = await self.mongo.persons_cooccur(int(person_a), int(person_b))
+            if not cooccurred:
+                return "ultra_continuity"
+
+        if (
+            bool(getattr(self.settings, "duplicate_merge_tight_spatial_reentry_enabled", True))
+            and gap > 0
+            and min(int(current_count), int(candidate_count))
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_tight_spatial_reentry_max_weak_tracklets",
+                    weak_limit,
+                )
+            )
+            and gap
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_tight_spatial_reentry_max_gap_frames",
+                    6,
+                )
+            )
+            and center_ratio
+            <= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_tight_spatial_reentry_max_center_distance_ratio",
+                    0.12,
+                )
+            )
+            and float(score)
+            >= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_tight_spatial_reentry_min_score",
+                    0.50,
+                )
+            )
+        ):
+            width_a = max(float(bbox_a[2] - bbox_a[0]), 1.0)
+            height_a = max(float(bbox_a[3] - bbox_a[1]), 1.0)
+            width_b = max(float(bbox_b[2] - bbox_b[0]), 1.0)
+            height_b = max(float(bbox_b[3] - bbox_b[1]), 1.0)
+            size_a = max(width_a, height_a)
+            size_b = max(width_b, height_b)
+            area_a = width_a * height_a
+            area_b = width_b * height_b
+            size_ratio = max(size_a, size_b) / max(min(size_a, size_b), 1.0)
+            area_ratio = max(area_a, area_b) / max(min(area_a, area_b), 1.0)
+            if (
+                size_ratio
+                <= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_tight_spatial_reentry_max_size_ratio",
+                        1.15,
+                    )
+                )
+                and area_ratio
+                <= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_tight_spatial_reentry_max_area_ratio",
+                        1.25,
+                    )
+                )
+            ):
+                if cooccurred is None:
+                    cooccurred = await self.mongo.persons_cooccur(int(person_a), int(person_b))
+                if not cooccurred:
+                    attrs_a, attrs_b = await self.mongo.fetch_two_persons_attributes(
+                        int(person_a),
+                        int(person_b),
+                    )
+                    if self._attrs_support_reentry_bridge(attrs_a, attrs_b):
+                        return "tight_spatial_reentry"
+
+        reentry_bridge_max_tracklets = int(
+            getattr(self.settings, "duplicate_merge_reentry_bridge_max_tracklets", 4)
+        )
+        reentry_bridge_max_supported_tracklets = int(
+            getattr(
+                self.settings,
+                "duplicate_merge_reentry_bridge_max_supported_tracklets",
+                reentry_bridge_max_tracklets,
+            )
+        )
+        reentry_bridge_counts_allowed = (
+            max(int(current_count), int(candidate_count)) <= reentry_bridge_max_tracklets
+            or (
+                min(int(current_count), int(candidate_count)) <= reentry_bridge_max_tracklets
+                and max(int(current_count), int(candidate_count))
+                <= reentry_bridge_max_supported_tracklets
+            )
+        )
+        if (
+            bool(getattr(self.settings, "duplicate_merge_supported_spatial_reentry_enabled", True))
+            and gap
+            >= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_supported_spatial_reentry_min_gap_frames",
+                    24,
+                )
+            )
+            and gap
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_supported_spatial_reentry_max_gap_frames",
+                    90,
+                )
+            )
+            and max(int(current_count), int(candidate_count))
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_supported_spatial_reentry_max_tracklets",
+                    8,
+                )
+            )
+            and float(score)
+            >= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_supported_spatial_reentry_min_score",
+                    0.53,
+                )
+            )
+            and center_ratio
+            <= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_supported_spatial_reentry_max_center_distance_ratio",
+                    0.18,
+                )
+            )
+        ):
+            width_a = max(float(bbox_a[2] - bbox_a[0]), 1.0)
+            height_a = max(float(bbox_a[3] - bbox_a[1]), 1.0)
+            width_b = max(float(bbox_b[2] - bbox_b[0]), 1.0)
+            height_b = max(float(bbox_b[3] - bbox_b[1]), 1.0)
+            size_a = max(width_a, height_a)
+            size_b = max(width_b, height_b)
+            area_a = width_a * height_a
+            area_b = width_b * height_b
+            size_ratio = max(size_a, size_b) / max(min(size_a, size_b), 1.0)
+            area_ratio = max(area_a, area_b) / max(min(area_a, area_b), 1.0)
+            if (
+                size_ratio
+                <= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_supported_spatial_reentry_max_size_ratio",
+                        1.20,
+                    )
+                )
+                and area_ratio
+                <= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_supported_spatial_reentry_max_area_ratio",
+                        1.80,
+                    )
+                )
+            ):
+                if cooccurred is None:
+                    cooccurred = await self.mongo.persons_cooccur(int(person_a), int(person_b))
+                if not cooccurred:
+                    attrs_a, attrs_b = await self.mongo.fetch_two_persons_attributes(
+                        int(person_a),
+                        int(person_b),
+                    )
+                    if self._attrs_support_reentry_bridge(attrs_a, attrs_b):
+                        return "supported_spatial_reentry"
+
+        if (
+            bool(getattr(self.settings, "duplicate_merge_reentry_bridge_enabled", True))
+            and gap > 0
+            and reentry_bridge_counts_allowed
+            and gap >= int(getattr(self.settings, "duplicate_merge_reentry_bridge_min_gap_frames", 30))
+            and gap <= int(getattr(self.settings, "duplicate_merge_reentry_bridge_max_gap_frames", 180))
+            and min(int(current_count), int(candidate_count)) <= max_weak_count
+            and float(score) >= float(getattr(self.settings, "duplicate_merge_reentry_bridge_min_score", 0.535))
+            and center_ratio <= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_reentry_bridge_max_center_distance_ratio",
+                    0.85,
+                )
+            )
+        ):
+            if cooccurred is None:
+                cooccurred = await self.mongo.persons_cooccur(int(person_a), int(person_b))
+            if not cooccurred:
+                attrs_a, attrs_b = await self.mongo.fetch_two_persons_attributes(
+                    int(person_a),
+                    int(person_b),
+                )
+                if self._attrs_support_reentry_bridge(attrs_a, attrs_b):
+                    return "reentry_bridge"
+
+        if (
+            bool(getattr(self.settings, "duplicate_merge_clothing_reentry_enabled", True))
+            and gap
+            >= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_clothing_reentry_min_gap_frames",
+                    30,
+                )
+            )
+            and gap
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_clothing_reentry_max_gap_frames",
+                    240,
+                )
+            )
+            and min(int(current_count), int(candidate_count))
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_clothing_reentry_max_weak_tracklets",
+                    weak_limit,
+                )
+            )
+            and max(int(current_count), int(candidate_count))
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_clothing_reentry_max_supported_tracklets",
+                    8,
+                )
+            )
+            and float(score)
+            >= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_clothing_reentry_min_score",
+                    0.515,
+                )
+            )
+        ):
+            if cooccurred is None:
+                cooccurred = await self.mongo.persons_cooccur(int(person_a), int(person_b))
+            if not cooccurred:
+                attrs_a, attrs_b = await self.mongo.fetch_two_persons_attributes(
+                    int(person_a),
+                    int(person_b),
+                )
+                if self._attrs_support_clothing_reentry(attrs_a, attrs_b):
+                    return "clothing_supported_reentry"
+
+        if (
+            bool(getattr(self.settings, "duplicate_merge_supported_spatial_reentry_enabled", True))
+            and gap
+            >= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_supported_spatial_reentry_min_gap_frames",
+                    24,
+                )
+            )
+            and gap
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_supported_spatial_reentry_max_gap_frames",
+                    90,
+                )
+            )
+            and max(int(current_count), int(candidate_count))
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_supported_spatial_reentry_max_tracklets",
+                    8,
+                )
+            )
+            and float(score)
+            >= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_supported_spatial_reentry_min_score",
+                    0.53,
+                )
+            )
+            and center_ratio
+            <= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_supported_spatial_reentry_max_center_distance_ratio",
+                    0.18,
+                )
+            )
+        ):
+            width_a = max(float(bbox_a[2] - bbox_a[0]), 1.0)
+            height_a = max(float(bbox_a[3] - bbox_a[1]), 1.0)
+            width_b = max(float(bbox_b[2] - bbox_b[0]), 1.0)
+            height_b = max(float(bbox_b[3] - bbox_b[1]), 1.0)
+            size_a = max(width_a, height_a)
+            size_b = max(width_b, height_b)
+            area_a = width_a * height_a
+            area_b = width_b * height_b
+            size_ratio = max(size_a, size_b) / max(min(size_a, size_b), 1.0)
+            area_ratio = max(area_a, area_b) / max(min(area_a, area_b), 1.0)
+            if (
+                size_ratio
+                <= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_supported_spatial_reentry_max_size_ratio",
+                        1.20,
+                    )
+                )
+                and area_ratio
+                <= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_supported_spatial_reentry_max_area_ratio",
+                        1.80,
+                    )
+                )
+            ):
+                if cooccurred is None:
+                    cooccurred = await self.mongo.persons_cooccur(int(person_a), int(person_b))
+                if not cooccurred:
+                    attrs_a, attrs_b = await self.mongo.fetch_two_persons_attributes(
+                        int(person_a),
+                        int(person_b),
+                    )
+                    if self._attrs_support_reentry_bridge(attrs_a, attrs_b):
+                        return "supported_spatial_reentry"
+
+        if (
+            bool(getattr(self.settings, "duplicate_merge_occlusion_spatial_rejoin_enabled", False))
+            and gap > 0
+            and min(int(current_count), int(candidate_count)) <= max_weak_count
+            and float(score)
+            >= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_occlusion_spatial_rejoin_min_score",
+                    0.53,
+                )
+            )
+        ):
+            if cooccurred is None:
+                cooccurred = await self.mongo.persons_cooccur(int(person_a), int(person_b))
+            if not cooccurred:
+                try:
+                    continuation = await self.mongo.persons_closest_spatial_transition_with_bboxes(
+                        int(person_a),
+                        int(person_b),
+                        max_gap_frames=int(
+                            getattr(
+                                self.settings,
+                                "duplicate_merge_occlusion_spatial_rejoin_max_gap_frames",
+                                180,
+                            )
+                        ),
+                    )
+                except AttributeError:
+                    continuation = None
+                if continuation:
+                    cont_bbox_a = continuation.get("bbox_a") or []
+                    cont_bbox_b = continuation.get("bbox_b") or []
+                    if len(cont_bbox_a) >= 4 and len(cont_bbox_b) >= 4:
+                        cont_bbox_a = [float(v) for v in cont_bbox_a]
+                        cont_bbox_b = [float(v) for v in cont_bbox_b]
+                        cont_center_ratio = self._center_distance_ratio(
+                            cont_bbox_a,
+                            cont_bbox_b,
+                        )
+                        width_a = max(float(cont_bbox_a[2] - cont_bbox_a[0]), 1.0)
+                        height_a = max(float(cont_bbox_a[3] - cont_bbox_a[1]), 1.0)
+                        width_b = max(float(cont_bbox_b[2] - cont_bbox_b[0]), 1.0)
+                        height_b = max(float(cont_bbox_b[3] - cont_bbox_b[1]), 1.0)
+                        size_a = max(width_a, height_a)
+                        size_b = max(width_b, height_b)
+                        area_a = width_a * height_a
+                        area_b = width_b * height_b
+                        size_ratio = max(size_a, size_b) / max(min(size_a, size_b), 1.0)
+                        area_ratio = max(area_a, area_b) / max(min(area_a, area_b), 1.0)
+                        tight_spatial = (
+                            cont_center_ratio
+                            <= float(
+                                getattr(
+                                    self.settings,
+                                    "duplicate_merge_occlusion_spatial_rejoin_tight_center_distance_ratio",
+                                    0.42,
+                                )
+                            )
+                            and size_ratio
+                            <= float(
+                                getattr(
+                                    self.settings,
+                                    "duplicate_merge_occlusion_spatial_rejoin_max_size_ratio",
+                                    1.55,
+                                )
+                            )
+                            and area_ratio
+                            <= float(
+                                getattr(
+                                    self.settings,
+                                    "duplicate_merge_occlusion_spatial_rejoin_max_area_ratio",
+                                    2.10,
+                                )
+                            )
+                        )
+                        precise_spatial = (
+                            cont_center_ratio
+                            <= float(
+                                getattr(
+                                    self.settings,
+                                    "duplicate_merge_occlusion_spatial_rejoin_max_center_distance_ratio",
+                                    0.50,
+                                )
+                            )
+                            and size_ratio
+                            <= float(
+                                getattr(
+                                    self.settings,
+                                    "duplicate_merge_occlusion_spatial_rejoin_tight_size_ratio",
+                                    1.10,
+                                )
+                            )
+                            and area_ratio
+                            <= float(
+                                getattr(
+                                    self.settings,
+                                    "duplicate_merge_occlusion_spatial_rejoin_tight_area_ratio",
+                                    2.00,
+                                )
+                            )
+                        )
+                        strong_score = float(score) >= float(
+                            getattr(
+                                self.settings,
+                                "duplicate_merge_occlusion_spatial_rejoin_strong_min_score",
+                                0.59,
+                            )
+                        )
+                        if (strong_score and tight_spatial) or precise_spatial:
+                            attrs_a, attrs_b = await self.mongo.fetch_two_persons_attributes(
+                                int(person_a),
+                                int(person_b),
+                            )
+                            if not MongoPersonStore.attributes_have_strong_conflict(
+                                attrs_a,
+                                attrs_b,
+                            ):
+                                return "occlusion_spatial_rejoin"
+
+        if min(int(current_count), int(candidate_count)) > 1:
+            spatial_only_min_score = max(
+                spatial_only_min_score,
+                float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_soft_split_spatial_only_multitrack_min_score",
+                        0.60,
+                    )
+                ),
+            )
+        if (
+            gap > 0
+            and min(int(current_count), int(candidate_count)) <= weak_limit
+            and gap <= standard_max_gap
+            and float(score) >= spatial_only_min_score
+            and center_ratio <= spatial_only_center_ratio
+        ):
+            if cooccurred is None:
+                cooccurred = await self.mongo.persons_cooccur(int(person_a), int(person_b))
+            if cooccurred:
+                return None
+            return "spatial_only_weak_fragment"
+
+        if (
+            bool(getattr(self.settings, "duplicate_merge_adjacent_tight_continuation_enabled", True))
+            and gap > 0
+            and gap
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_adjacent_tight_continuation_max_gap_frames",
+                    4,
+                )
+            )
+            and max(int(current_count), int(candidate_count))
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_adjacent_tight_continuation_max_tracklets",
+                    8,
+                )
+            )
+            and float(score)
+            >= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_adjacent_tight_continuation_min_score",
+                    0.50,
+                )
+            )
+            and center_ratio
+            <= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_adjacent_tight_continuation_max_center_distance_ratio",
+                    0.06,
+                )
+            )
+        ):
+            width_a = max(float(bbox_a[2] - bbox_a[0]), 1.0)
+            height_a = max(float(bbox_a[3] - bbox_a[1]), 1.0)
+            width_b = max(float(bbox_b[2] - bbox_b[0]), 1.0)
+            height_b = max(float(bbox_b[3] - bbox_b[1]), 1.0)
+            size_a = max(width_a, height_a)
+            size_b = max(width_b, height_b)
+            area_a = width_a * height_a
+            area_b = width_b * height_b
+            size_ratio = max(size_a, size_b) / max(min(size_a, size_b), 1.0)
+            area_ratio = max(area_a, area_b) / max(min(area_a, area_b), 1.0)
+            if (
+                size_ratio
+                <= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_adjacent_tight_continuation_max_size_ratio",
+                        1.10,
+                    )
+                )
+                and area_ratio
+                <= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_adjacent_tight_continuation_max_area_ratio",
+                        1.15,
+                    )
+                )
+            ):
+                if cooccurred is None:
+                    cooccurred = await self.mongo.persons_cooccur(int(person_a), int(person_b))
+                if not cooccurred:
+                    attrs_a, attrs_b = await self.mongo.fetch_two_persons_attributes(
+                        int(person_a),
+                        int(person_b),
+                    )
+                    if (
+                        not MongoPersonStore.attributes_have_strong_conflict(attrs_a, attrs_b)
+                        and (
+                            not self._attrs_have_stable_identity_evidence(attrs_a)
+                            or not self._attrs_have_stable_identity_evidence(attrs_b)
+                            or self._attrs_support_reentry_bridge(attrs_a, attrs_b)
+                        )
+                    ):
+                        return "adjacent_tight_continuation"
+
+        if (
+            bool(getattr(self.settings, "duplicate_merge_boundary_weak_continuation_enabled", True))
+            and gap > 0
+            and gap
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_boundary_weak_continuation_max_gap_frames",
+                    12,
+                )
+            )
+            and (
+                min(int(current_count), int(candidate_count))
+                <= int(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_boundary_weak_continuation_max_weak_tracklets",
+                        weak_limit,
+                    )
+                )
+                or max(int(current_count), int(candidate_count))
+                <= int(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_boundary_weak_continuation_max_supported_tracklets",
+                        8,
+                    )
+                )
+            )
+            and max(int(current_count), int(candidate_count))
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_boundary_weak_continuation_max_supported_tracklets",
+                    8,
+                )
+            )
+            and float(score)
+            >= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_boundary_weak_continuation_min_score",
+                    0.52,
+                )
+            )
+            and center_ratio
+            >= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_boundary_weak_continuation_min_center_distance_ratio",
+                    0.10,
+                )
+            )
+            and center_ratio
+            <= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_boundary_weak_continuation_max_center_distance_ratio",
+                    0.32,
+                )
+            )
+        ):
+            width_a = max(float(bbox_a[2] - bbox_a[0]), 1.0)
+            height_a = max(float(bbox_a[3] - bbox_a[1]), 1.0)
+            width_b = max(float(bbox_b[2] - bbox_b[0]), 1.0)
+            height_b = max(float(bbox_b[3] - bbox_b[1]), 1.0)
+            size_a = max(width_a, height_a)
+            size_b = max(width_b, height_b)
+            area_a = width_a * height_a
+            area_b = width_b * height_b
+            size_ratio = max(size_a, size_b) / max(min(size_a, size_b), 1.0)
+            area_ratio = max(area_a, area_b) / max(min(area_a, area_b), 1.0)
+            bottom_delta_ratio = abs(float(bbox_a[3] - bbox_b[3])) / max(
+                height_a,
+                height_b,
+                1.0,
+            )
+            if (
+                size_ratio
+                <= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_boundary_weak_continuation_max_size_ratio",
+                        1.80,
+                    )
+                )
+                and area_ratio
+                <= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_boundary_weak_continuation_max_area_ratio",
+                        2.30,
+                    )
+                )
+                and bottom_delta_ratio
+                <= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_boundary_weak_continuation_max_bottom_delta_ratio",
+                        0.03,
+                    )
+                )
+            ):
+                if cooccurred is None:
+                    cooccurred = await self.mongo.persons_cooccur(int(person_a), int(person_b))
+                if not cooccurred:
+                    attrs_a, attrs_b = await self.mongo.fetch_two_persons_attributes(
+                        int(person_a),
+                        int(person_b),
+                    )
+                    weak_boundary_side = (
+                        min(int(current_count), int(candidate_count))
+                        <= int(
+                            getattr(
+                                self.settings,
+                                "duplicate_merge_boundary_weak_continuation_max_weak_tracklets",
+                                weak_limit,
+                            )
+                        )
+                    )
+                    if (
+                        not MongoPersonStore.attributes_have_strong_conflict(attrs_a, attrs_b)
+                        and (weak_boundary_side or self._attrs_support_reentry_bridge(attrs_a, attrs_b))
+                    ):
+                        return "boundary_weak_continuation"
+
+        if (
+            gap > 0
+            and min(int(current_count), int(candidate_count)) <= 1
+            and gap <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_singleton_spatial_continuation_max_gap_frames",
+                    standard_max_gap,
+                )
+            )
+            and float(score)
+            >= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_singleton_spatial_continuation_min_score",
+                    0.30,
+                )
+            )
+            and center_ratio
+            <= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_singleton_spatial_continuation_max_center_distance_ratio",
+                    spatial_only_center_ratio,
+                )
+            )
+        ):
+            width_a = max(float(bbox_a[2] - bbox_a[0]), 1.0)
+            height_a = max(float(bbox_a[3] - bbox_a[1]), 1.0)
+            width_b = max(float(bbox_b[2] - bbox_b[0]), 1.0)
+            height_b = max(float(bbox_b[3] - bbox_b[1]), 1.0)
+            size_a = max(width_a, height_a)
+            size_b = max(width_b, height_b)
+            area_a = width_a * height_a
+            area_b = width_b * height_b
+            size_ratio = max(size_a, size_b) / max(min(size_a, size_b), 1.0)
+            area_ratio = max(area_a, area_b) / max(min(area_a, area_b), 1.0)
+            if (
+                size_ratio
+                <= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_singleton_spatial_continuation_max_size_ratio",
+                        1.80,
+                    )
+                )
+                and area_ratio
+                <= float(
+                    getattr(
+                        self.settings,
+                        "duplicate_merge_singleton_spatial_continuation_max_area_ratio",
+                        2.20,
+                    )
+                )
+            ):
+                if cooccurred is None:
+                    cooccurred = await self.mongo.persons_cooccur(int(person_a), int(person_b))
+                if cooccurred:
+                    return None
+                return "singleton_spatial_continuation"
+
+        if (
+            bool(getattr(self.settings, "duplicate_merge_spatial_continuation_enabled", False))
+            and min(int(current_count), int(candidate_count)) <= weak_limit
+            and float(score) >= float(
+                getattr(self.settings, "duplicate_merge_spatial_continuation_min_score", 0.20)
+            )
+        ):
+            if cooccurred is None:
+                cooccurred = await self.mongo.persons_cooccur(int(person_a), int(person_b))
+            if cooccurred:
+                return None
+            try:
+                continuation = await self.mongo.persons_closest_spatial_transition_with_bboxes(
+                    int(person_a),
+                    int(person_b),
+                    max_gap_frames=int(
+                        getattr(
+                            self.settings,
+                            "duplicate_merge_spatial_continuation_max_gap_frames",
+                            60,
+                        )
+                    ),
+                )
+            except AttributeError:
+                continuation = None
+            if continuation:
+                cont_bbox_a = continuation.get("bbox_a") or []
+                cont_bbox_b = continuation.get("bbox_b") or []
+                if len(cont_bbox_a) >= 4 and len(cont_bbox_b) >= 4:
+                    cont_center_ratio = self._center_distance_ratio(
+                        [float(v) for v in cont_bbox_a],
+                        [float(v) for v in cont_bbox_b],
+                    )
+                    if cont_center_ratio <= float(
+                        getattr(
+                            self.settings,
+                            "duplicate_merge_spatial_continuation_max_center_distance_ratio",
+                            0.30,
+                        )
+                    ):
+                        return "spatial_continuation"
+        return None
+
+    @staticmethod
+    def _bboxes_share_frame_boundary(box_a: list[float], box_b: list[float]) -> bool:
+        # Finite-video demos use full-frame person crops at the image boundary.
+        # If two same-frame boxes both touch the same image edge, a detector split
+        # can have low IoU while still describing one truncated person.
+        boundary_eps = 2.0
+        return (
+            abs(float(box_a[0]) - float(box_b[0])) <= boundary_eps
+            or abs(float(box_a[1]) - float(box_b[1])) <= boundary_eps
+            or abs(float(box_a[2]) - float(box_b[2])) <= boundary_eps
+            or abs(float(box_a[3]) - float(box_b[3])) <= boundary_eps
+        )
+
+    async def _person_observations_close_for_reentry(self, person_a: int, person_b: int) -> bool:
+        obs_a = self.person_last_observation.get(int(person_a))
+        obs_b = self.person_last_observation.get(int(person_b))
+        max_center_ratio = float(
+            getattr(
+                self.settings,
+                "duplicate_merge_occlusion_reentry_max_center_distance_ratio",
+                2.0,
+            )
+        )
+        if obs_a and obs_b:
+            bbox_a = obs_a.get("bbox_xyxy")
+            bbox_b = obs_b.get("bbox_xyxy")
+            if bbox_a and bbox_b and len(bbox_a) >= 4 and len(bbox_b) >= 4:
+                center_ratio = self._center_distance_ratio(
+                    [float(v) for v in bbox_a],
+                    [float(v) for v in bbox_b],
+                )
+                if center_ratio <= max_center_ratio:
+                    return True
+
+        try:
+            transition = await self.mongo.persons_min_frame_gap_with_bboxes(
+                int(person_a),
+                int(person_b),
+            )
+        except AttributeError:
+            return False
+        if not transition:
+            return False
+        bbox_a = transition.get("bbox_a") or []
+        bbox_b = transition.get("bbox_b") or []
+        if len(bbox_a) < 4 or len(bbox_b) < 4:
+            return False
+        center_ratio = self._center_distance_ratio(
+            [float(v) for v in bbox_a],
+            [float(v) for v in bbox_b],
+        )
+        return center_ratio <= max_center_ratio
+
+    def _attrs_have_same_confident_gender(self, attrs_a: dict, attrs_b: dict) -> bool:
+        gender_a = attrs_a.get("gender")
+        gender_b = attrs_b.get("gender")
+        if gender_a not in {"male", "female"} or gender_b not in {"male", "female"}:
+            return False
+        if gender_a != gender_b:
+            return False
+        conf_threshold = float(
+            getattr(self.settings, "duplicate_merge_same_gender_singleton_gender_confidence", 0.80)
+        )
+        return (
+            float(attrs_a.get("gender_confidence", 0.0) or 0.0) >= conf_threshold
+            and float(attrs_b.get("gender_confidence", 0.0) or 0.0) >= conf_threshold
+        )
+
+    def _attrs_support_reentry_bridge(self, attrs_a: dict, attrs_b: dict) -> bool:
+        if MongoPersonStore.attributes_have_strong_conflict(attrs_a, attrs_b):
+            return False
+
+        gender_a = attrs_a.get("gender")
+        gender_b = attrs_b.get("gender")
+        if gender_a not in {"male", "female"} or gender_b not in {"male", "female"}:
+            return False
+        if gender_a != gender_b:
+            return False
+
+        gender_conf_threshold = float(
+            getattr(self.settings, "duplicate_merge_reentry_bridge_gender_confidence", 0.70)
+        )
+        if (
+            float(attrs_a.get("gender_confidence", 0.0) or 0.0) < gender_conf_threshold
+            or float(attrs_b.get("gender_confidence", 0.0) or 0.0) < gender_conf_threshold
+        ):
+            return False
+
+        attr_conf_threshold = 0.70
+        stable_tasks = ("backpack", "hat", "lower", "sleeve")
+        matches = 0
+        for task in stable_tasks:
+            label_a = attrs_a.get(task)
+            label_b = attrs_b.get(task)
+            if not label_a or not label_b or label_a == "unknown" or label_b == "unknown":
+                continue
+            if label_a != label_b:
+                continue
+            conf_a = float(attrs_a.get(f"{task}_confidence", 0.0) or 0.0)
+            conf_b = float(attrs_b.get(f"{task}_confidence", 0.0) or 0.0)
+            if conf_a >= attr_conf_threshold and conf_b >= attr_conf_threshold:
+                matches += 1
+
+        return matches >= int(
+            getattr(self.settings, "duplicate_merge_reentry_bridge_min_attr_matches", 2)
+        )
+
+    def _attrs_support_clothing_reentry(self, attrs_a: dict, attrs_b: dict) -> bool:
+        if MongoPersonStore.attributes_have_strong_conflict(attrs_a, attrs_b):
+            return False
+
+        attr_conf_threshold = float(
+            getattr(self.settings, "duplicate_merge_clothing_reentry_attr_confidence", 0.70)
+        )
+        matches = 0
+        for task in ("backpack", "hat", "lower", "sleeve"):
+            label_a = attrs_a.get(task)
+            label_b = attrs_b.get(task)
+            if not label_a or not label_b or label_a == "unknown" or label_b == "unknown":
+                continue
+            if label_a != label_b:
+                continue
+            conf_a = float(attrs_a.get(f"{task}_confidence", 0.0) or 0.0)
+            conf_b = float(attrs_b.get(f"{task}_confidence", 0.0) or 0.0)
+            if conf_a >= attr_conf_threshold and conf_b >= attr_conf_threshold:
+                matches += 1
+
+        return matches >= int(
+            getattr(self.settings, "duplicate_merge_clothing_reentry_min_attr_matches", 3)
+        )
+
+    def _attrs_have_stable_identity_evidence(self, attrs: dict) -> bool:
+        attr_conf_threshold = 0.70
+        for task in ("gender", "backpack", "hat", "lower", "sleeve"):
+            label = attrs.get(task)
+            if not label or label == "unknown":
+                continue
+            if float(attrs.get(f"{task}_confidence", 0.0) or 0.0) >= attr_conf_threshold:
+                return True
+        return False
+
+    def _mask_ambiguous_gender_conflict(
+        self,
+        person_attrs: dict[str, tuple[str, float]],
+        tracklet_attrs: dict[str, tuple[str, float]],
+    ) -> dict[str, tuple[str, float]]:
+        if not bool(getattr(self.settings, "gender_ambiguous_conflict_enabled", True)):
+            return person_attrs
+        p_gender, p_conf = person_attrs.get("gender", ("unknown", 0.0))
+        t_gender, t_conf = tracklet_attrs.get("gender", ("unknown", 0.0))
+        if (
+            p_gender in {"male", "female"}
+            and t_gender in {"male", "female"}
+            and p_gender != t_gender
+            and float(t_conf) >= float(
+                getattr(self.settings, "gender_ambiguous_conflict_tracklet_confidence", 0.70)
+            )
+            and float(p_conf) <= float(
+                getattr(self.settings, "gender_ambiguous_conflict_max_person_confidence", 0.80)
+            )
+        ):
+            masked = dict(person_attrs)
+            masked["gender"] = ("unknown", 0.0)
+            return masked
+        return person_attrs
+
+    def _attrs_allow_singleton_merge(
+        self,
+        attrs_a: dict,
+        attrs_b: dict,
+        *,
+        score: float,
+    ) -> bool:
+        if self._attrs_have_same_confident_gender(attrs_a, attrs_b):
+            return True
+
+        gender_a = attrs_a.get("gender")
+        gender_b = attrs_b.get("gender")
+        if (
+            gender_a in {"male", "female"}
+            and gender_b in {"male", "female"}
+            and gender_a != gender_b
+        ):
+            return False
+
+        # Missing/low-confidence attributes are not negative identity evidence.
+        # For singleton fragments, appearance + no cooccurrence should be allowed
+        # to repair splits when the cosine is high enough; attributes will be
+        # re-voted after merge from the stronger person's evidence.
+        unknown_attr_min_score = float(
+            getattr(self.settings, "duplicate_merge_singleton_unknown_attr_min_score", 0.88)
+        )
+        return float(score) >= unknown_attr_min_score
+
+    async def _persist_occlusion_candidate(
+        self,
+        tracklet,
+        *,
+        reason: str,
+        matching: dict | None = None,
+        selected_entries: list[TrackletEntry] | None = None,
+        embedding_consistency: float | None = None,
+        min_entries: int | None = None,
+        candidate_id_override: str | None = None,
+    ) -> None:
+        if not getattr(self.settings, "occlusion_candidates_enabled", True):
+            return
+        max_lag_s = float(getattr(self.settings, "max_new_identity_lag_seconds", 0.0) or 0.0)
+        if not self._tracklet_is_fresh_enough(
+            tracklet,
+            max_lag_s=max_lag_s,
+            log_event="occlusion_candidate_blocked_stale_tracklet",
+        ):
+            return
+        # Mirror the identity-mint quiescence guard at
+        # _can_mint_new_identity: once stream_quiescence_seconds of
+        # wall-clock have passed since the last Kafka message, the
+        # stream is over and the worker is just draining backlog. New
+        # occlusion-candidate rows in that window are evidence the user
+        # cannot act on — and visually they make the UI count keep
+        # creeping up for minutes after the video ends. Silently drop
+        # them; legitimate mid-stream evidence is already captured.
+        quiescence_s = float(getattr(self.settings, "stream_quiescence_seconds", 0.0) or 0.0)
+        last_ns = getattr(self, "last_message_time_ns", None)
+        if (
+            quiescence_s > 0
+            and last_ns
+            and not getattr(self, "_stream_finalizing", False)
+        ):
+            if (time.time_ns() - int(last_ns)) > int(quiescence_s * 1e9):
+                return
+        if not hasattr(self, "occlusion_candidate_track_ids"):
+            self.occlusion_candidate_track_ids = set()
+        if candidate_id_override is None and int(tracklet.track_id) in self.occlusion_candidate_track_ids:
+            return
+        entries = list(tracklet.entries or [])
+        required_entries = (
+            int(min_entries)
+            if min_entries is not None
+            else int(getattr(self.settings, "occlusion_candidate_min_entries", 2))
+        )
+        if len(entries) < required_entries:
+            return
+        max_visibility = max((float(entry.v_score) for entry in entries), default=0.0)
+        if max_visibility < float(getattr(self.settings, "occlusion_candidate_min_visibility", 0.45)):
+            return
+
+        if candidate_id_override is None:
+            self.occlusion_candidate_track_ids.add(int(tracklet.track_id))
+        candidate_id = candidate_id_override or (
+            f"{self._current_device_id}:track:{int(tracklet.track_id)}:"
+            f"{reason}:{int(entries[0].frame_idx)}:{int(entries[-1].frame_idx)}"
+        )
+        selected_entries = selected_entries or []
+        selected_frame_idxs = {int(entry.frame_idx) for entry in selected_entries}
+        best_entry = max(entries, key=lambda entry: (entry.v_score, -entry.overlap_ratio))
+        preview_entries = sorted(
+            entries,
+            key=lambda entry: (
+                entry.frame_idx not in selected_frame_idxs,
+                -entry.v_score,
+                entry.overlap_ratio,
+            ),
+        )[:5]
+        if best_entry not in preview_entries:
+            preview_entries = [best_entry, *preview_entries[:4]]
+
+        crop_key = ""
+        snapshot_crop = (
+            best_entry.attribute_crop
+            if best_entry.attribute_crop is not None and best_entry.attribute_crop.size > 0
+            else best_entry.crop
+        )
+        if snapshot_crop is not None and snapshot_crop.size > 0:
+            ok, buf = cv2.imencode(".jpg", snapshot_crop, [cv2.IMWRITE_JPEG_QUALITY, 88])
+            if ok:
+                crop_key = await asyncio.to_thread(
+                    self.minio.upload_tracklet_snapshot,
+                    candidate_id,
+                    buf.tobytes(),
+                )
+
+        frame_crop_keys: dict[int, str] = {}
+        for entry in preview_entries:
+            if entry.crop.size <= 0:
+                continue
+            ok, buf = cv2.imencode(".jpg", entry.crop, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if not ok:
+                continue
+            frame_key = await asyncio.to_thread(
+                self.minio.upload_tracklet_frame_snapshot,
+                candidate_id,
+                int(entry.frame_idx),
+                buf.tobytes(),
+            )
+            if frame_key:
+                frame_crop_keys[int(entry.frame_idx)] = frame_key
+
+        consistency = compute_tracklet_consistency(entries)
+        emb_consistency = float(embedding_consistency or 0.0)
+        quality = {
+            "v_avg": round(sum(float(entry.v_score) for entry in entries) / len(entries), 4),
+            "embedding_consistency": round(emb_consistency, 4),
+            "bbox_size_stability": round(consistency.bbox_size_stability, 4),
+            "position_stability": round(consistency.position_stability, 4),
+            "good_frame_ratio": round(consistency.good_frame_ratio, 4),
+            "overall_consistency": round(consistency.overall, 4),
+        }
+        evidence = {
+            "selected_frame_count": len(selected_frame_idxs),
+            "selected_frame_indices": sorted(selected_frame_idxs),
+            "frame_samples": [
+                {
+                    "frame_idx": int(entry.frame_idx),
+                    "bbox_xyxy": [float(round(v, 2)) for v in entry.bbox_xyxy],
+                    "bbox_center_xy": [
+                        float(round((entry.bbox_xyxy[0] + entry.bbox_xyxy[2]) / 2.0, 2)),
+                        float(round((entry.bbox_xyxy[1] + entry.bbox_xyxy[3]) / 2.0, 2)),
+                    ],
+                    "bbox_size_wh": [
+                        float(round(entry.bbox_xyxy[2] - entry.bbox_xyxy[0], 2)),
+                        float(round(entry.bbox_xyxy[3] - entry.bbox_xyxy[1], 2)),
+                    ],
+                    "visibility_score": float(round(entry.v_score, 4)),
+                    "overlap_ratio": float(round(entry.overlap_ratio, 4)),
+                    "selected": int(entry.frame_idx) in selected_frame_idxs,
+                    "selection_reason": (
+                        "selected_consensus_frame"
+                        if int(entry.frame_idx) in selected_frame_idxs
+                        else reason
+                    ),
+                    "crop_key": frame_crop_keys.get(int(entry.frame_idx)),
+                }
+                for entry in preview_entries
+            ],
+        }
+        await self.mongo.add_occlusion_candidate(
+            candidate_id=candidate_id,
+            track_id=int(tracklet.track_id),
+            device_id=self._current_device_id,
+            reason=reason,
+            status="unconfirmed",
+            frame_start=int(entries[0].frame_idx),
+            frame_end=int(entries[-1].frame_idx),
+            entry_count=len(entries),
+            quality=quality,
+            evidence=evidence,
+            best_crop_key=crop_key or None,
+            matching=matching or {},
+        )
+        log.info(
+            "occlusion_candidate_persisted",
+            candidate_id=candidate_id,
+            track_id=tracklet.track_id,
+            reason=reason,
+            entry_count=len(entries),
+            max_visibility=round(max_visibility, 4),
+        )
+
+    async def _process_short_fragment_tracklet(self, tracklet, *, reason: str) -> int | None:
+        entries = list(tracklet.entries or [])
+        if not entries:
+            return None
+        if not getattr(self.settings, "fragment_recovery_enabled", True):
+            await self._persist_occlusion_candidate(
+                tracklet,
+                reason=reason,
+                matching={"method": "unconfirmed", "source": reason, "similarity_score": None},
+            )
+            return None
+
+        best_entry = max(entries, key=lambda entry: (entry.v_score, -entry.overlap_ratio))
+        if float(best_entry.v_score) < float(getattr(self.settings, "fragment_recovery_min_visibility", 0.72)):
+            await self._persist_occlusion_candidate(
+                tracklet,
+                reason=reason,
+                matching={"method": "unconfirmed", "source": reason, "similarity_score": None},
+            )
+            return None
+
+        ok, buf = cv2.imencode(".jpg", best_entry.crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            await self._persist_occlusion_candidate(
+                tracklet,
+                reason=reason,
+                matching={"method": "unconfirmed", "source": reason, "similarity_score": None},
+            )
+            return None
+
+        try:
+            _, result = await self.model_client.extract_features(
+                buf.tobytes(),
+                model=getattr(self.settings, "embedding_model", "osnet"),
+            )
+            embedding = np.array(result["embedding"], dtype=np.float32)
+            norm = float(np.linalg.norm(embedding))
+            if norm <= 1e-8:
+                raise ValueError("zero-norm embedding")
+            embedding = embedding / norm
+        except Exception as err:
+            log.warning("fragment_recovery_feature_failed", track_id=tracklet.track_id, error=str(err))
+            await self._persist_occlusion_candidate(
+                tracklet,
+                reason=reason,
+                matching={"method": "unconfirmed", "source": reason, "similarity_score": None},
+            )
+            return None
+
+        attr_crop = (
+            best_entry.attribute_crop
+            if best_entry.attribute_crop is not None and best_entry.attribute_crop.size > 0
+            else best_entry.crop
+        )
+        ok_attr, attr_buf = cv2.imencode(".jpg", attr_crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if ok_attr:
+            try:
+                attrs = await self.model_client.classify_attributes(attr_buf.tobytes())
+                if attrs:
+                    self.attribute_voter.vote_frame(tracklet.track_id, attrs)
+            except Exception:
+                pass
+
+        consistency = compute_tracklet_consistency(entries)
+        v_avg = float(sum(float(entry.v_score) for entry in entries) / len(entries))
+        person_id, matching = self._add_fragment_recovery_candidate(
+            tracklet=tracklet,
+            embedding=embedding,
+            v_avg=v_avg,
+            emb_consistency=1.0,
+        )
+        t_attrs = self.attribute_voter.resolve_tracklet(tracklet.track_id)
+        if person_id is None and matching:
+            person_id, matching = self._maybe_accept_occlusion_provisional_match(
+                tracklet=tracklet,
+                matching=matching,
+                v_avg=v_avg,
+                tracklet_attrs=t_attrs,
+                forbidden_person_ids=set(),
+                recent_incompatible_person_ids=set(),
+                blocked_person_ids=set(),
+            )
+        if person_id is None:
+            await self._persist_occlusion_candidate(
+                tracklet,
+                reason=reason,
+                selected_entries=[best_entry],
+                embedding_consistency=1.0,
+                matching=matching or {"method": "unconfirmed", "source": reason, "similarity_score": None},
+            )
+            return None
+
+        tracklet_id = str(uuid.uuid4())
+        tracklet.person_id = person_id
+        tracklet.state = TrackletState.MATCHED
+        self.track_id_to_person_id[tracklet.track_id] = person_id
+        self._update_person_last_observation_from_tracklet(person_id, tracklet)
+        if bool((matching or {}).get("provisional")):
+            p_attrs = self.attribute_voter.person_snapshot(person_id)
+        else:
+            p_attrs = self.attribute_voter.resolve_person(person_id, t_attrs)
+        self.track_metadata[tracklet.track_id] = {
+            "tracklet_id": tracklet_id,
+            "tracklet_state": tracklet.state.value,
+            "snapshot_key": None,
+            "visibility_score": round(v_avg, 4),
+            "quality": {
+                "v_avg": float(round(v_avg, 4)),
+                "embedding_consistency": 1.0,
+                "overall_consistency": float(round(consistency.overall, 4)),
+                "good_frame_ratio": float(round(consistency.good_frame_ratio, 4)),
+            },
+            "matching": matching or {"method": "new_identity", "source": "fragment_recovery"},
+            "attributes": {task: label for task, (label, _) in p_attrs.items()},
+        }
+        await self._persist_tracklet(
+            tracklet=tracklet,
+            tracklet_id=tracklet_id,
+            person_id=person_id,
+            consistency=consistency,
+            v_avg=v_avg,
+            emb_consistency=1.0,
+            best_entry=best_entry,
+            selected=[best_entry],
+            matching=matching or {"method": "new_identity", "source": "fragment_recovery"},
+            person_attrs=p_attrs,
+        )
+        log.info(
+            "fragment_recovery_promoted",
+            track_id=tracklet.track_id,
+            person_id=person_id,
+            entries=len(entries),
+            v_avg=round(v_avg, 4),
+        )
+        return person_id
+
     async def _process_tracklet(
         self,
         tracklet,
         reserved_person_ids: set[int] | None = None,
+        allow_tentative_fallback: bool = True,
     ) -> int | None:
         if not self.topk_selector.is_tracklet_ready(tracklet.entries):
             tracklet.state = TrackletState.ACTIVE  # allow re-evaluation as new frames arrive
@@ -462,21 +4763,64 @@ class WorkerPipeline:
                         entries=len(tracklet.entries),
                         recent_v_scores=recent_v,
                         threshold=getattr(self.topk_selector, "high_quality_threshold", None))
+            self._track_inflight(asyncio.ensure_future(
+                self._persist_occlusion_candidate(
+                    tracklet,
+                    reason="quality_gate_fail",
+                    matching={"method": "unconfirmed", "source": "quality_gate_fail"},
+                )
+            ))
             return None
         consistency = compute_tracklet_consistency(tracklet.entries)
+        # PDF Bước 2 — reject tracklets that are dimensionally / spatially
+        # incoherent before paying for embedding extraction. A bouncy bbox
+        # or jumping centroid signals either a polluted track (ByteTrack
+        # ID-swap during occlusion blended two people into one track_id)
+        # or a detection-quality problem; either way the aggregated
+        # embedding cannot be trusted to seed a canonical or steal a match.
+        consistency_threshold = float(
+            getattr(self.settings, "tracklet_readiness_consistency_threshold", 0.0)
+        )
+        if consistency.overall < consistency_threshold:
+            tracklet.state = TrackletState.ACTIVE
+            log.warning(
+                "tracklet_consistency_gate_fail",
+                track_id=tracklet.track_id,
+                entries=len(tracklet.entries),
+                consistency_overall=consistency.overall,
+                bbox_size_stability=consistency.bbox_size_stability,
+                position_stability=consistency.position_stability,
+                good_frame_ratio=consistency.good_frame_ratio,
+                threshold=consistency_threshold,
+            )
+            self._track_inflight(asyncio.ensure_future(
+                self._persist_occlusion_candidate(
+                    tracklet,
+                    reason="consistency_gate_fail",
+                    matching={"method": "unconfirmed", "source": "consistency_gate_fail"},
+                )
+            ))
+            return None
         selected = self.topk_selector.select(tracklet.entries)
 
         embeddings, v_scores, overlap_ratios = [], [], []
         best_entry = selected[0] if selected else None
-
+        best_entry_attrs: dict[str, dict] | None = None
         async def _extract_one(entry):
             ok, buf = cv2.imencode(".jpg", entry.crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
             if not ok:
-                return None, None
+                return None, None, None
             img_bytes = buf.tobytes()
+            attr_crop = entry.attribute_crop if entry.attribute_crop is not None and entry.attribute_crop.size > 0 else entry.crop
+            ok_attr, attr_buf = cv2.imencode(".jpg", attr_crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            attr_bytes = attr_buf.tobytes() if ok_attr else img_bytes
             emb_vec = None
+            attrs = None
             try:
-                _, result = await self.model_client.extract_features(img_bytes)
+                _, result = await self.model_client.extract_features(
+                    img_bytes,
+                    model=getattr(self.settings, "embedding_model", "osnet"),
+                )
                 emb_vec = np.array(result["embedding"], dtype=np.float32)
                 norm = np.linalg.norm(emb_vec)
                 if norm > 1e-8:
@@ -486,25 +4830,75 @@ class WorkerPipeline:
             except Exception as err:
                 log.warning("feature_extraction_failed", error=str(err))
             try:
-                attrs = await self.model_client.classify_attributes(img_bytes)
-                self.attribute_voter.vote_frame(tracklet.track_id, attrs)
+                attrs = await self.model_client.classify_attributes(attr_bytes)
             except Exception:
                 pass
-            return emb_vec, entry
+            return emb_vec, entry, attrs
 
-        for emb_vec, entry in await asyncio.gather(*[_extract_one(e) for e in selected]):
+        extracted = []
+        for emb_vec, entry, attrs in await asyncio.gather(*[_extract_one(e) for e in selected]):
             if emb_vec is None:
                 continue
+            extracted.append((emb_vec, entry, attrs))
+
+        if not extracted:
+            log.warning("tracklet_no_embeddings", track_id=tracklet.track_id, selected=len(selected))
+            tracklet.state = TrackletState.ACTIVE
+            self._track_inflight(asyncio.ensure_future(
+                self._persist_occlusion_candidate(
+                    tracklet,
+                    reason="feature_extraction_failed",
+                    selected_entries=selected,
+                    matching={"method": "unconfirmed", "source": "feature_extraction_failed"},
+                )
+            ))
+            return
+
+        raw_embeddings = [item[0] for item in extracted]
+        raw_v_scores = [item[1].v_score for item in extracted]
+        consensus_threshold = float(
+            getattr(self.settings, "embedding_consensus_threshold", 0.72)
+        )
+        consensus_indices = _select_embedding_consensus_indices(
+            raw_embeddings,
+            raw_v_scores,
+            similarity_threshold=consensus_threshold,
+        )
+        min_consensus = int(getattr(self.settings, "min_consensus_embeddings", 2))
+        consensus_failed = (
+            len(raw_embeddings) >= min_consensus and len(consensus_indices) < min_consensus
+        )
+        if consensus_failed:
+            raw_consistency = WeightedEmbeddingAggregator.compute_embedding_consistency(raw_embeddings)
+            log.warning(
+                "tracklet_embedding_consensus_fail",
+                track_id=tracklet.track_id,
+                selected=len(selected),
+                embedded=len(raw_embeddings),
+                consensus_count=len(consensus_indices),
+                raw_embedding_consistency=round(raw_consistency, 4),
+                threshold=consensus_threshold,
+            )
+            # Graceful degrade: pick the top-v_score embedding and let the matcher
+            # attempt a gallery match in match-only mode (no new identity). If no
+            # match is found, the post-match flow persists it as occlusion candidate.
+            top_idx = max(range(len(extracted)), key=lambda i: extracted[i][1].v_score)
+            consensus_indices = [top_idx]
+
+        for idx in consensus_indices:
+            emb_vec, entry, attrs = extracted[idx]
             embeddings.append(emb_vec)
             v_scores.append(entry.v_score)
             overlap_ratios.append(entry.overlap_ratio)
+            if attrs:
+                self.attribute_voter.vote_frame(tracklet.track_id, attrs)
             if best_entry is None or entry.v_score > best_entry.v_score:
                 best_entry = entry
+                best_entry_attrs = attrs
+            elif best_entry is entry:
+                best_entry_attrs = attrs
 
-        if not embeddings:
-            log.warning("tracklet_no_embeddings", track_id=tracklet.track_id, selected=len(selected))
-            return
-
+        consensus_entries = [extracted[idx][1] for idx in consensus_indices]
         self.embedded_tracklets += 1
         emb_consistency = WeightedEmbeddingAggregator.compute_embedding_consistency(embeddings)
         tracklet_embedding = self.aggregator.aggregate(embeddings, v_scores, overlap_ratios)
@@ -512,11 +4906,52 @@ class WorkerPipeline:
 
         # Resolve tracklet-level attributes (all 8 tasks).
         t_attrs = self.attribute_voter.resolve_tracklet(tracklet.track_id)
+        attrs_unreliable = self._is_occlusion_attribute_unreliable(tracklet, v_avg=v_avg)
+
+        glasses_from_best = None
+        if isinstance(best_entry_attrs, dict):
+            glasses_from_best = best_entry_attrs.get("glasses")
+        if isinstance(glasses_from_best, dict):
+            glasses_label = glasses_from_best.get("label")
+            glasses_conf = float(glasses_from_best.get("confidence", 0.0))
+            if (
+                isinstance(glasses_label, str)
+                and glasses_label in {"glasses", "no_glasses"}
+                and glasses_conf >= self.settings.glasses_best_frame_override_threshold
+            ):
+                t_attrs["glasses"] = (glasses_label, round(glasses_conf, 4))
 
         try:
             if reserved_person_ids is None:
                 reserved_person_ids = set()
             current_person_id = self.track_id_to_person_id.get(tracklet.track_id)
+            if current_person_id is None:
+                current_person_id = self._find_recent_track_identity(tracklet)
+                if current_person_id is not None:
+                    self.track_id_to_person_id[tracklet.track_id] = current_person_id
+                    log.info(
+                        "track_identity_memory_restored",
+                        track_id=tracklet.track_id,
+                        person_id=current_person_id,
+                        frame_start=tracklet.entries[0].frame_idx if tracklet.entries else None,
+                    )
+            identity_shift_risk = None
+            if current_person_id is not None:
+                identity_shift_risk = self._tracklet_identity_shift_risk(tracklet)
+                if identity_shift_risk is not None:
+                    forbidden_person_ids_for_shift = self.track_forbidden_person_ids.setdefault(
+                        tracklet.track_id,
+                        set(),
+                    )
+                    forbidden_person_ids_for_shift.add(current_person_id)
+                    self.track_id_to_person_id.pop(tracklet.track_id, None)
+                    log.warning(
+                        "current_identity_shift_risk_rejected",
+                        track_id=tracklet.track_id,
+                        rejected_person_id=current_person_id,
+                        **identity_shift_risk,
+                    )
+                    current_person_id = None
             blocked_person_ids = set(reserved_person_ids)
             if current_person_id is not None:
                 blocked_person_ids.discard(current_person_id)
@@ -527,21 +4962,170 @@ class WorkerPipeline:
                     tracklet.entries[-1].timestamp_ns,
                     blocked_person_ids,
                 )
+            blocked_duplicate_person_ids = set()
+            if tracklet.entries:
+                blocked_duplicate_person_ids = self._find_blocked_duplicate_person_ids(
+                    tracklet.entries[-1].bbox_xyxy,
+                    blocked_person_ids,
+                )
+            recent_incompatible_person_ids = set()
+            forbidden_person_ids = set(self.track_forbidden_person_ids.get(tracklet.track_id, set()))
+            if self._has_current_identity_attribute_conflict(t_attrs, current_person_id):
+                assert current_person_id is not None
+                forbidden_person_ids.add(current_person_id)
+                self.track_forbidden_person_ids.setdefault(tracklet.track_id, set()).add(
+                    current_person_id
+                )
+                self.track_id_to_person_id.pop(tracklet.track_id, None)
+                log.warning(
+                    "current_identity_attribute_conflict_rejected",
+                    track_id=tracklet.track_id,
+                    rejected_person_id=current_person_id,
+                    tracklet_gender=t_attrs.get("gender"),
+                    person_snapshot=self.attribute_voter.person_snapshot(current_person_id),
+                )
+                current_person_id = None
+            elif current_person_id is not None:
+                forbidden_person_ids.discard(current_person_id)
+            if attrs_unreliable:
+                log.info(
+                    "attribute_incompatible_guard_skipped_occlusion",
+                    track_id=tracklet.track_id,
+                    tracklet_gender=t_attrs.get("gender"),
+                    v_avg=round(float(v_avg), 4),
+                )
+            else:
+                forbidden_person_ids.update(
+                    self._find_attribute_incompatible_person_ids(t_attrs, current_person_id)
+                )
+            # A2: temporal co-active guard — any person_id already bound to a
+            # live track in the last 600ms can't also be this tracklet.
+            forbidden_person_ids.update(
+                self._find_co_active_person_ids(
+                    tracklet.track_id,
+                    current_person_id,
+                    tracklet.entries[-1].timestamp_ns if tracklet.entries else 0,
+                )
+            )
+            static_artifact = self._should_suppress_new_identity(tracklet)
+            if static_artifact:
+                self.track_id_to_person_id.pop(tracklet.track_id, None)
+                self.track_metadata.pop(tracklet.track_id, None)
+                if hasattr(self, "tracklet_buffer"):
+                    self.tracklet_buffer.remove(tracklet.track_id)
+                log.warning(
+                    "tracklet_static_artifact_rejected",
+                    track_id=tracklet.track_id,
+                    current_person_id=current_person_id,
+                    entry_count=len(tracklet.entries),
+                )
+                return None
+            allow_new_identity = True
+            if current_person_id is None:
+                allow_new_identity = (
+                    not static_artifact
+                    and identity_shift_risk is None
+                    and not self._identity_cap_reached()
+                    and self._can_allocate_new_identity(tracklet)
+                )
+            else:
+                # A live track_id already carries temporal evidence for its
+                # assigned person. If its current crop no longer clears the
+                # gallery/continuity threshold, keep it tentative/occlusion
+                # evidence instead of minting a second person from the same
+                # tracker identity. Actual ID switches are still handled above
+                # by strong gallery matches or explicit attribute conflicts.
+                allow_new_identity = False
+            # Distinguish the two reasons minting can be denied: an actual
+            # identity cap (where falling back to capped_soft_match at the
+            # low threshold is correct) vs an unreliable tracklet
+            # (consensus failure / static-artifact suppression / cannot
+            # allocate). In the unreliable case the right thing is to
+            # defer, not to force-merge into the nearest existing person.
+            allow_capped_soft_match = self._identity_cap_reached()
+            if consensus_failed:
+                allow_new_identity = False
+            if tracklet.entries:
+                recent_incompatible_person_ids = self._find_recent_incompatible_person_ids(
+                    tracklet.entries[-1].bbox_xyxy,
+                    tracklet.entries[-1].timestamp_ns,
+                    current_person_id,
+                )
 
+            # Register the new person's attributes in attribute_voter
+            # synchronously at allocation time. Without this, concurrent
+            # _process_tracklet tasks running their conflict check between
+            # this match_tracklet's allocation and the worker's later
+            # resolve_person call would see an empty voter entry for the
+            # just-allocated pid and miss the attribute-conflict guard —
+            # leading to wrong-gender tracklets matching the new identity.
+            def _register_new_identity_attrs(new_pid: int) -> None:
+                if self._is_occlusion_attribute_unreliable(tracklet, v_avg=v_avg):
+                    return
+                try:
+                    self.attribute_voter.resolve_person(new_pid, t_attrs)
+                except Exception:
+                    log.warning("on_new_identity_register_failed", person_id=new_pid)
+
+            # PDF Bước 2: max consecutive good frames. Used as an alternative
+            # promotion signal inside the matcher when v_avg / consistency dip
+            # (the heavily-occluded boundary person scenario).
+            good_streak = _compute_max_good_streak(
+                tracklet.entries,
+                float(getattr(self.settings, "high_quality_threshold", 0.55)),
+            )
+            # PDF Bước 5 gate #2: count the high-quality frames in the full
+            # tracklet buffer (not the consensus-filtered set). The matcher
+            # enforces num_high_quality_frames >= min_high_quality_frames
+            # as one of the promote-tentative conditions; we compute it here
+            # using the same threshold as the readiness selector so both
+            # gates see the same metric.
+            high_quality_threshold = float(
+                getattr(self.settings, "high_quality_threshold", 0.55)
+            )
+            num_high_quality_frames = sum(
+                1 for entry in tracklet.entries if entry.v_score >= high_quality_threshold
+            )
             person_id = self.matcher.match_tracklet(
                 track_id=tracklet.track_id,
                 embedding=tracklet_embedding,
                 v_avg=v_avg,
                 embedding_consistency=emb_consistency,
                 tracklet_len=len(tracklet.entries),
+                num_high_quality_frames=num_high_quality_frames,
                 blocked_person_ids=blocked_person_ids,
                 current_person_id=current_person_id,
                 reuse_person_id=reuse_person_id,
+                blocked_duplicate_person_ids=blocked_duplicate_person_ids,
+                forbidden_person_ids=forbidden_person_ids,
+                recent_incompatible_person_ids=recent_incompatible_person_ids,
+                allow_new_identity=allow_new_identity,
+                allow_capped_soft_match=allow_capped_soft_match,
+                on_new_identity=_register_new_identity_attrs,
+                good_streak=good_streak,
+                allow_tentative_fallback=allow_tentative_fallback,
             )
+            pop_last_decision = getattr(self.matcher, "pop_last_decision", None)
+            matching = pop_last_decision(tracklet.track_id) if callable(pop_last_decision) else {}
+            matching = matching or {}
         except PersonIdAllocationError:
             log.error("person_id_allocation_failed", track_id=tracklet.track_id, exc_info=True)
             self.tracklet_buffer.remove(tracklet.track_id)
             return None
+
+        if person_id is None and current_person_id is None:
+            provisional_person_id, provisional_matching = self._maybe_accept_occlusion_provisional_match(
+                tracklet=tracklet,
+                matching=matching,
+                v_avg=v_avg,
+                tracklet_attrs=t_attrs,
+                forbidden_person_ids=forbidden_person_ids,
+                recent_incompatible_person_ids=recent_incompatible_person_ids,
+                blocked_person_ids=blocked_person_ids,
+            )
+            if provisional_person_id is not None:
+                person_id = provisional_person_id
+                matching = provisional_matching
 
         if (
             person_id is not None
@@ -562,6 +5146,30 @@ class WorkerPipeline:
             tracklet.state = TrackletState.MATCHED
             return person_id
 
+        if person_id is None and current_person_id is None:
+            recovery_person_id, recovery_matching = self._add_fragment_recovery_candidate(
+                tracklet=tracklet,
+                embedding=tracklet_embedding,
+                v_avg=v_avg,
+                emb_consistency=emb_consistency,
+            )
+            if recovery_matching:
+                matching = recovery_matching
+            if recovery_person_id is not None:
+                person_id = recovery_person_id
+            else:
+                provisional_person_id, provisional_matching = self._maybe_accept_occlusion_provisional_match(
+                    tracklet=tracklet,
+                    matching=matching,
+                    v_avg=v_avg,
+                    tracklet_attrs=t_attrs,
+                    forbidden_person_ids=forbidden_person_ids,
+                    recent_incompatible_person_ids=recent_incompatible_person_ids,
+                    blocked_person_ids=blocked_person_ids,
+                )
+                if provisional_person_id is not None:
+                    person_id = provisional_person_id
+                    matching = provisional_matching
 
         tracklet_id = str(uuid.uuid4())
 
@@ -570,14 +5178,50 @@ class WorkerPipeline:
             tracklet.person_id = person_id
             tracklet.state = TrackletState.MATCHED
             self.track_id_to_person_id[tracklet.track_id] = person_id
+            self._update_person_last_observation_from_tracklet(person_id, tracklet)
             reserved_person_ids.add(person_id)  # make visible to other concurrent tasks
 
+            # V23 P1: emit one attachment_decision line per match so we can trace
+            # how each tracklet's gender vote flows into a person identity.
+            try:
+                _pre_snap = self.attribute_voter.person_snapshot(person_id) or {}
+                _pre_gender, _pre_gconf = _pre_snap.get("gender", ("unknown", 0.0))
+                _pre_support = self.attribute_voter.person_task_stable_support(person_id, "gender")
+                _t_gender, _t_gconf = (t_attrs or {}).get("gender", ("unknown", 0.0))
+                _guard_thresh = float(self.settings.attribute_conflict_tracklet_confidence)
+                log.warning(
+                    "attachment_decision",
+                    track_id=tracklet.track_id,
+                    person_id=person_id,
+                    method=str(matching.get("method", "unknown")),
+                    similarity_score=matching.get("similarity_score"),
+                    runner_up_score=matching.get("runner_up_score"),
+                    margin=matching.get("margin_to_runner_up"),
+                    tracklet_gender=_t_gender,
+                    tracklet_gender_conf=round(float(_t_gconf), 3),
+                    person_gender_before=_pre_gender,
+                    person_gender_conf_before=round(float(_pre_gconf), 3),
+                    person_gender_support_before=int(_pre_support),
+                    attribute_guard_active=bool(_t_gconf >= _guard_thresh),
+                )
+            except Exception:
+                log.warning("attachment_decision_log_failed", track_id=tracklet.track_id, exc_info=True)
+
             # Resolve person-level attributes with per-task hysteresis.
-            p_attrs = self.attribute_voter.resolve_person(person_id, t_attrs)
+            is_provisional_occlusion = bool(matching.get("provisional"))
+            if is_provisional_occlusion or attrs_unreliable:
+                # Keep the tracklet/sighting evidence, but don't let a partial
+                # occlusion crop alter person-level attributes. The sighting
+                # still stores tracklet_attrs below for audit/debug.
+                p_attrs = self.attribute_voter.person_snapshot(person_id)
+            else:
+                p_attrs = self.attribute_voter.resolve_person(person_id, t_attrs)
+            p_attrs = self._mask_ambiguous_gender_conflict(p_attrs, t_attrs)
             p_gender, p_gender_conf = p_attrs.get("gender", ("unknown", 0.0))
             self.track_metadata[tracklet.track_id] = {
                 "tracklet_id": tracklet_id,
                 "tracklet_state": tracklet.state.value,
+                "snapshot_key": None,
                 "visibility_score": round(v_avg, 4),
                 "quality": {
                     "v_avg": float(round(v_avg, 4)),
@@ -585,6 +5229,7 @@ class WorkerPipeline:
                     "overall_consistency": float(round(consistency.overall, 4)),
                     "good_frame_ratio": float(round(consistency.good_frame_ratio, 4)),
                 },
+                "matching": matching,
                 # Compact label-only summary for the optional Avro `attributes` map.
                 "attributes": {task: label for task, (label, _) in p_attrs.items()},
             }
@@ -599,10 +5244,18 @@ class WorkerPipeline:
                     v_avg=v_avg,
                     emb_consistency=emb_consistency,
                     best_entry=best_entry,
+                    selected=consensus_entries,
+                    matching=matching,
                     person_attrs=p_attrs,
+                    tracklet_attrs=t_attrs,
                 )
             except Exception:
                 log.error("persistence_failed", tracklet_id=tracklet_id, exc_info=True)
+
+            person_id = await self._maybe_merge_duplicate_person(person_id)
+            tracklet.person_id = person_id
+            self.track_id_to_person_id[tracklet.track_id] = person_id
+            self._remember_track_identity(person_id, tracklet)
 
             log.info(
                 "tracklet_matched",
@@ -618,39 +5271,51 @@ class WorkerPipeline:
             # get_ready_tracklets() re-queues this tracklet on the next frame and
             # tentative attempt count increments until fallback fires.
             tracklet.state = TrackletState.ACTIVE
+            if (
+                getattr(self, "_stream_finalizing", False)
+                and allow_tentative_fallback
+                and len(tracklet.entries) >= int(getattr(self.settings, "tracklet_min_entries", 4))
+            ):
+                self.tracklet_buffer.tracklets.setdefault(tracklet.track_id, tracklet)
             tent = getattr(self.matcher, "tentative", {}).get(tracklet.track_id, {})
             log.warning("tracklet_tentative_pending",
                         track_id=tracklet.track_id,
                         attempts=tent.get("attempts", 0),
                         v_avg=round(v_avg, 4),
                         consistency=round(emb_consistency, 4))
+            self._track_inflight(asyncio.ensure_future(
+                self._persist_occlusion_candidate(
+                    tracklet,
+                    reason=str(matching.get("source") or "tentative_unconfirmed"),
+                    selected_entries=consensus_entries,
+                    embedding_consistency=emb_consistency,
+                    matching=matching,
+                )
+            ))
 
         return person_id
 
     async def _persist_tracklet(
         self, *, tracklet, tracklet_id, person_id, consistency,
-        v_avg, emb_consistency, best_entry, person_attrs,
+        v_avg, emb_consistency, best_entry, selected, matching, person_attrs,
+        tracklet_attrs=None,
     ) -> None:
         """Write to MongoDB, MinIO, and invalidate Redis — all async.
 
         ``person_attrs`` is the per-task ``{task: (label, confidence)}`` snapshot
-        from the AttributeVoter, written to ``persons.attributes.*`` and
-        ``sightings.attributes`` so the query service can filter on any of them.
+        from the AttributeVoter, written to ``persons.attributes.*``.
+
+        ``tracklet_attrs`` is the raw classifier output for THIS tracklet (before
+        voter aggregation). Stored on ``sightings.attributes`` so the per-sighting
+        gender-disagreement check in `_maybe_merge_duplicate_person` sees the
+        per-tracklet classifier evidence, not the post-voted person gender (which
+        is "unknown" for low-confidence tracklets and gives the merge guard nothing
+        to work with). Falls back to ``person_attrs`` when not supplied.
         """
         device_id = self._current_device_id
         entries = tracklet.entries
         started_at = datetime.fromtimestamp(entries[0].timestamp_ns / 1e9, tz=timezone.utc)
         ended_at = datetime.fromtimestamp(entries[-1].timestamp_ns / 1e9, tz=timezone.utc)
-
-        # Upload best crop to MinIO
-        crop_key = ""
-        if best_entry is not None and best_entry.crop.size > 0:
-            ok, buf = cv2.imencode(".jpg", best_entry.crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            if ok:
-                crop_key = await asyncio.to_thread(
-                    self.minio.upload_tracklet_snapshot, tracklet_id, buf.tobytes(),
-                )
-
         quality = {
             "v_avg": round(v_avg, 4),
             "embedding_consistency": round(emb_consistency, 4),
@@ -659,6 +5324,83 @@ class WorkerPipeline:
             "good_frame_ratio": round(consistency.good_frame_ratio, 4),
             "overall_consistency": round(consistency.overall, 4),
         }
+        selected_frame_idxs = {entry.frame_idx for entry in selected}
+        rejected_preview_idxs = {
+            entry.frame_idx
+            for entry in sorted(
+                [entry for entry in entries if entry.frame_idx not in selected_frame_idxs],
+                key=lambda e: (e.v_score, -e.overlap_ratio),
+            )[:3]
+        }
+        evidence = {
+            "selected_frame_count": len(selected_frame_idxs),
+            "selected_frame_indices": sorted(selected_frame_idxs),
+            "frame_samples": [
+                {
+                    "frame_idx": int(entry.frame_idx),
+                    "visibility_score": float(round(entry.v_score, 4)),
+                    "overlap_ratio": float(round(entry.overlap_ratio, 4)),
+                    "bbox_xyxy": [float(round(v, 2)) for v in entry.bbox_xyxy],
+                    "selected": entry.frame_idx in selected_frame_idxs,
+                    "selection_reason": (
+                        "selected_consensus_frame"
+                        if entry.frame_idx in selected_frame_idxs
+                        else (
+                            "rejected_low_visibility_preview"
+                            if entry.frame_idx in rejected_preview_idxs
+                            else "not_selected"
+                        )
+                    ),
+                    "crop_key": None,
+                }
+                for entry in entries
+            ],
+        }
+        max_snapshot_overlap = float(
+            getattr(self.settings, "person_snapshot_max_overlap_ratio", 0.35)
+        )
+        person_snapshot_entry = _choose_person_snapshot_entry(
+            entries,
+            selected,
+            max_overlap_ratio=max_snapshot_overlap,
+        )
+        snapshot_overlap_ratio = (
+            float(getattr(person_snapshot_entry, "overlap_ratio", 0.0) or 0.0)
+            if person_snapshot_entry is not None
+            else (
+                float(getattr(best_entry, "overlap_ratio", 1.0) or 1.0)
+                if best_entry is not None
+                else 1.0
+            )
+        )
+        snapshot_score = _compute_person_snapshot_score(
+            v_avg=v_avg,
+            overall_consistency=consistency.overall,
+            embedding_consistency=emb_consistency,
+            overlap_ratio=snapshot_overlap_ratio,
+        )
+        is_provisional_occlusion = bool((matching or {}).get("provisional"))
+        allow_person_snapshot = (
+            person_snapshot_entry is not None
+            and not is_provisional_occlusion
+        )
+
+        # V23 P1: log every sighting write so we can grep for the male-sighting that
+        # poisoned the woman identity.
+        _stored_attrs = tracklet_attrs if tracklet_attrs is not None else person_attrs
+        _sighting_gender, _sighting_gconf = (_stored_attrs or {}).get("gender", ("unknown", 0.0))
+        log.warning(
+            "sighting_persisted",
+            person_id=person_id,
+            tracklet_id=tracklet_id,
+            track_id=tracklet.track_id,
+            gender=_sighting_gender,
+            gender_conf=round(float(_sighting_gconf), 3),
+            quality_score=round(consistency.overall, 4),
+            entry_count=len(entries),
+            frame_start=entries[0].frame_idx,
+            frame_end=entries[-1].frame_idx,
+        )
 
         # All writes in parallel
         await asyncio.gather(
@@ -670,16 +5412,21 @@ class WorkerPipeline:
                 state=tracklet.state.value,
                 frame_start=entries[0].frame_idx,
                 frame_end=entries[-1].frame_idx,
+                frame_indices=[int(e.frame_idx) for e in entries],
                 entry_count=len(entries),
                 quality=quality,
-                matching={"similarity_score": None, "was_promoted": False},
-                best_crop_key=crop_key,
+                matching=matching,
+                evidence=evidence,
+                first_bbox_xyxy=[float(v) for v in entries[0].bbox_xyxy],
+                last_bbox_xyxy=[float(v) for v in entries[-1].bbox_xyxy],
+                best_crop_key=None,
             ),
             self.mongo.upsert_person(
                 person_id,
                 attributes=person_attrs,
                 device_id=device_id,
-                snapshot_key=crop_key or None,
+                snapshot_key=None,
+                snapshot_score=snapshot_score,
             ),
             self.mongo.add_sighting(
                 person_id=person_id,
@@ -689,8 +5436,8 @@ class WorkerPipeline:
                 ended_at=ended_at,
                 entry_count=len(entries),
                 quality_score=round(consistency.overall, 4),
-                snapshot_key=crop_key or None,
-                attributes=person_attrs,
+                snapshot_key=None,
+                attributes=tracklet_attrs if tracklet_attrs is not None else person_attrs,
             ),
             self.mongo.add_timeline_event(
                 person_id=person_id,
@@ -702,6 +5449,89 @@ class WorkerPipeline:
             return_exceptions=True,
         )
 
+        # Asset upload is secondary to person persistence. Write Mongo first so a
+        # newly-assigned identity appears in DB/UI immediately even when MinIO is
+        # slow or backlogged.
+        crop_key = ""
+        snapshot_crop = None
+        asset_entry = person_snapshot_entry or best_entry
+        if asset_entry is not None:
+            snapshot_crop = (
+                asset_entry.attribute_crop
+                if asset_entry.attribute_crop is not None and asset_entry.attribute_crop.size > 0
+                else asset_entry.crop
+            )
+        if snapshot_crop is not None and snapshot_crop.size > 0:
+            ok, buf = cv2.imencode(".jpg", snapshot_crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            if ok:
+                crop_key = await asyncio.to_thread(
+                    self.minio.upload_tracklet_snapshot, tracklet_id, buf.tobytes(),
+                )
+                if tracklet.track_id in self.track_metadata:
+                    self.track_metadata[tracklet.track_id]["snapshot_key"] = crop_key
+
+        frame_crop_keys: dict[int, str] = {}
+        for entry in entries:
+            if entry.frame_idx not in selected_frame_idxs and entry.frame_idx not in rejected_preview_idxs:
+                continue
+            if entry.crop.size <= 0:
+                continue
+            ok, buf = cv2.imencode(".jpg", entry.crop, [cv2.IMWRITE_JPEG_QUALITY, 82])
+            if not ok:
+                continue
+            frame_key = await asyncio.to_thread(
+                self.minio.upload_tracklet_frame_snapshot,
+                tracklet_id,
+                int(entry.frame_idx),
+                buf.tobytes(),
+            )
+            if frame_key:
+                frame_crop_keys[int(entry.frame_idx)] = frame_key
+
+        if crop_key or frame_crop_keys:
+            evidence_with_assets = {
+                **evidence,
+                "frame_samples": [
+                    {
+                        **sample,
+                        "crop_key": frame_crop_keys.get(int(sample["frame_idx"])),
+                    }
+                    for sample in evidence["frame_samples"]
+                ],
+            }
+            await asyncio.gather(
+                self.mongo.update_tracklet_assets(
+                    tracklet_id,
+                    best_crop_key=crop_key or None,
+                    evidence=evidence_with_assets,
+                ),
+                (
+                    self.mongo.update_person_snapshot(
+                        person_id,
+                        snapshot_key=crop_key,
+                        snapshot_score=snapshot_score,
+                    )
+                    if crop_key and allow_person_snapshot
+                    else asyncio.sleep(0)
+                ),
+                self.mongo.update_sighting_snapshot(
+                    tracklet_id,
+                    snapshot_key=crop_key,
+                ) if crop_key else asyncio.sleep(0),
+                return_exceptions=True,
+            )
+
 
 def run() -> None:
-    WorkerPipeline().run()
+    retry_delay_s = 3.0
+    while True:
+        try:
+            WorkerPipeline().run()
+            return
+        except (NoBrokersAvailable, KafkaError, OSError):
+            log.warning(
+                "worker_start_retry",
+                retry_delay_s=retry_delay_s,
+                exc_info=True,
+            )
+            time.sleep(retry_delay_s)

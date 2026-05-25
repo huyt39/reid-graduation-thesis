@@ -193,6 +193,11 @@ class EdgePipeline:
                         processed_frames=processed_frames,
                         published_messages=published_messages,
                     )
+                    self.producer.send_end_of_stream(
+                        device_id=self.settings.device_id,
+                        frame_number=frame_idx,
+                        timestamp_ns=time.time_ns(),
+                    )
                     break
 
                 frame_idx += 1
@@ -291,6 +296,7 @@ class EdgePipeline:
                             "class_id": det["class_id"],
                             "visibility_score": round(visibility_score, 4),
                             "overlap_ratio": round(overlap_ratio, 4),
+                            "visibility_tag": tag.value if hasattr(tag, "value") else str(tag),
                         }
                     )
 
