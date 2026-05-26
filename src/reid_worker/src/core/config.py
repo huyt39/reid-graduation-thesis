@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     # (global + horizontal stripes + channel branches), more robust to
     # partial-body / occluded crops. Requires INFERENCE_LMBN_WEIGHTS to be
     # set in the inference engine.
-    embedding_model: str = "osnet"
+    embedding_model: str = "lmbn"
 
     qdrant_host: str = "localhost"
     qdrant_port: int = 6333
@@ -162,6 +162,9 @@ class Settings(BaseSettings):
     untracked_detection_cluster_min_entries: int = 2
     untracked_detection_cluster_max_gap_frames: int = 15
     untracked_detection_cluster_max_center_distance_ratio: float = 0.95
+    untracked_detection_cluster_appearance_gate_enabled: bool = True
+    untracked_detection_cluster_appearance_min_visibility: float = 0.55
+    untracked_detection_cluster_appearance_min_similarity: float = 0.62
     # Sliding-window cap on per-cluster TrackletEntry retention. Each entry
     # holds a full-resolution image crop, so unbounded growth OOM-kills the
     # worker. After promotion the tracklet_buffer copy is authoritative; the
@@ -182,7 +185,7 @@ class Settings(BaseSettings):
     # gate, so 2-4 frame static/object bursts remain occlusion candidates.
     untracked_cluster_promote_min_entries_fast: int = 5
     untracked_cluster_promote_min_visibility_fast: float = 0.85
-    untracked_cluster_promote_fast_min_overall_consistency: float = 0.88
+    untracked_cluster_promote_fast_min_overall_consistency: float = 0.83
     recover_stale_tracklets_enabled: bool = True
     # Keep short occlusion fragments as evidence only by default. Promoting a
     # 2-4 frame fragment to a confirmed identity caused duplicate IDs on
@@ -272,12 +275,12 @@ class Settings(BaseSettings):
     # updates, so occluded evidence can be shown without teaching the identity
     # model from partial or boundary crops.
     occlusion_provisional_match_enabled: bool = True
-    occlusion_provisional_match_threshold: float = 0.60
+    occlusion_provisional_match_threshold: float = 0.75
     occlusion_provisional_min_margin: float = 0.03
     occlusion_provisional_short_reentry_enabled: bool = True
-    occlusion_provisional_reentry_min_similarity: float = 0.58
+    occlusion_provisional_reentry_min_similarity: float = 0.55
     occlusion_provisional_reentry_max_entries: int = 8
-    occlusion_provisional_reentry_max_gap_frames: int = 180
+    occlusion_provisional_reentry_max_gap_frames: int = 120
     occlusion_provisional_reentry_max_center_distance_ratio: float = 2.0
 
     track_high_thresh: float = 0.7
@@ -396,14 +399,14 @@ class Settings(BaseSettings):
     # identity-split signature. Video-agnostic.
     duplicate_merge_soft_split_override_threshold: float = 0.70
     duplicate_merge_soft_split_max_weak_tracklets: int = 8
-    duplicate_merge_soft_split_max_center_distance_ratio: float = 0.35
-    duplicate_merge_soft_split_duplicate_iou_threshold: float = 0.45
-    duplicate_merge_soft_split_duplicate_box_multitrack_min_score: float = 0.58
+    duplicate_merge_soft_split_max_center_distance_ratio: float = 0.15
+    duplicate_merge_soft_split_duplicate_iou_threshold: float = 0.75
+    duplicate_merge_soft_split_duplicate_box_multitrack_min_score: float = 0.78
     duplicate_merge_soft_split_spatial_only_min_score: float = 0.50
     duplicate_merge_soft_split_spatial_only_multitrack_min_score: float = 0.60
     duplicate_merge_soft_split_spatial_only_max_center_distance_ratio: float = 0.30
     duplicate_merge_overlap_spatial_duplicate_enabled: bool = True
-    duplicate_merge_overlap_spatial_duplicate_min_score: float = 0.58
+    duplicate_merge_overlap_spatial_duplicate_min_score: float = 0.78
     duplicate_merge_overlap_spatial_duplicate_max_gap_frames: int = 4
     duplicate_merge_overlap_spatial_duplicate_max_tracklets: int = 24
     duplicate_merge_overlap_spatial_duplicate_max_center_distance_ratio: float = 0.08
@@ -470,6 +473,16 @@ class Settings(BaseSettings):
     duplicate_merge_reentry_bridge_min_attr_matches: int = 2
     duplicate_merge_reentry_bridge_supported_min_score: float = 0.70
     duplicate_merge_reentry_bridge_supported_min_margin: float = 0.12
+    duplicate_merge_high_conf_reentry_enabled: bool = True
+    duplicate_merge_high_conf_reentry_min_score: float = 0.86
+    duplicate_merge_high_conf_reentry_max_tracklets: int = 8
+    duplicate_merge_high_conf_reentry_min_gap_frames: int = 30
+    duplicate_merge_high_conf_reentry_max_gap_frames: int = 120
+    duplicate_merge_high_conf_reentry_max_center_distance_ratio: float = 0.35
+    duplicate_merge_high_conf_reentry_max_size_ratio: float = 1.70
+    duplicate_merge_high_conf_reentry_max_area_ratio: float = 2.80
+    duplicate_merge_high_conf_reentry_attr_confidence: float = 0.65
+    duplicate_merge_high_conf_reentry_min_attr_matches: int = 2
     duplicate_merge_supported_spatial_reentry_enabled: bool = True
     duplicate_merge_supported_spatial_reentry_min_score: float = 0.53
     duplicate_merge_supported_spatial_reentry_max_tracklets: int = 8

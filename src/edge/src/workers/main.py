@@ -346,6 +346,8 @@ class EdgePipeline:
                     )
                     visibility_score = compute_visibility_score(subscores)
                     overlap_ratio = compute_overlap_ratio(bbox, all_bboxes)
+                    if overlap_ratio >= self.settings.hard_drop_overlap_ratio:
+                        continue
                     tag = tag_detection(
                         visibility_score,
                         good_thresh=self.settings.v_good_threshold,

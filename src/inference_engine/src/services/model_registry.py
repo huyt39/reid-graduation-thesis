@@ -348,6 +348,7 @@ class ModelRegistry:
             return emb.tolist()
         if model == "lmbn" and self.lmbn is not None:
             features = self.lmbn(tensors).mean(dim=2)
+            features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-8)
             return features.cpu().numpy().tolist()
         if self.osnet is not None:
             features = self.osnet(tensors)
@@ -368,6 +369,7 @@ class ModelRegistry:
         if model == "lmbn" and self.lmbn is not None:
             features = self.lmbn(tensor)  # [1, 512, 7]
             features = features.mean(dim=2)  # [1, 512]
+            features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-8)
             return features.cpu().numpy().flatten().tolist()
         if self.osnet is not None:
             features = self.osnet(tensor)  # [1, 512]
@@ -389,6 +391,7 @@ class ModelRegistry:
             return emb.tolist()
         if model == "lmbn" and self.lmbn is not None:
             features = self.lmbn(tensors).mean(dim=2)
+            features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-8)
         elif self.osnet is not None:
             features = self.osnet(tensors)
             features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-8)
