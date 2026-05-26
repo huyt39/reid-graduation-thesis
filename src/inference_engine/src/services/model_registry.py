@@ -262,6 +262,26 @@ class ModelRegistry:
                 path=str(standalone_gender_path) if standalone_gender_path else "",
             )
 
+        # Standalone gender classifier (PETA-trained, 88% acc). Overrides the gender
+        # head of the multi-attr model when present.
+        standalone_gender_path = _resolve_path(settings.standalone_gender_weights)
+        if standalone_gender_path.exists():
+            try:
+                from src.models.standalone_gender import StandaloneGenderModel
+                self.standalone_gender_model = StandaloneGenderModel(
+                    str(standalone_gender_path), self.device
+                )
+                log.info("model_registry.standalone_gender_loaded", path=str(standalone_gender_path))
+            except Exception as exc:
+                self.standalone_gender_model = None
+                log.warning(
+                    "model_registry.standalone_gender_load_failed",
+                    path=str(standalone_gender_path),
+                    error=str(exc),
+                )
+        else:
+            log.info("model_registry.standalone_gender_weights_missing", path=str(standalone_gender_path))
+
         # Legacy single-task gender classifier (loaded only if multi-attr is absent).
         if self.multi_attr_model is None:
             eff_path = _resolve_path(settings.efficientnet_weights) if settings.efficientnet_weights else None

@@ -126,12 +126,6 @@ class BaseApiClient {
       const requestHeaders = {
         ...this.defaultHeaders,
         ...headers,
-        ...(method === "GET"
-          ? {
-              "Cache-Control": "no-cache, no-store, must-revalidate",
-              Pragma: "no-cache",
-            }
-          : {}),
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       };
 
@@ -141,7 +135,6 @@ class BaseApiClient {
         method,
         headers: requestHeaders,
         body: body ? JSON.stringify(body) : undefined,
-        cache: method === "GET" ? "no-store" : "default",
       });
 
       if (response.status === 401 && !skipAuth) {
@@ -152,16 +145,9 @@ class BaseApiClient {
             headers: {
               ...this.defaultHeaders,
               ...headers,
-              ...(method === "GET"
-                ? {
-                    "Cache-Control": "no-cache, no-store, must-revalidate",
-                    Pragma: "no-cache",
-                  }
-                : {}),
               Authorization: `Bearer ${newToken}`,
             },
             body: body ? JSON.stringify(body) : undefined,
-            cache: method === "GET" ? "no-store" : "default",
           });
         } else {
           this.handleAuthFailure();

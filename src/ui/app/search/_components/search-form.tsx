@@ -1,81 +1,154 @@
 "use client";
 
-import { FormEvent, useMemo, useState } from "react";
-import { Search, SendHorizontal } from "lucide-react";
+import { useState } from "react";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useSearch } from "@/hooks/use-search";
 
-const EXAMPLE_QUERIES = [
-  "show me person 42",
-  "find all women last seen at camera-1",
-  "how many times did person 5 appear by hour",
-  "list all cameras",
-];
+const schema = z.object({
+  query_type: z.string().min(1),
+  gender: z.string().optional(),
+  device_id: z.string().optional(),
+  start_time: z.string().optional(),
+  end_time: z.string().optional(),
+});
 
-function JsonBlock({ value }: { value: unknown }) {
-  const text = useMemo(() => JSON.stringify(value ?? null, null, 2), [value]);
-  return (
-    <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/50 p-3 text-sm leading-relaxed font-sans">
-      {text}
-    </pre>
-  );
-}
+type FormValues = z.infer<typeof schema>;
+
+const QUERY_TYPES = ["person_count", "device_activity", "gender_distribution"];
 
 export function SearchForm() {
-  const [query, setQuery] = useState("");
-  const [submittedQuery, setSubmittedQuery] = useState("");
-  const { result, isLoading, error, runNatural } = useSearch();
+  const [submitted, setSubmitted] = useState(false);
+  const { result, isLoading, error, run } = useSearch();
 
-  async function onSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const cleaned = query.trim();
-    if (!cleaned || isLoading) return;
-    setSubmittedQuery(cleaned);
-    await runNatural(cleaned);
+  const form = useForm<FormValues>({
+    resolver: zodResolver(schema),
+    defaultValues: { query_type: QUERY_TYPES[0] },
+  });
+
+  async function onSubmit(values: FormValues) {
+    setSubmitted(true);
+    const { query_type, ...params } = values;
+    const cleaned = Object.fromEntries(
+      Object.entries(params).filter(([, v]) => v !== "" && v !== undefined)
+    );
+    await run(query_type, cleaned);
   }
 
   return (
-    <div className="grid gap-6 lg:grid-cols-[minmax(360px,480px)_1fr]">
+    <div className="grid gap-6 lg:grid-cols-[420px_1fr]">
       <Card>
         <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            <Search className="h-4 w-4" />
-            Natural query
-          </CardTitle>
+          <CardTitle className="text-base">Structured query</CardTitle>
         </CardHeader>
         <CardContent>
-          <form onSubmit={onSubmit} className="space-y-4">
-            <textarea
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Ask about persons, cameras, timelines, or sightings..."
-              rows={5}
-              className="border-input bg-background ring-offset-background placeholder:text-muted-foreground focus-visible:ring-ring min-h-32 w-full resize-none rounded-md border px-3 py-2 text-sm outline-none transition-[color,box-shadow] focus-visible:ring-2 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-            />
-            <Button
-              type="submit"
-              disabled={isLoading || query.trim().length === 0}
-              className="w-full"
-            >
-              <SendHorizontal className="h-4 w-4" />
-              {isLoading ? "Running..." : "Run query"}
-            </Button>
-          </form>
-
-          <div className="mt-5 space-y-2">
-            {EXAMPLE_QUERIES.map((example) => (
-              <button
-                key={example}
-                type="button"
-                onClick={() => setQuery(example)}
-                className="hover:bg-muted block w-full rounded-md border px-3 py-2 text-left text-sm transition-colors"
-              >
-                {example}
-              </button>
-            ))}
-          </div>
+          <Form {...form}>
+            <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+              <FormField
+                control={form.control}
+                name="query_type"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Query type</FormLabel>
+                    <Select onValueChange={field.onChange} value={field.value}>
+                      <FormControl>
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent>
+                        {QUERY_TYPES.map((q) => (
+                          <SelectItem key={q} value={q}>
+                            {q}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="gender"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Gender (optional)</FormLabel>
+                    <FormControl>
+                      <Input placeholder="male / female" {...field} />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="device_id"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Device ID (optional)</FormLabel>
+                    <FormControl>
+                      <Input placeholder="cam-01" {...field} />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <div className="grid grid-cols-2 gap-3">
+                <FormField
+                  control={form.control}
+                  name="start_time"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Start</FormLabel>
+                      <FormControl>
+                        <Input type="datetime-local" {...field} />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={form.control}
+                  name="end_time"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>End</FormLabel>
+                      <FormControl>
+                        <Input type="datetime-local" {...field} />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+              <Button type="submit" disabled={isLoading} className="w-full">
+                <Search className="h-4 w-4" />
+                {isLoading ? "Running..." : "Run query"}
+              </Button>
+            </form>
+          </Form>
         </CardContent>
       </Card>
 
@@ -83,44 +156,19 @@ export function SearchForm() {
         <CardHeader>
           <CardTitle className="text-base">Result</CardTitle>
         </CardHeader>
-        <CardContent className="space-y-4">
+        <CardContent>
           {isLoading ? (
             <Skeleton className="h-48 w-full" />
           ) : error ? (
             <p className="text-destructive text-sm">{error}</p>
-          ) : !result ? (
+          ) : !submitted ? (
             <p className="text-sm text-muted-foreground">
-              Enter a natural-language query and run it to inspect the parsed query and database
-              result.
+              Configure a query on the left and run it to see results.
             </p>
           ) : (
-            <>
-              <div className="rounded-md border p-3">
-                <div className="text-muted-foreground text-xs font-medium uppercase tracking-wide">
-                  Query
-                </div>
-                <div className="mt-1 text-sm">{submittedQuery}</div>
-              </div>
-
-              {result.summary ? (
-                <div className="rounded-md border p-3">
-                  <div className="text-muted-foreground text-xs font-medium uppercase tracking-wide">
-                    Summary
-                  </div>
-                  <p className="mt-1 text-sm leading-relaxed">{result.summary}</p>
-                </div>
-              ) : null}
-
-              <div>
-                <div className="mb-2 text-sm font-medium">Parsed query</div>
-                <JsonBlock value={result.parsed_query ?? null} />
-              </div>
-
-              <div>
-                <div className="mb-2 text-sm font-medium">Database result</div>
-                <JsonBlock value={result.result ?? result} />
-              </div>
-            </>
+            <pre className="text-xs bg-muted/50 rounded-md p-3 overflow-auto max-h-[480px]">
+              {JSON.stringify(result, null, 2)}
+            </pre>
           )}
         </CardContent>
       </Card>

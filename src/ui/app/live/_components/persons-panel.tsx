@@ -33,16 +33,7 @@ function stateLabel(state: string | null): string {
   if (!state) return "";
   if (state === "confirmed") return "✓";
   if (state === "tentative") return "~";
-  if (state === "raw_edge") return "R";
   return state.slice(0, 1).toUpperCase();
-}
-
-function getPersonDisplayLabel(person: TrackedPerson): string {
-  if (person.tracklet_state === "tentative") {
-    return person.track_id != null ? `T#${person.track_id}` : "?";
-  }
-  if (person.person_id === null) return "Raw";
-  return `#${person.person_id}`;
 }
 
 function collectAttributeBadges(person: TrackedPerson): string[] {
@@ -83,41 +74,32 @@ export function PersonsPanel({ persons }: { persons: TrackedPerson[] }) {
         )}
         {persons.map((p) => {
           const isTentative = p.tracklet_state === "tentative";
-          const isRaw = p.person_id === null;
           const badges = collectAttributeBadges(p);
-          const status =
-            p.status ?? (isTentative ? "tentative" : isRaw ? "recovering" : "confirmed");
-          const displayLabel = getPersonDisplayLabel(p);
+          const status = p.status ?? (isTentative ? "tentative" : "confirmed");
           return (
             <Card
-              key={`${p.live_track_key ?? p.tracklet_id ?? p.person_id ?? "raw"}-${p.bbox.join("-")}`}
+              key={`${p.person_id}-${p.tracklet_id ?? ""}`}
               className={cn("py-3 gap-2", isTentative && "opacity-60")}
             >
               <CardContent className="grid grid-cols-[52px_minmax(0,1fr)] gap-3 px-3">
                 <PersonSnapshot
                   src={p.snapshot_url}
-                  alt={`Tracked person ${p.person_id ?? "raw"}`}
-                  label={displayLabel}
+                  alt={`Tracked person ${p.person_id}`}
+                  label={isTentative ? "?" : `#${p.person_id}`}
                   className="h-[72px] w-[52px] rounded-md"
-                  previewTitle={
-                    isRaw ? "Raw detection crop unavailable" : `Tracked person ${displayLabel}`
-                  }
                 />
                 <div className="space-y-1 text-xs">
                   <CardTitle className="flex items-center justify-between text-sm">
                     <div className="flex items-center gap-2">
                       <span className={cn("font-semibold", isTentative && "text-muted-foreground")}>
-                        {displayLabel}
+                        {isTentative ? "?" : `#${p.person_id}`}
                         {p.tracklet_state && !isTentative && (
                           <span className="ml-1 text-xs text-muted-foreground">
                             {stateLabel(p.tracklet_state)}
                           </span>
                         )}
                       </span>
-                      <Badge
-                        variant="outline"
-                        className={cn("text-[10px]", getStatusClasses(status))}
-                      >
+                      <Badge variant="outline" className={cn("text-[10px]", getStatusClasses(status))}>
                         {getLiveStatusLabel(status)}
                       </Badge>
                     </div>
@@ -135,9 +117,7 @@ export function PersonsPanel({ persons }: { persons: TrackedPerson[] }) {
                     <>
                       <div className="flex items-center justify-between">
                         <span className="text-muted-foreground">tracklet vis</span>
-                        <span className="text-muted-foreground">
-                          {formatDecimal(p.quality.v_avg)}
-                        </span>
+                        <span className="text-muted-foreground">{formatDecimal(p.quality.v_avg)}</span>
                       </div>
                       <div className="flex items-center justify-between">
                         <span className="text-muted-foreground">consist</span>
@@ -155,19 +135,15 @@ export function PersonsPanel({ persons }: { persons: TrackedPerson[] }) {
                   )}
                   <div className="flex items-center justify-between">
                     <span className="text-muted-foreground">overlap</span>
-                    <span className={visClass(1 - p.overlap_ratio)}>
-                      {formatPct(p.overlap_ratio)}
-                    </span>
+                    <span className={visClass(1 - p.overlap_ratio)}>{formatPct(p.overlap_ratio)}</span>
                   </div>
                   <p className="pt-1 text-[11px] leading-4 text-muted-foreground">
-                    {isRaw
-                      ? "Raw edge detection. ReID evidence and identity assignment are not available yet."
-                      : buildLiveEvidenceSummary(
-                          p.matching,
-                          p.quality,
-                          p.live_visibility_score,
-                          p.overlap_ratio
-                        )}
+                    {buildLiveEvidenceSummary(
+                      p.matching,
+                      p.quality,
+                      p.live_visibility_score,
+                      p.overlap_ratio
+                    )}
                   </p>
                   {badges.length > 0 && (
                     <div className="flex flex-wrap gap-1 pt-1">

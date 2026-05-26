@@ -33,20 +33,11 @@ export function describeMatchMethod(matching: LiveMatching): string {
       return "Recovered after tentative fallback";
     case "tentative_soft_match":
       return "Recovered by soft match";
-    case "soft_match_at_promotion":
-      return "Recovered by soft match before new ID";
-    case "ambiguous_resolved":
-      return "Resolved after ambiguous retries";
     case "current_identity_maintained":
       return "Maintained current identity";
-    case "current_identity_rejected":
-      return "Rejected track continuity mismatch";
-    case "new_identity_suppressed":
-      return "Suppressed as likely static artifact";
     case "new_identity":
       if (matching.source === "tentative_promoted") return "Promoted from tentative track";
       if (matching.source === "tentative_fallback") return "Created after fallback";
-      if (matching.source === "ambiguous_fallback") return "Created after ambiguous fallback";
       return "Created from strong tracklet evidence";
     case "ambiguous_rejected":
       return "Held due to ambiguous gallery match";
@@ -126,15 +117,9 @@ export function summarizeTracklets(tracklets: Tracklet[]): {
     tracklets.reduce((sum, tracklet) => sum + (tracklet.quality.good_frame_ratio || 0), 0) /
     tracklets.length;
   const recoveryCount = tracklets.filter((tracklet) =>
-    [
-      "spatial_appearance_reuse",
-      "recent_person_reuse",
-      "recent_person_reuse_after_fallback",
-      "tentative_soft_match",
-      "soft_match_at_promotion",
-      "ambiguous_resolved",
-      "current_identity_maintained",
-    ].includes(tracklet.matching.method)
+    ["spatial_appearance_reuse", "recent_person_reuse", "recent_person_reuse_after_fallback", "tentative_soft_match"].includes(
+      tracklet.matching.method
+    )
   ).length;
   const highQualityCount = tracklets.filter(
     (tracklet) => tracklet.quality.overall_consistency >= 0.7

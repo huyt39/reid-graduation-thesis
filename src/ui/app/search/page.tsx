@@ -8,7 +8,7 @@ export default function SearchPage() {
         <div>
           <h2 className="text-2xl font-semibold tracking-tight">Search</h2>
           <p className="text-sm text-muted-foreground">
-            Ask the ReID query service in natural language and inspect the parsed database query.
+            Run structured queries against the ReID query service.
           </p>
         </div>
         <SearchForm />

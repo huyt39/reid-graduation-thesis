@@ -10,7 +10,6 @@ import {
   Camera,
   Search,
   Clock,
-  ShieldCheck,
   LogOut,
   Menu,
   Video,
@@ -43,7 +42,6 @@ interface NavItem {
 const NAV_ITEMS: NavItem[] = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { href: "/live", label: "Live", icon: Video },
-  { href: "/occlusion", label: "Occlusion", icon: ShieldCheck },
   { href: "/persons", label: "Persons", icon: Users },
   { href: "/devices", label: "Devices", icon: Camera },
   { href: "/search", label: "Search", icon: Search },
