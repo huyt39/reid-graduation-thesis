@@ -11,6 +11,8 @@ class FrameData:
     tracked_persons: list[dict]
     created_at: int
     image_base64: str
+    image_width: int | None = None
+    image_height: int | None = None
     schema_version: int = 2
     source: str = "processed"
 

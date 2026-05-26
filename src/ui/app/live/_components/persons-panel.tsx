@@ -38,7 +38,9 @@ function stateLabel(state: string | null): string {
 }
 
 function getPersonDisplayLabel(person: TrackedPerson): string {
-  if (person.tracklet_state === "tentative") return "?";
+  if (person.tracklet_state === "tentative") {
+    return person.track_id != null ? `T#${person.track_id}` : "?";
+  }
   if (person.person_id === null) return "Raw";
   return `#${person.person_id}`;
 }
@@ -88,7 +90,7 @@ export function PersonsPanel({ persons }: { persons: TrackedPerson[] }) {
           const displayLabel = getPersonDisplayLabel(p);
           return (
             <Card
-              key={`${p.person_id ?? "raw"}-${p.tracklet_id ?? p.bbox.join("-")}`}
+              key={`${p.live_track_key ?? p.tracklet_id ?? p.person_id ?? "raw"}-${p.bbox.join("-")}`}
               className={cn("py-3 gap-2", isTentative && "opacity-60")}
             >
               <CardContent className="grid grid-cols-[52px_minmax(0,1fr)] gap-3 px-3">

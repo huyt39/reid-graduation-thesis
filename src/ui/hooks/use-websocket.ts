@@ -22,6 +22,8 @@ export interface TrackedPerson {
   sleeve_confidence?: number;
   lower?: string;
   lower_confidence?: number;
+  track_id: number | null;
+  live_track_key: string | null;
   tracklet_id: string | null;
   tracklet_state: string | null;
   snapshot_url?: string | null;
@@ -56,6 +58,8 @@ export interface FrameUpdate {
   tracked_persons: TrackedPerson[];
   created_at: number;
   image_base64: string;
+  image_width: number | null;
+  image_height: number | null;
 }
 
 export type ConnectionState = "connecting" | "connected" | "disconnected";
@@ -123,6 +127,8 @@ function normalizeTrackedPerson(raw: unknown): TrackedPerson {
     sleeve_confidence: asNumber(person.sleeve_confidence),
     lower: asOptionalString(person.lower) ?? undefined,
     lower_confidence: asNumber(person.lower_confidence),
+    track_id: typeof person.track_id === "number" ? person.track_id : null,
+    live_track_key: asOptionalString(person.live_track_key),
     tracklet_id: asOptionalString(person.tracklet_id),
     tracklet_state: asOptionalString(person.tracklet_state),
     snapshot_url: asOptionalString(person.snapshot_url),
@@ -182,6 +188,8 @@ function normalizeFrameUpdate(raw: Record<string, unknown>): FrameUpdate {
     tracked_persons: trackedPersonsRaw.map(normalizeTrackedPerson),
     created_at: asNumber(raw.created_at),
     image_base64: asString(raw.image_base64),
+    image_width: typeof raw.image_width === "number" ? raw.image_width : null,
+    image_height: typeof raw.image_height === "number" ? raw.image_height : null,
   };
 }
 

@@ -1,4 +1,90 @@
-# Plan v5: Tune YOLO/encode env (pha 5a) — refactor async capture conditional (pha 5b)
+# Plan v6: Fix letterbox/aspect flicker — LiveFeed Card stretched by PersonsPanel
+
+## Context (v6 — current)
+
+User báo: "ở một số frame xuất hiện viền đen ở trên hoặc dưới, khiến kích thước frame thu nhỏ lại hoặc to ra". Đây **không phải FPS giật** (FPS đã ok ở v5a), mà là **aspect ratio của khung hiển thị thay đổi** giữa các frame ⇒ `object-contain` của `<img>` tạo letterbox khác nhau.
+
+### Root cause (đã verify đọc 2 file)
+
+**`src/ui/app/live/_components/live-view.tsx:99`** — layout cha:
+```tsx
+<div className="flex flex-col lg:flex-row gap-4">
+  <PersonsPanel ... />
+  <LiveFeed frame={...} ... />
+</div>
+```
+Không có `items-start` ⇒ default `align-items: stretch` ⇒ LiveFeed Card bị **stretch height** theo sibling cao nhất.
+
+**`src/ui/app/live/_components/persons-panel.tsx:72`** — sibling PersonsPanel:
+```tsx
+<aside className="w-full lg:w-72 shrink-0 flex flex-col gap-3">
+```
+Width cố định `w-72` (288px) ⇒ LiveFeed width KHÔNG đổi. Nhưng aside KHÔNG có `max-h` ⇒ height tăng theo số person cards (inner `overflow-y-auto` ở line 78 không hoạt động vì outer không có constraint chiều cao).
+
+**`src/ui/app/live/_components/live-feed.tsx:135`** — LiveFeed Card:
+```tsx
+<Card className="flex-1 relative overflow-hidden bg-black p-0 min-h-[400px]">
+  <img className="w-full h-full object-contain" ... />
+```
+`flex-1 min-h-[400px]` không cố định aspect. Height = `max(400px, stretched-by-sibling)`.
+
+**Chuỗi nhân quả**: nhiều người vào cảnh ⇒ PersonsPanel cao hơn ⇒ stretch LiveFeed Card cao hơn ⇒ Card aspect ratio (W/H) giảm ⇒ `<img>` (video 16:9) `object-contain` ⇒ width bị giới hạn bởi height, image scale down ⇒ **viền đen trên/dưới to ra, frame thu nhỏ**. Khi người rời cảnh ⇒ ngược lại.
+
+Secondary cause (chưa chắc có ảnh hưởng nhưng đáng note): raw stream (size 720, encode_preview_max=720) và processed stream (native size, worker không resize) có dimensions khác nhau. UI ưu tiên rawFrame nên khi cả 2 có frame, baseFrame luôn = raw ⇒ KHÔNG switch ⇒ secondary cause không trigger trong flow bình thường. Bỏ qua pha này.
+
+### Fix
+
+File: `src/ui/app/live/_components/live-feed.tsx`
+
+Đổi:
+```tsx
+<Card className="flex-1 relative overflow-hidden bg-black p-0 min-h-[400px]">
+```
+thành:
+```tsx
+<Card className="flex-1 relative overflow-hidden bg-black p-0 aspect-video">
+```
+
+`aspect-video` (= 16/9) ⇒ Card height = width × 9/16, **không còn phụ thuộc PersonsPanel**. Image `object-contain` 16:9 video sẽ fit perfectly không letterbox.
+
+Bonus (cũng nhỏ, gộp luôn): thêm `items-start` vào parent flex ở `live-view.tsx:99` để defensive — phòng trường hợp aspect-video không đủ (vd dùng grid layout sau).
+
+File: `src/ui/app/live/_components/live-view.tsx`
+
+```diff
+- <div className="flex flex-col lg:flex-row gap-4">
++ <div className="flex flex-col lg:flex-row gap-4 lg:items-start">
+```
+
+### Trade-off + note
+
+- `aspect-video` giả định video 16:9. Nếu user dùng video 4:3 hoặc dọc thì sẽ có letterbox **consistent** (không nhấp nháy). Không phải xấu — vẫn ổn định.
+- Nếu user muốn aspect động theo video, có thể đo `img.naturalWidth/naturalHeight` ở first load và set inline style `aspectRatio`. Phức tạp hơn, làm sau nếu cần.
+- PersonsPanel height vẫn growing — sẽ bị overflow vertically dưới Card. Cosmetic issue khác, có thể fix riêng bằng `max-h-[80vh] overflow-y-auto` trên aside. Note nhưng không bắt buộc pha này.
+
+## Critical files
+
+- `src/ui/app/live/_components/live-feed.tsx` — thay `min-h-[400px]` bằng `aspect-video`.
+- `src/ui/app/live/_components/live-view.tsx` — thêm `lg:items-start`.
+
+## Verification
+
+1. Rebuild UI: `docker compose -f src/deploy/docker-compose.yml up -d --build ui` (UI rebuild ~30s).
+2. Mở `http://localhost:3000/live`. Quan sát:
+   - LiveFeed Card luôn 16:9 aspect.
+   - Khi người vào/ra cảnh, **kích thước frame không đổi**, viền đen (nếu có) constant.
+   - UI badge FPS vẫn hiển thị bình thường.
+3. Test ≥2 video khác nhau (vắng + đông người) để verify stability.
+
+## Out of scope
+
+- Resize processed stream về 720 ở worker (giải quyết cause secondary).
+- PersonsPanel max-h + scroll (cosmetic riêng).
+- Async capture loop pha 5b (đã out of scope từ v5 vì user đã đạt mục tiêu FPS).
+
+---
+
+# Plan v5: Tune YOLO/encode env (pha 5a) — refactor async capture conditional (pha 5b) (đã apply)
 
 ## Context (v5 — current)
 

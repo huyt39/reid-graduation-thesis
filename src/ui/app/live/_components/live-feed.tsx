@@ -57,12 +57,12 @@ function drawOverlay(canvas: HTMLCanvasElement, img: HTMLImageElement, persons: 
     const isTentative = p.tracklet_state === "tentative";
     const status = p.status ?? (isTentative ? "tentative" : "confirmed");
     const color =
-      p.person_id != null
-        ? personColor(p.person_id)
-        : status === "recovering"
-          ? "#f59e0b"
-          : isTentative
-            ? "#94a3b8"
+      isTentative
+        ? "#94a3b8"
+        : p.person_id != null
+          ? personColor(p.person_id)
+          : status === "recovering"
+            ? "#f59e0b"
             : visColor(p.live_visibility_score);
 
     ctx.strokeStyle = color;
@@ -75,7 +75,9 @@ function drawOverlay(canvas: HTMLCanvasElement, img: HTMLImageElement, persons: 
     ctx.fillRect(rx1, ry1, bw, bh);
 
     const label = isTentative
-      ? "?"
+      ? p.track_id != null
+        ? `T#${p.track_id}`
+        : "?"
       : p.person_id === null
         ? `raw ${Math.max(p.confidence, p.live_visibility_score).toFixed(2)}`
         : `#${p.person_id} ${getLiveStatusLabel(status)} ${p.live_visibility_score.toFixed(2)}`;
@@ -150,7 +152,7 @@ export function LiveFeed({ frame, isLiveActive }: Props) {
 
   if (!isLiveActive) {
     return (
-      <Card className="flex-1 flex items-center justify-center min-h-[400px]">
+      <Card className="flex-1 flex items-center justify-center aspect-video">
         <p className="text-muted-foreground text-sm">
           Live stream is paused. Press Start live to begin.
         </p>
@@ -160,14 +162,14 @@ export function LiveFeed({ frame, isLiveActive }: Props) {
 
   if (!frame) {
     return (
-      <Card className="flex-1 flex items-center justify-center min-h-[400px]">
+      <Card className="flex-1 flex items-center justify-center aspect-video">
         <p className="text-muted-foreground text-sm">Waiting for frames…</p>
       </Card>
     );
   }
 
   return (
-    <Card className="flex-1 relative overflow-hidden bg-black p-0 min-h-[400px]">
+    <Card className="flex-1 relative overflow-hidden bg-black p-0 aspect-video">
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img
         ref={imgRef}

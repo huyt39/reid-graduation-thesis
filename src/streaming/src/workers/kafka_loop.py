@@ -14,6 +14,43 @@ from src.services.minio_urls import MinIOURLBuilder
 logger = structlog.get_logger()
 
 
+def _jpeg_dimensions(image_bytes: bytes) -> tuple[int | None, int | None]:
+    if len(image_bytes) < 4 or image_bytes[:2] != b"\xff\xd8":
+        return None, None
+    idx = 2
+    size = len(image_bytes)
+    while idx + 9 < size:
+        if image_bytes[idx] != 0xFF:
+            idx += 1
+            continue
+        while idx < size and image_bytes[idx] == 0xFF:
+            idx += 1
+        if idx >= size:
+            break
+        marker = image_bytes[idx]
+        idx += 1
+        if marker in {0xD8, 0xD9}:
+            continue
+        if idx + 2 > size:
+            break
+        segment_len = int.from_bytes(image_bytes[idx:idx + 2], "big")
+        if segment_len < 2 or idx + segment_len > size:
+            break
+        if marker in {
+            0xC0, 0xC1, 0xC2, 0xC3,
+            0xC5, 0xC6, 0xC7,
+            0xC9, 0xCA, 0xCB,
+            0xCD, 0xCE, 0xCF,
+        }:
+            if segment_len >= 7:
+                height = int.from_bytes(image_bytes[idx + 3:idx + 5], "big")
+                width = int.from_bytes(image_bytes[idx + 5:idx + 7], "big")
+                return width, height
+            break
+        idx += segment_len
+    return None, None
+
+
 async def run_kafka_loop(
     consumer: StreamingKafkaConsumer,
     frame_cache: FrameCache,
@@ -137,6 +174,7 @@ def _decode_frame(
         # Pass-through: edge already encoded JPEG. Re-decoding + re-encoding
         # here would waste CPU and add no quality (edge controls quality).
         image_base64 = base64.b64encode(image_bytes).decode("ascii")
+        image_width, image_height = _jpeg_dimensions(image_bytes)
 
         tracked_persons = msg.get("tracked_persons")
         if tracked_persons is None:
@@ -147,6 +185,8 @@ def _decode_frame(
                     "confidence": det.get("confidence", 0.0),
                     "gender": "raw",
                     "gender_confidence": 0.0,
+                    "track_id": None,
+                    "live_track_key": None,
                     "tracklet_id": None,
                     "tracklet_state": "raw_edge",
                     "snapshot_key": None,
@@ -174,6 +214,8 @@ def _decode_frame(
             tracked_persons=tracked_persons,
             created_at=msg["created_at"],
             image_base64=image_base64,
+            image_width=image_width,
+            image_height=image_height,
             schema_version=int(msg.get("schema_version", 2)),
             source=source,
         )

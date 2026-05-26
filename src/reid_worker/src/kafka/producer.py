@@ -66,6 +66,8 @@ class WorkerKafkaProducer:
             "person_id": int(person["person_id"]),
             "bbox": [float(v) for v in person["bbox"]],
             "confidence": float(person["confidence"]),
+            "track_id": None if person.get("track_id") is None else int(person.get("track_id")),
+            "live_track_key": person.get("live_track_key"),
             "tracklet_id": person.get("tracklet_id"),
             "tracklet_state": person.get("tracklet_state"),
             "snapshot_key": person.get("snapshot_key"),

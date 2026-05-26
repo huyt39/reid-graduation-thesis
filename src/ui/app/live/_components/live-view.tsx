@@ -1,11 +1,16 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Pause, Play } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useWebSocket } from "@/hooks/use-websocket";
-import { mergeRawWithProcessedIds } from "@/lib/match-bboxes";
+import {
+  getCachedLiveIdentities,
+  mergeRawWithProcessedIds,
+  updateLiveIdentityCache,
+  type LiveIdentityCacheEntry,
+} from "@/lib/match-bboxes";
 import { DeviceSelector } from "./device-selector";
 import { ConnectionBadge } from "./connection-badge";
 import { LiveFeed } from "./live-feed";
@@ -16,6 +21,7 @@ const WS_URL = process.env.NEXT_PUBLIC_STREAMING_WS || "ws://localhost:8765";
 export function LiveView() {
   const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
   const [isLiveActive, setIsLiveActive] = useState(true);
+  const identityCacheRef = useRef(new Map<string, LiveIdentityCacheEntry>());
 
   const processed = useWebSocket(`${WS_URL}/ws`, selectedDevice, {
     enabled: isLiveActive,
@@ -38,10 +44,45 @@ export function LiveView() {
   // Hybrid: raw bboxes (match the image) + processed person_ids/attributes
   // (real IDs) via IoU projection. PersonsPanel keeps using pure processed
   // data so attribute hysteresis isn't affected.
-  const hybridTrackedPersons =
-    rawFrame && processedFrame
-      ? mergeRawWithProcessedIds(rawFrame.tracked_persons, processedFrame.tracked_persons)
-      : (baseFrame?.tracked_persons ?? []);
+  const hybridTrackedPersons = useMemo(() => {
+    const now = Date.now();
+    if (processedFrame) {
+      updateLiveIdentityCache(
+        identityCacheRef.current,
+        processedFrame.tracked_persons,
+        processedFrame.frame_number,
+        now
+      );
+    }
+    if (!rawFrame || !processedFrame) return baseFrame?.tracked_persons ?? [];
+
+    const currentKeys = new Set(
+      processedFrame.tracked_persons
+        .map((person) => person.live_track_key ?? person.tracklet_id)
+        .filter((key): key is string => typeof key === "string")
+    );
+    const cachedPersons = getCachedLiveIdentities(
+      identityCacheRef.current,
+      rawFrame.frame_number,
+      now
+    ).filter((person) => {
+      const key = person.live_track_key ?? person.tracklet_id;
+      return !key || !currentKeys.has(key);
+    });
+
+    return mergeRawWithProcessedIds(rawFrame.tracked_persons, processedFrame.tracked_persons, {
+      cachedPersons,
+      minIou: 0.35,
+      sourceSize: {
+        width: processedFrame.image_width,
+        height: processedFrame.image_height,
+      },
+      targetSize: {
+        width: rawFrame.image_width,
+        height: rawFrame.image_height,
+      },
+    });
+  }, [baseFrame?.tracked_persons, processedFrame, rawFrame]);
   const currentFrame = baseFrame ? { ...baseFrame, tracked_persons: hybridTrackedPersons } : null;
   const persons = currentFrame?.tracked_persons ?? [];
   const idLagFrames =
@@ -96,7 +137,7 @@ export function LiveView() {
         </div>
       ) : null}
 
-      <div className="flex flex-col lg:flex-row gap-4">
+      <div className="flex flex-col lg:flex-row gap-4 lg:items-start">
         <PersonsPanel persons={isLiveActive ? persons : []} />
         <LiveFeed frame={currentFrame} isLiveActive={isLiveActive} />
       </div>

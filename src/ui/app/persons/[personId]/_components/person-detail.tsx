@@ -271,9 +271,16 @@ function EvidenceTab({ tracklets, isLoading }: { tracklets: Tracklet[]; isLoadin
                 </div>
                 <Badge
                   variant="outline"
-                  className={cn("text-[11px]", getStatusClasses("confirmed"))}
+                  className={cn(
+                    "text-[11px]",
+                    getStatusClasses(
+                      tracklet.state === "occlusion_attached" ? "recovering" : "confirmed"
+                    )
+                  )}
                 >
-                  {getTrackletConfidenceLabel(tracklet.quality)}
+                  {tracklet.state === "occlusion_attached"
+                    ? "Occlusion evidence"
+                    : getTrackletConfidenceLabel(tracklet.quality)}
                 </Badge>
                 <Badge variant="secondary">{tracklet.device_id}</Badge>
               </div>

@@ -429,6 +429,22 @@ class MongoPersonStore:
     async def count_tracklets(self, person_id: int) -> int:
         return await self._db[self.TRACKLETS].count_documents({"person_id": person_id})
 
+    async def count_canonical_tracklets(self, person_id: int) -> int:
+        """Count person evidence that is allowed to anchor identity merges.
+
+        Occlusion-attached/provisional rows are useful ReID evidence, but they
+        are intentionally not canonical anchors. Counting them as support makes
+        weak occlusion bridges overconfident and can collapse two established
+        people into one ID.
+        """
+        return await self._db[self.TRACKLETS].count_documents(
+            {
+                "person_id": person_id,
+                "state": {"$ne": "occlusion_attached"},
+                "matching.provisional": {"$ne": True},
+            }
+        )
+
     async def list_recent_person_ids(self, limit: int = 50) -> list[int]:
         cursor = self._db[self.PERSONS].find(
             {"is_active": {"$ne": False}},
