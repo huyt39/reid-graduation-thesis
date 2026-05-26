@@ -77,6 +77,10 @@ class QueryExecutor:
             mongo_query["attributes.gender"] = filters.gender
         if filters.gender_confidence_min is not None:
             mongo_query["attributes.gender_confidence"] = {"$gte": filters.gender_confidence_min}
+        for attr in ("age_child", "backpack", "sidebag", "hat", "glasses", "sleeve", "lower"):
+            value = getattr(filters, attr)
+            if value:
+                mongo_query[f"attributes.{attr}"] = value
         if filters.last_seen_device:
             mongo_query["stats.last_seen_device"] = filters.last_seen_device
         if filters.first_seen_after:

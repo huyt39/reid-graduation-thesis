@@ -10,6 +10,7 @@ from src.schemas.query import (
     PersonResponse,
     PaginatedPersonsResponse,
     PaginatedSightingsResponse,
+    PaginatedTrackletsResponse,
     PaginatedTimelineResponse,
     SimilarPersonsResponse,
     )
@@ -19,6 +20,21 @@ router = APIRouter(prefix="/persons", tags=["persons"])
 def _attach_snapshot_url(item: dict, minio_urls) -> dict:
     enriched = dict(item)
     enriched["snapshot_url"] = minio_urls.presigned_url(item.get("snapshot_key"))
+    return enriched
+
+
+def _attach_best_crop_url(item: dict, minio_urls) -> dict:
+    enriched = dict(item)
+    enriched["best_crop_url"] = minio_urls.presigned_url(item.get("best_crop_key"))
+    evidence = dict(enriched.get("evidence") or {})
+    frame_samples = []
+    for sample in evidence.get("frame_samples") or []:
+        enriched_sample = dict(sample)
+        enriched_sample["crop_url"] = minio_urls.presigned_url(enriched_sample.get("crop_key"))
+        enriched_sample.pop("crop_key", None)
+        frame_samples.append(enriched_sample)
+    evidence["frame_samples"] = frame_samples
+    enriched["evidence"] = evidence
     return enriched
 
 
@@ -84,6 +100,23 @@ async def get_sightings(
         skip=(page - 1) * page_size, limit=page_size,
     )
     enriched_items = [_attach_snapshot_url(item, minio_urls) for item in items]
+    return {"items": enriched_items, "total": total, "page": page, "page_size": page_size}
+
+
+@router.get("/{person_id}/tracklets", response_model = PaginatedTrackletsResponse)
+async def get_tracklets(
+    person_id: int,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    mongo = get_mongo()
+    minio_urls = get_minio_urls()
+    items, total = await mongo.get_tracklets(
+        person_id,
+        skip=(page - 1) * page_size,
+        limit=page_size,
+    )
+    enriched_items = [_attach_best_crop_url(item, minio_urls) for item in items]
     return {"items": enriched_items, "total": total, "page": page, "page_size": page_size}
 
 

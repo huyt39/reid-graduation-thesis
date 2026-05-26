@@ -7,6 +7,7 @@ class Settings(BaseSettings):
 
     # Model weight paths
     osnet_weights: str = "src/assets/models/osnet/model.pth.tar-150"
+    osnet_onnx_path: str = ""
     lmbn_weights: str = ""  # optional, leave empty to skip
     efficientnet_weights: str = "src/assets/models/efficientnet/best_model.pth"
     # Multi-attribute classifier (8 PA-100K tasks on shared EfficientNet-B0 backbone).
@@ -21,6 +22,12 @@ class Settings(BaseSettings):
     embedding_dim: int = 512
     max_batch_size: int = 32
     batch_timeout_ms: int = 10
+
+    # Triton backend (when enabled, skips loading OSNet/multi_attr PyTorch
+    # models in-process; the standalone gender + legacy gender models still
+    # load locally because they aren't exported to Triton yet).
+    use_triton: bool = False
+    triton_url: str = "triton:8000"
 
     model_config = SettingsConfigDict(
         env_file=".env", env_prefix="INFERENCE_", extra="ignore",

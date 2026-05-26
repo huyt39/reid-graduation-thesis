@@ -82,6 +82,8 @@ class WebSocketBroadcaster:
                 "frame_number": frame.frame_number,
                 "tracked_persons": frame.tracked_persons,
                 "created_at": frame.created_at,
+                "image_width": frame.image_width,
+                "image_height": frame.image_height,
                 "image_base64": frame.image_base64,
             }
         )

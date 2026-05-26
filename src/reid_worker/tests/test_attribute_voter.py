@@ -43,6 +43,30 @@ def test_person_hysteresis_flips_after_two_consecutive():
     assert out["gender"][0] == "female"
 
 
+def test_gender_can_use_task_specific_lower_flip_threshold():
+    voter = AttributeVoter(
+        person_threshold=0.7,
+        flip_threshold=0.85,
+        task_flip_thresholds={"gender": 0.65},
+    )
+    voter.resolve_person(1, {"gender": ("male", 0.97)})
+    voter.resolve_person(1, {"gender": ("female", 0.66)})
+    out = voter.resolve_person(1, {"gender": ("female", 0.74)})
+    assert out["gender"][0] == "female"
+
+
+def test_non_gender_tasks_keep_conservative_flip_threshold():
+    voter = AttributeVoter(
+        person_threshold=0.7,
+        flip_threshold=0.85,
+        task_flip_thresholds={"gender": 0.65},
+    )
+    voter.resolve_person(1, {"sleeve": ("long_sleeve", 0.92)})
+    voter.resolve_person(1, {"sleeve": ("short_sleeve", 0.72)})
+    out = voter.resolve_person(1, {"sleeve": ("short_sleeve", 0.74)})
+    assert out["sleeve"][0] == "long_sleeve"
+
+
 def test_person_same_label_reinforces():
     voter = AttributeVoter(person_threshold=0.7)
     voter.resolve_person(1, {"gender": ("male", 0.8)})
@@ -76,6 +100,14 @@ def test_person_snapshot_returns_current_state():
     snap = voter.person_snapshot(1)
     assert snap["gender"][0] == "female"
     assert snap["hat"][0] == "hat"
+
+
+def test_person_task_stable_support_counts_reinforcing_tracklets():
+    voter = AttributeVoter(person_threshold=0.7)
+    voter.resolve_person(1, {"gender": ("male", 0.76)})
+    voter.resolve_person(1, {"gender": ("male", 0.77)})
+    voter.resolve_person(1, {"gender": ("male", 0.75)})
+    assert voter.person_task_stable_support(1, "gender") == 3
 
 
 def test_vote_frame_skips_invalid_payloads():

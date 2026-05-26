@@ -41,6 +41,23 @@ class WorkerKafkaProducer:
                 "good_frame_ratio": float(quality.get("good_frame_ratio", 0.0)),
             }
 
+        matching = person.get("matching")
+        if matching is not None:
+            matching = {
+                "method": str(matching.get("method", "") or ""),
+                "source": str(matching.get("source", "") or ""),
+                "similarity_score": None if matching.get("similarity_score") is None else float(matching.get("similarity_score")),
+                "runner_up_score": None if matching.get("runner_up_score") is None else float(matching.get("runner_up_score")),
+                "margin_to_runner_up": None if matching.get("margin_to_runner_up") is None else float(matching.get("margin_to_runner_up")),
+                "reuse_person_id": None if matching.get("reuse_person_id") is None else int(matching.get("reuse_person_id")),
+                "tentative_attempts": None if matching.get("tentative_attempts") is None else int(matching.get("tentative_attempts")),
+                "canonical_update_applied": (
+                    None
+                    if matching.get("canonical_update_applied") is None
+                    else bool(matching.get("canonical_update_applied"))
+                ),
+            }
+
         attributes = person.get("attributes")
         if attributes is not None:
             attributes = {str(k): str(v) for k, v in attributes.items()}
@@ -49,12 +66,18 @@ class WorkerKafkaProducer:
             "person_id": int(person["person_id"]),
             "bbox": [float(v) for v in person["bbox"]],
             "confidence": float(person["confidence"]),
+            "track_id": None if person.get("track_id") is None else int(person.get("track_id")),
+            "live_track_key": person.get("live_track_key"),
             "tracklet_id": person.get("tracklet_id"),
             "tracklet_state": person.get("tracklet_state"),
             "snapshot_key": person.get("snapshot_key"),
             "visibility_score": float(person.get("visibility_score", 0.0)),
+            "live_visibility_score": float(person.get("live_visibility_score", 0.0)),
+            "overlap_ratio": float(person.get("overlap_ratio", 0.0)),
             "quality": quality,
+            "matching": matching,
             "attributes": attributes,
+            "status": person.get("status"),
         }
         for field in _STRING_ATTRIBUTE_FIELDS:
             value = person.get(field)
@@ -81,7 +104,7 @@ class WorkerKafkaProducer:
             "tracked_persons": normalized_persons,
             "created_at": int(timestamp_ns),
             "image_data": image_data,
-            "schema_version": 2,
+            "schema_version": 3,
         }
         msg_bytes = serialize_avro(self.schema, datum)
         self.producer.send(self.topic, value=msg_bytes)

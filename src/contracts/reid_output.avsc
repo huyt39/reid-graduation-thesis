@@ -30,10 +30,14 @@
           {"name": "sleeve_confidence", "type": "float", "default": 0.0},
           {"name": "lower", "type": "string", "default": "unknown"},
           {"name": "lower_confidence", "type": "float", "default": 0.0},
+          {"name": "track_id", "type": ["null", "int"], "default": null},
+          {"name": "live_track_key", "type": ["null", "string"], "default": null},
           {"name": "tracklet_id", "type": ["null", "string"], "default": null},
           {"name": "tracklet_state", "type": ["null", "string"], "default": null},
           {"name": "snapshot_key", "type": ["null", "string"], "default": null},
           {"name": "visibility_score", "type": "float", "default": 0.0},
+          {"name": "live_visibility_score", "type": "float", "default": 0.0},
+          {"name": "overlap_ratio", "type": "float", "default": 0.0},
           {"name": "quality", "type": ["null", {
             "type": "record",
             "name": "TrackletQuality",
@@ -44,7 +48,22 @@
               {"name": "good_frame_ratio", "type": "float", "default": 0.0}
             ]
           }], "default": null},
-          {"name": "attributes", "type": ["null", {"type": "map", "values": "string"}], "default": null}
+          {"name": "matching", "type": ["null", {
+            "type": "record",
+            "name": "TrackletMatching",
+            "fields": [
+              {"name": "method", "type": "string", "default": ""},
+              {"name": "source", "type": "string", "default": ""},
+              {"name": "similarity_score", "type": ["null", "float"], "default": null},
+              {"name": "runner_up_score", "type": ["null", "float"], "default": null},
+              {"name": "margin_to_runner_up", "type": ["null", "float"], "default": null},
+              {"name": "reuse_person_id", "type": ["null", "int"], "default": null},
+              {"name": "tentative_attempts", "type": ["null", "int"], "default": null},
+              {"name": "canonical_update_applied", "type": ["null", "boolean"], "default": null}
+            ]
+          }], "default": null},
+          {"name": "attributes", "type": ["null", {"type": "map", "values": "string"}], "default": null},
+          {"name": "status", "type": ["null", "string"], "default": null}
         ]
       }
     }},

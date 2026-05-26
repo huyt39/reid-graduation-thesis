@@ -19,7 +19,13 @@ class TrackletEntry:
     v_score: float
     bbox_xyxy: list[float]
     timestamp_ns: int
+    attribute_crop: np.ndarray | None = None
     overlap_ratio: float = 0.0
+    # Frame dimensions at the time this entry was appended. Used to detect
+    # boundary contact (PDF Bước 1 occlusion signal: cut_off). Default 0 means
+    # "unknown" and disables the boundary check for that entry.
+    frame_w: int = 0
+    frame_h: int = 0
 
 
 @dataclass

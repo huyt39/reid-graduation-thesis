@@ -95,6 +95,9 @@ async def test_person_search_builds_filters_and_pagination():
             "filters": {
                 "gender": "male",
                 "gender_confidence_min": 0.8,
+                "glasses": "glasses",
+                "backpack": "backpack",
+                "hat": "hat",
                 "last_seen_device": "cam_01",
                 "is_active": True,
             },
@@ -112,6 +115,9 @@ async def test_person_search_builds_filters_and_pagination():
         filters={
             "attributes.gender": "male",
             "attributes.gender_confidence": {"$gte": 0.8},
+            "attributes.glasses": "glasses",
+            "attributes.backpack": "backpack",
+            "attributes.hat": "hat",
             "stats.last_seen_device": "cam_01",
             "is_active": True,
         },

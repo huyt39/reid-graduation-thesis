@@ -28,20 +28,26 @@ class TopKSelector:
         return high_quality >= self.min_high_quality_frames
 
     def select(self, entries: list[TrackletEntry]) -> list[TrackletEntry]:
+        # Design intent (Bước 3 of the pipeline doc): the selected frames must
+        # be at least min_temporal_gap apart so the embedding aggregation gets
+        # diverse views, not near-identical adjacent frames. The previous
+        # implementation enforced this and then bypassed it with a fill-up
+        # loop that took near-duplicate frames to reach K — defeating the
+        # constraint and inflating embedding_consistency artificially. We
+        # return fewer than K frames when diversity can't be satisfied; the
+        # downstream is_tracklet_ready / consensus filter handles short
+        # selections.
         sorted_entries = sorted(entries, key=self._selection_score, reverse=True)
         selected: list[TrackletEntry] = []
         selected_frame_idxs: list[int] = []
         for entry in sorted_entries:
             if len(selected) >= self.k:
                 break
-            too_close = any(abs(entry.frame_idx - sel_idx) < self.min_temporal_gap for sel_idx in selected_frame_idxs)
+            too_close = any(
+                abs(entry.frame_idx - sel_idx) < self.min_temporal_gap
+                for sel_idx in selected_frame_idxs
+            )
             if not too_close:
                 selected.append(entry)
                 selected_frame_idxs.append(entry.frame_idx)
-        if len(selected) < self.k:
-            remaining = [e for e in sorted_entries if e not in selected]
-            for entry in remaining:
-                if len(selected) >= self.k:
-                    break
-                selected.append(entry)
         return selected

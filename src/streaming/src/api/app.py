@@ -51,51 +51,62 @@ def _build_minio_urls() -> MinIOURLBuilder | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start Kafka consumer in a background task
     minio_urls = _build_minio_urls()
-    consumer = StreamingKafkaConsumer(
-        bootstrap_servers=settings.kafka_bootstrap_servers,
-        topic=settings.output_topic,
-        group_id=settings.consumer_group,
-        schema_path=settings.schema_path,
-    )
-    raw_consumer = StreamingKafkaConsumer(
-        bootstrap_servers=settings.kafka_bootstrap_servers,
-        topic=settings.input_topic,
-        group_id=settings.raw_consumer_group,
-        schema_path=settings.input_schema_path,
-    )
+    consumer = None
+    raw_consumer = None
+    kafka_task = None
+    raw_kafka_task = None
 
-    streaming_state["kafka_loop_running"] = True
-    streaming_state["kafka_loop_failed"] = False
-    streaming_state["raw_kafka_loop_running"] = True
-    streaming_state["raw_kafka_loop_failed"] = False
+    try:
+        consumer = StreamingKafkaConsumer(
+            bootstrap_servers=settings.kafka_bootstrap_servers,
+            topic=settings.output_topic,
+            group_id=settings.consumer_group,
+            schema_path=settings.schema_path,
+        )
+        raw_consumer = StreamingKafkaConsumer(
+            bootstrap_servers=settings.kafka_bootstrap_servers,
+            topic=settings.preview_topic,
+            group_id=settings.preview_consumer_group,
+            schema_path=settings.preview_schema_path,
+        )
 
-    kafka_task = asyncio.create_task(
-        run_kafka_loop(
-            consumer,
-            frame_cache,
-            broadcaster,
-            minio_urls,
-            max_poll_records=settings.max_poll_records,
-            jpeg_quality=settings.jpeg_quality,
-            source="processed",
-        ),
-        name="kafka-consumer-loop",
-    )
-    raw_kafka_task = asyncio.create_task(
-        run_kafka_loop(
-            raw_consumer,
-            raw_frame_cache,
-            raw_broadcaster,
-            None,
-            max_poll_records=settings.max_poll_records,
-            jpeg_quality=settings.jpeg_quality,
-            source="raw",
-        ),
-        name="raw-kafka-consumer-loop",
-    )
-    logger.info("streaming.started")
+        streaming_state["kafka_loop_running"] = True
+        streaming_state["kafka_loop_failed"] = False
+        streaming_state["raw_kafka_loop_running"] = True
+        streaming_state["raw_kafka_loop_failed"] = False
+
+        kafka_task = asyncio.create_task(
+            run_kafka_loop(
+                consumer,
+                frame_cache,
+                broadcaster,
+                minio_urls,
+                max_poll_records=settings.max_poll_records,
+                broadcast_max_fps=settings.broadcast_max_fps,
+                source="processed",
+            ),
+            name="kafka-consumer-loop",
+        )
+        raw_kafka_task = asyncio.create_task(
+            run_kafka_loop(
+                raw_consumer,
+                raw_frame_cache,
+                raw_broadcaster,
+                None,
+                max_poll_records=settings.max_poll_records,
+                broadcast_max_fps=settings.broadcast_max_fps,
+                source="raw",
+            ),
+            name="raw-kafka-consumer-loop",
+        )
+        logger.info("streaming.started")
+    except Exception:
+        streaming_state["kafka_loop_running"] = False
+        streaming_state["kafka_loop_failed"] = True
+        streaming_state["raw_kafka_loop_running"] = False
+        streaming_state["raw_kafka_loop_failed"] = True
+        logger.error("streaming.startup_kafka_unavailable", exc_info=True)
 
     def _on_kafka_task_done(task: asyncio.Task) -> None:
         streaming_state["kafka_loop_running"] = False
@@ -107,7 +118,8 @@ async def lifespan(app: FastAPI):
             streaming_state["kafka_loop_failed"] = True
             logger.error("streaming.kafka_loop_failed", exc_info=exc)
 
-    kafka_task.add_done_callback(_on_kafka_task_done)
+    if kafka_task is not None:
+        kafka_task.add_done_callback(_on_kafka_task_done)
 
     def _on_raw_kafka_task_done(task: asyncio.Task) -> None:
         streaming_state["raw_kafka_loop_running"] = False
@@ -119,26 +131,31 @@ async def lifespan(app: FastAPI):
             streaming_state["raw_kafka_loop_failed"] = True
             logger.error("streaming.raw_kafka_loop_failed", exc_info=exc)
 
-    raw_kafka_task.add_done_callback(_on_raw_kafka_task_done)
+    if raw_kafka_task is not None:
+        raw_kafka_task.add_done_callback(_on_raw_kafka_task_done)
 
 
     yield
 
     # Shutdown
-    kafka_task.cancel()
-    raw_kafka_task.cancel()
-    try:
-        await kafka_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await raw_kafka_task
-    except asyncio.CancelledError:
-        pass
+    if kafka_task is not None:
+        kafka_task.cancel()
+        try:
+            await kafka_task
+        except asyncio.CancelledError:
+            pass
+    if raw_kafka_task is not None:
+        raw_kafka_task.cancel()
+        try:
+            await raw_kafka_task
+        except asyncio.CancelledError:
+            pass
     streaming_state["kafka_loop_running"] = False
     streaming_state["raw_kafka_loop_running"] = False
-    consumer.close()
-    raw_consumer.close()
+    if consumer is not None:
+        consumer.close()
+    if raw_consumer is not None:
+        raw_consumer.close()
     logger.info("streaming.stopped")
 
 

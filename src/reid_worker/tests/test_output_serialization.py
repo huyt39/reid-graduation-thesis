@@ -33,20 +33,33 @@ def test_reid_output_serialization():
                 "tracklet_state": "matched",
                 "snapshot_key": "persons/7/best.jpg",
                 "visibility_score": 0.87,
+                "live_visibility_score": 0.54,
+                "overlap_ratio": 0.21,
                 "quality": {
                     "v_avg": 0.87,
                     "embedding_consistency": 0.93,
                     "overall_consistency": 0.89,
                     "good_frame_ratio": 0.80,
                 },
+                "matching": {
+                    "method": "gallery_match",
+                    "source": "gallery_search",
+                    "similarity_score": 0.88,
+                    "runner_up_score": 0.73,
+                    "margin_to_runner_up": 0.15,
+                    "reuse_person_id": None,
+                    "tentative_attempts": None,
+                    "canonical_update_applied": True,
+                },
                 "attributes": {
                     "gender": "male",
                 },
+                "status": "confirmed",
             }
         ],
         "created_at": 123456789,
         "image_data": b"jpeg-bytes",
-        "schema_version": 2,
+        "schema_version": 3,
     }
 
     encoded = serialize_avro(schema, payload)
@@ -76,8 +89,12 @@ def test_normalize_tracked_person_defaults_and_types():
     assert normalized["tracklet_state"] is None
     assert normalized["snapshot_key"] is None
     assert normalized["visibility_score"] == 0.0
+    assert normalized["live_visibility_score"] == 0.0
+    assert normalized["overlap_ratio"] == 0.0
     assert normalized["quality"] is None
+    assert normalized["matching"] is None
     assert normalized["attributes"] == {"gender": "male", "age": "25"}
+    assert normalized["status"] is None
     assert normalized["age_child"] == "unknown"
     assert normalized["age_child_confidence"] == 0.0
     assert normalized["backpack"] == "unknown"
@@ -113,8 +130,6 @@ def test_normalize_tracked_person_coerces_none_attribute_fields():
     assert normalized["age_child_confidence"] == 0.0
     assert normalized["hat"] == "unknown"
     assert normalized["hat_confidence"] == 0.0
-
-
 def test_send_uses_normalized_tracked_persons(monkeypatch):
     captured = {}
 
@@ -157,7 +172,7 @@ def test_send_uses_normalized_tracked_persons(monkeypatch):
     assert captured["datum"]["device_id"] == "cam-1"
     assert captured["datum"]["frame_number"] == 12
     assert captured["datum"]["created_at"] == 123456789
-    assert captured["datum"]["schema_version"] == 2
+    assert captured["datum"]["schema_version"] == 3
     assert person["person_id"] == 7
     assert person["bbox"] == [1.0, 2.0, 3.0, 4.0]
     assert person["confidence"] == 0.95
@@ -167,5 +182,9 @@ def test_send_uses_normalized_tracked_persons(monkeypatch):
     assert person["tracklet_state"] is None
     assert person["snapshot_key"] is None
     assert person["visibility_score"] == 0.0
+    assert person["live_visibility_score"] == 0.0
+    assert person["overlap_ratio"] == 0.0
     assert person["quality"] is None
+    assert person["matching"] is None
     assert person["attributes"] == {"gender": "male", "age": "25"}
+    assert person["status"] is None

@@ -9,6 +9,7 @@ from torch import nn
 
 from .attention import BatchFeatureErase_Top
 from .bnneck import BNNeck, BNNeck3
+from .gem_pooling import GeM
 from .osnet import OSBlock, osnet_x1_0
 
 
@@ -20,7 +21,7 @@ class LMBN_n(nn.Module):
         self.n_ch = 2
         self.chs = 512 // self.n_ch
 
-        osnet = osnet_x1_0(pretrained=False, weight_path=osnet_weight_path, device=device)
+        osnet = osnet_x1_0(weight_path=osnet_weight_path, device=device)
 
         self.backone = nn.Sequential(osnet.conv1, osnet.maxpool, osnet.conv2, osnet.conv3[0])
         conv3 = osnet.conv3[1:]
@@ -29,9 +30,22 @@ class LMBN_n(nn.Module):
         self.partial_branch = nn.Sequential(copy.deepcopy(conv3), copy.deepcopy(osnet.conv4), copy.deepcopy(osnet.conv5))
         self.channel_branch = nn.Sequential(copy.deepcopy(conv3), copy.deepcopy(osnet.conv4), copy.deepcopy(osnet.conv5))
 
+        # PDF Bước 4 — GeM(p=3) for the spatial→vector pooling steps.
+        # Two design notes:
+        #   * global_pooling stays MaxPool — LMBN-N intentionally uses
+        #     max-pool for its global branch to emphasise the single
+        #     most discriminative response; swapping to GeM here would
+        #     deviate from the LMBN architecture rather than implement
+        #     the PDF's GeM intent.
+        #   * partial_pooling stays as AdaptiveAvgPool2d((2,1)) — that
+        #     is the horizontal-stripe multi-region pool, not a
+        #     spatial→vector reduction. Swapping it would break the
+        #     downstream stripe split at p0/p1.
+        # channel_pooling IS the (1,1) spatial→vector step the design
+        # targets; replace it.
         self.global_pooling = nn.AdaptiveMaxPool2d((1, 1))
         self.partial_pooling = nn.AdaptiveAvgPool2d((2, 1))
-        self.channel_pooling = nn.AdaptiveAvgPool2d((1, 1))
+        self.channel_pooling = GeM(p=3.0, learnable=False)
 
         reduction = BNNeck3(512, num_classes, feats, return_f=True)
         self.reduction_0 = copy.deepcopy(reduction)

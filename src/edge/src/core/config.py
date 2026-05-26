@@ -14,8 +14,13 @@ class Settings(BaseSettings):
     kafka_bootstrap_servers: str = "localhost:29092"
     reid_topic: str = "reid_input"
     schema_path: str = "src/contracts/reid_input.avsc"
-    jpeg_quality: int = 70
+    jpeg_quality: int = 90
     max_encode_dim: int = 0
+    preview_enabled: bool = False
+    preview_topic: str = "edge_preview"
+    preview_fps: float = 12.0
+    preview_jpeg_quality: int = 60
+    preview_max_encode_dim: int = 720
     pre_skip_max_detected: int = 5
     pre_skip_max_empty: int = 30
     pre_skip_box_count_weight: float = 0.1
@@ -32,10 +37,14 @@ class Settings(BaseSettings):
     always_send_min_area_ratio: float = 0.0075
     always_send_max_overlap_ratio: float = 0.35
     always_send_min_cutoff_score: float = 0.6
+    # Hard-drop detections whose bbox is overlapped by another bbox above this
+    # ratio. At ≥ 0.5 the crop typically contains two people, which produces
+    # blended embeddings that contaminate downstream ReID identities. Set
+    # high (e.g. 0.99) to disable.
+    hard_drop_overlap_ratio: float = 0.5
     poll_interval_s: float = 0.01
     log_every_n_processed_frames: int = 100
     log_every_n_frames: int = 30
-
     model_config = SettingsConfigDict(
         env_file=".env",
         env_prefix="EDGE_",

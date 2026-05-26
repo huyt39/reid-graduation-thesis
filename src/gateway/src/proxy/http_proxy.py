@@ -93,6 +93,8 @@ async def proxy_request(
         if k.lower() not in _HOP_BY_HOP
     }
     resp_headers.setdefault("x-request-id", request_id)
+    resp_headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    resp_headers["Pragma"] = "no-cache"
 
     # request successfully
     logger.info(

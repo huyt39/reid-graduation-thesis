@@ -17,7 +17,8 @@
             {"name": "confidence", "type": "float"},
             {"name": "class_id", "type": "int"},
             {"name": "visibility_score", "type": "float"},
-            {"name": "overlap_ratio", "type": "float"}
+            {"name": "overlap_ratio", "type": "float"},
+            {"name": "visibility_tag", "type": "string", "default": "mid"}
           ]
         }
       }

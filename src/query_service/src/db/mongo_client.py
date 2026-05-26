@@ -65,6 +65,45 @@ class MongoQueryClient:
         items = await cursor.to_list(length=limit)
         return items, total
 
+    async def get_tracklets(
+        self,
+        person_id: int,
+        skip: int = 0,
+        limit: int = 20,
+    ) -> tuple[list[dict], int]:
+        query: dict = {"person_id": person_id}
+        total = await self._db.tracklets.count_documents(query)
+        cursor = (
+            self._db.tracklets.find(query, {"_id": 0})
+            .sort("created_at", pymongo.DESCENDING)
+            .skip(skip)
+            .limit(limit)
+        )
+        items = await cursor.to_list(length=limit)
+        return items, total
+
+    async def get_occlusion_candidates(
+        self,
+        status: str | None = "unconfirmed",
+        device_id: str | None = None,
+        skip: int = 0,
+        limit: int = 20,
+    ) -> tuple[list[dict], int]:
+        query: dict = {}
+        if status:
+            query["status"] = status
+        if device_id:
+            query["device_id"] = device_id
+        total = await self._db.occlusion_candidates.count_documents(query)
+        cursor = (
+            self._db.occlusion_candidates.find(query, {"_id": 0})
+            .sort("created_at", pymongo.DESCENDING)
+            .skip(skip)
+            .limit(limit)
+        )
+        items = await cursor.to_list(length=limit)
+        return items, total
+
     # Timeline
 
     async def get_timeline(

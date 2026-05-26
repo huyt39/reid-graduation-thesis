@@ -90,6 +90,18 @@ def test_embedding_batch(client):
     assert len(body["embeddings"]) == 2
 
 
+def test_embedding_batch_fails_when_embedding_model_is_unavailable(client):
+    registry.osnet = None
+    registry.triton = None
+    with patch.object(registry, "extract_embedding_batch", side_effect=RuntimeError("No ReID embedding model loaded")):
+        jpeg = _make_jpeg()
+        files = [("images", ("a.jpg", jpeg, "image/jpeg"))]
+        r = client.post("/embedding/batch", files=files, data={"model": "osnet"})
+
+    assert r.status_code == 503
+    assert "No ReID embedding model loaded" in r.json()["detail"]
+
+
 def test_similarity(client):
     jpeg = _make_jpeg()
     r = client.post(

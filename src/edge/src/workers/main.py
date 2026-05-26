@@ -50,6 +50,18 @@ class EdgePipeline:
             schema_path=self.settings.schema_path,
         )
         self.detect_every_n_frames = max(1, self.settings.detect_every_n_frames)
+        self.preview_producer = (
+            EdgeKafkaProducer(
+                bootstrap_servers=self.settings.kafka_bootstrap_servers,
+                topic=self.settings.preview_topic,
+                schema_path=self.settings.schema_path,
+            )
+            if self.settings.preview_enabled
+            else None
+        )
+        preview_fps = float(getattr(self.settings, "preview_fps", 0.0) or 0.0)
+        self._preview_min_interval_s = (1.0 / preview_fps) if preview_fps > 0 else 0.0
+        self._last_preview_at: float = 0.0
 
     @staticmethod
     def _resolve_local_path(path_str: str) -> str:
@@ -134,8 +146,10 @@ class EdgePipeline:
         self,
         frame,
         detections: list[dict],
+        *,
+        max_encode_dim: int | None = None,
     ) -> tuple:
-        max_encode_dim = self.settings.max_encode_dim
+        max_encode_dim = self.settings.max_encode_dim if max_encode_dim is None else max_encode_dim
         if max_encode_dim <= 0:
             return frame, detections
 
@@ -159,6 +173,70 @@ class EdgePipeline:
             )
 
         return resized_frame, resized_detections
+
+    def _encode_outbound_frame(
+        self,
+        frame,
+        detections: list[dict],
+        *,
+        jpeg_quality: int,
+        max_encode_dim: int,
+    ) -> tuple[bytes | None, list[dict], float]:
+        frame_to_encode, encoded_detections = self._prepare_outbound_frame(
+            frame,
+            detections,
+            max_encode_dim=max_encode_dim,
+        )
+        encode_started_at = time.perf_counter()
+        ok, img_encoded = cv2.imencode(
+            ".jpg",
+            frame_to_encode,
+            [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)],
+        )
+        encode_ms = (time.perf_counter() - encode_started_at) * 1000
+        if not ok:
+            return None, encoded_detections, encode_ms
+        return img_encoded.tobytes(), encoded_detections, encode_ms
+
+    def _should_publish_preview(self) -> bool:
+        if self.preview_producer is None:
+            return False
+        if self._preview_min_interval_s <= 0:
+            return True
+        now = time.perf_counter()
+        if (now - self._last_preview_at) < self._preview_min_interval_s:
+            return False
+        self._last_preview_at = now
+        return True
+
+    def _publish_preview_frame(
+        self,
+        *,
+        frame,
+        detections: list[dict],
+        frame_idx: int,
+        timestamp_ns: int,
+    ) -> float:
+        if not self._should_publish_preview():
+            return 0.0
+        assert self.preview_producer is not None
+        image_bytes, preview_detections, encode_ms = self._encode_outbound_frame(
+            frame,
+            detections,
+            jpeg_quality=self.settings.preview_jpeg_quality,
+            max_encode_dim=self.settings.preview_max_encode_dim,
+        )
+        if image_bytes is None:
+            log.warning("preview_frame_encode_failed", frame_idx=frame_idx)
+            return encode_ms
+        self.preview_producer.send(
+            device_id=self.settings.device_id,
+            frame_number=frame_idx,
+            detections=preview_detections,
+            image_data=image_bytes,
+            timestamp_ns=timestamp_ns,
+        )
+        return encode_ms
 
     def run(self) -> None:
         cap = self._open_capture(self.settings.source_url)
@@ -193,6 +271,11 @@ class EdgePipeline:
                         processed_frames=processed_frames,
                         published_messages=published_messages,
                     )
+                    self.producer.send_end_of_stream(
+                        device_id=self.settings.device_id,
+                        frame_number=frame_idx,
+                        timestamp_ns=time.time_ns(),
+                    )
                     break
 
                 frame_idx += 1
@@ -202,43 +285,48 @@ class EdgePipeline:
                 ):
                     log.info("edge_frame_read", frame_idx=frame_idx)
 
-                if (
+                # Decouple preview-rate from ReID-rate: skipped detection
+                # frames can still publish to edge_preview, while reid_input
+                # only receives frames carrying usable detections.
+                skip_detection = (
                     not self.settings.demo_mode
-                    and self.detect_every_n_frames > 1
-                    and frame_idx % self.detect_every_n_frames != 0
-                ):
-                    continue
-
-                if (
-                    not self.settings.demo_mode
-                    and self.detect_every_n_frames <= 1
-                    and not self.pre_skipper.should_process(frame)
-                ):
-                    continue
-
-                detect_started_at = time.perf_counter()
-                detections = self.detector.infer(frame)
-                detect_ms = (time.perf_counter() - detect_started_at) * 1000
-                total_detect_ms += detect_ms
-                if not self.settings.demo_mode:
-                    if self.detect_every_n_frames <= 1:
-                        self.pre_skipper.update_after_detection(detections)
-                    if not detections:
-                        continue
-                elif not detections:
-                    frame_h, frame_w = frame.shape[:2]
-                    detections = [self._synthetic_detection(frame_w, frame_h)]
-                    log.info(
-                        "edge_demo_synthetic_detection",
-                        frame_idx=frame_idx,
-                        bbox=detections[0]["bbox"],
+                    and (
+                        (
+                            self.detect_every_n_frames > 1
+                            and frame_idx % self.detect_every_n_frames != 0
+                        )
+                        or (
+                            self.detect_every_n_frames <= 1
+                            and not self.pre_skipper.should_process(frame)
+                        )
                     )
-
-                log.info(
-                    "edge_detections",
-                    frame_idx=frame_idx,
-                    detection_count=len(detections),
                 )
+
+                if skip_detection:
+                    detections: list[dict] = []
+                else:
+                    detect_started_at = time.perf_counter()
+                    detections = self.detector.infer(frame)
+                    detect_ms = (time.perf_counter() - detect_started_at) * 1000
+                    total_detect_ms += detect_ms
+                    if not self.settings.demo_mode:
+                        if self.detect_every_n_frames <= 1:
+                            self.pre_skipper.update_after_detection(detections)
+                    elif not detections:
+                        frame_h, frame_w = frame.shape[:2]
+                        detections = [self._synthetic_detection(frame_w, frame_h)]
+                        log.info(
+                            "edge_demo_synthetic_detection",
+                            frame_idx=frame_idx,
+                            bbox=detections[0]["bbox"],
+                        )
+
+                if detections:
+                    log.info(
+                        "edge_detections",
+                        frame_idx=frame_idx,
+                        detection_count=len(detections),
+                    )
                 total_raw_detections += len(detections)
 
                 frame_h, frame_w = frame.shape[:2]
@@ -258,6 +346,8 @@ class EdgePipeline:
                     )
                     visibility_score = compute_visibility_score(subscores)
                     overlap_ratio = compute_overlap_ratio(bbox, all_bboxes)
+                    if overlap_ratio >= self.settings.hard_drop_overlap_ratio:
+                        continue
                     tag = tag_detection(
                         visibility_score,
                         good_thresh=self.settings.v_good_threshold,
@@ -291,25 +381,28 @@ class EdgePipeline:
                             "class_id": det["class_id"],
                             "visibility_score": round(visibility_score, 4),
                             "overlap_ratio": round(overlap_ratio, 4),
+                            "visibility_tag": tag.value if hasattr(tag, "value") else str(tag),
                         }
                     )
+
+                total_encode_ms += self._publish_preview_frame(
+                    frame=frame,
+                    detections=outbound_detections,
+                    frame_idx=frame_idx,
+                    timestamp_ns=timestamp_ns,
+                )
 
                 if not outbound_detections:
                     continue
 
-                frame_to_encode, outbound_detections = self._prepare_outbound_frame(
+                image_bytes, outbound_detections, encode_ms = self._encode_outbound_frame(
                     frame,
                     outbound_detections,
+                    jpeg_quality=self.settings.jpeg_quality,
+                    max_encode_dim=self.settings.max_encode_dim,
                 )
-                encode_started_at = time.perf_counter()
-                ok, img_encoded = cv2.imencode(
-                    ".jpg",
-                    frame_to_encode,
-                    [cv2.IMWRITE_JPEG_QUALITY, self.settings.jpeg_quality],
-                )
-                encode_ms = (time.perf_counter() - encode_started_at) * 1000
                 total_encode_ms += encode_ms
-                if not ok:
+                if image_bytes is None:
                     log.warning("frame_encode_failed", frame_idx=frame_idx)
                     continue
 
@@ -318,7 +411,7 @@ class EdgePipeline:
                     device_id=self.settings.device_id,
                     frame_number=frame_idx,
                     detections=outbound_detections,
-                    image_data=img_encoded.tobytes(),
+                    image_data=image_bytes,
                     timestamp_ns=timestamp_ns,
                 )
                 publish_ms = (time.perf_counter() - publish_started_at) * 1000
@@ -353,6 +446,8 @@ class EdgePipeline:
         finally:
             cap.release()
             self.producer.close()
+            if self.preview_producer is not None:
+                self.preview_producer.close()
             log.info(
                 "edge_stopped",
                 processed_frames=processed_frames,

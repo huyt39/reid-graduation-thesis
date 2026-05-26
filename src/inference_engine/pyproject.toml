@@ -14,8 +14,9 @@ dependencies = [
   "torch>=2.0.0",
   "torchvision>=0.15.0",
   "Pillow>=10.0.0",
-  "efficientnet-pytorch>=0.7.1",
   "python-multipart>=0.0.20",
+  "onnxruntime>=1.20.0",
+  "tritonclient[http]>=2.46.0",
 ]
 
 [build-system]
@@ -24,3 +25,12 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
 
+# Force CPU-only torch wheels so ARM64 Docker builds don't pull ~1.5GB of NVIDIA CUDA packages.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

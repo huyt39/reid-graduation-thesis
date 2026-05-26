@@ -18,8 +18,9 @@ def test_readyz_reports_devices():
     """Readyz endpoint returns device list and connection count."""
     with TestClient(app) as c:
         r = c.get("/readyz")
-        assert r.status_code == 200
-        body = r.json()
+        assert r.status_code in {200, 503}
+        payload = r.json()
+        body = payload if r.status_code == 200 else payload["detail"]
         assert "devices" in body
         assert "connections" in body
 

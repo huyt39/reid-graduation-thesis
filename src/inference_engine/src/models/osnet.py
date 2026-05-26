@@ -7,11 +7,15 @@ weight paths are now passed explicitly to the factory function.
 from __future__ import absolute_import, division
 
 from collections import OrderedDict
+import sys
 
+import numpy as np
 import structlog
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+from .gem_pooling import GeM
 
 log = structlog.get_logger()
 
@@ -151,7 +155,15 @@ class OSNet(nn.Module):
         self.conv3 = self._make_layer(blocks[1], layers[1], channels[1], channels[2], reduce_spatial_size=True)
         self.conv4 = self._make_layer(blocks[2], layers[2], channels[2], channels[3], reduce_spatial_size=False)
         self.conv5 = Conv1x1(channels[3], channels[3])
-        self.global_avgpool = nn.AdaptiveAvgPool2d(1)
+        # PDF Bước 4 — GeM(p=3) replaces plain avgpool for the
+        # spatial→vector reduction. The buffer-based ``p`` is initialised
+        # at construction; pretrained checkpoints (which contain no
+        # state for nn.AdaptiveAvgPool2d) still load cleanly because the
+        # loader at load_pretrained_weights() ignores keys absent from
+        # the checkpoint. Name kept as ``global_avgpool`` so downstream
+        # forward() and any saved-with-this-class checkpoints stay
+        # backward-compatible.
+        self.global_avgpool = GeM(p=3.0, learnable=False)
         self.fc = self._construct_fc_layer(self.feature_dim, channels[3], dropout_p=None)
         self.classifier = nn.Linear(self.feature_dim, num_classes)
         self._init_params()
@@ -226,6 +238,10 @@ class OSNet(nn.Module):
 # ── Weight loading ────────────────────────────────────────────────────
 
 def load_pretrained_weights(model: nn.Module, weight_path: str, device: torch.device) -> None:
+    # Some legacy checkpoints were pickled against NumPy module paths that are
+    # no longer importable under newer versions. Register a compatibility alias
+    # before torch.load so those checkpoints can still be deserialized.
+    sys.modules.setdefault("numpy._core", np.core)
     state_dict = torch.load(weight_path, map_location=device, weights_only=False)
     if "state_dict" in state_dict:
         state_dict = state_dict["state_dict"]
