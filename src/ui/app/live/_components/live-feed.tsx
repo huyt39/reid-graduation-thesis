@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Card } from "@/components/ui/card";
 import { getLiveStatusLabel } from "@/lib/reid-evidence";
 import type { FrameUpdate, TrackedPerson } from "@/hooks/use-websocket";
@@ -98,13 +98,33 @@ interface Props {
 export function LiveFeed({ frame, isLiveActive }: Props) {
   const imgRef = useRef<HTMLImageElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const recvCountRef = useRef(0);
+  const renderCountRef = useRef(0);
+  const lastFrameNumberRef = useRef<number | null>(null);
+  // Mutable mirror of `frame` so the 1s FPS timer can read the latest frame
+  // without depending on `frame` (which would clear+recreate the interval
+  // every WebSocket update, preventing the callback from ever firing).
+  const frameRef = useRef<FrameUpdate | null>(frame);
+  const [fpsStats, setFpsStats] = useState({ recv: 0, render: 0, ageMs: 0 });
+
+  useEffect(() => {
+    frameRef.current = frame;
+    if (!frame) return;
+    if (lastFrameNumberRef.current !== frame.frame_number) {
+      lastFrameNumberRef.current = frame.frame_number;
+      recvCountRef.current += 1;
+    }
+  }, [frame]);
 
   useEffect(() => {
     const img = imgRef.current;
     const canvas = canvasRef.current;
     if (!img || !canvas || !frame) return;
 
-    const render = () => drawOverlay(canvas, img, frame.tracked_persons);
+    const render = () => {
+      drawOverlay(canvas, img, frame.tracked_persons);
+      renderCountRef.current += 1;
+    };
 
     if (img.complete && img.naturalWidth > 0) {
       render();
@@ -112,6 +132,21 @@ export function LiveFeed({ frame, isLiveActive }: Props) {
       img.onload = render;
     }
   }, [frame]);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const f = frameRef.current;
+      const recv = recvCountRef.current;
+      const render = renderCountRef.current;
+      recvCountRef.current = 0;
+      renderCountRef.current = 0;
+      const ageMs = f
+        ? Math.max(0, Math.round(Date.now() - f.created_at / 1e6))
+        : 0;
+      setFpsStats({ recv, render, ageMs });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
 
   if (!isLiveActive) {
     return (
@@ -151,6 +186,9 @@ export function LiveFeed({ frame, isLiveActive }: Props) {
       <div className="absolute top-2 left-2 rounded bg-black/60 px-2 py-0.5 text-xs text-white/80">
         {frame.device_id}
         {frame.source ? ` • ${frame.source}` : ""}
+      </div>
+      <div className="absolute bottom-2 left-2 rounded bg-black/60 px-2 py-0.5 font-mono text-xs text-white/80">
+        recv {fpsStats.recv} • render {fpsStats.render} • age {fpsStats.ageMs}ms
       </div>
     </Card>
   );

@@ -364,7 +364,7 @@ class WorkerPipeline:
         self.untracked_detection_cluster_seq = 0
         self.processing_tracklet_ids: set[int] = set()
         self.fragment_recovery_clusters: list[dict] = []
-        # Fix C — admission appearance-gate state. Per track_id, cache the
+        # Admission appearance-gate state. Per track_id, cache the
         # embeddings of frames already accepted into the buffer so we can
         # compare a new frame's embedding against the running mean cheaply.
         # _track_id_split_counts assigns deterministic virtual track_ids when
@@ -657,8 +657,8 @@ class WorkerPipeline:
             return set()
 
         strong_tracklet_thresh = float(self.settings.attribute_conflict_tracklet_confidence)
-        # V23 L1: below this floor the gender classifier is effectively noise — don't
-        # let it influence matching at all.
+        # Below this floor the gender classifier is effectively noise; don't let
+        # it influence identity matching.
         weak_tracklet_floor = 0.55
         if t_gender_conf < weak_tracklet_floor:
             return set()
@@ -1103,8 +1103,7 @@ class WorkerPipeline:
         )
         if suppressed:
             # Diagnostic only — make data-driven threshold tuning possible without
-            # guessing. Lets us see exactly which boundary persons get caught and
-            # which static objects (WC icons, fire extinguishers) slip through.
+            # guessing which boundary persons or static false positives were caught.
             log.warning(
                 "new_identity_suppressed_static_artifact",
                 track_id=tracklet.track_id,
@@ -1497,17 +1496,26 @@ class WorkerPipeline:
 
         max_v = max(e.v_score for e in entries)
         n_entries = len(entries)
+        consistency = compute_tracklet_consistency(entries)
 
         # Two-tier promotion: long-evidence tier OR high-confidence brief tier.
-        # Match-consistency gate downstream rejects mixed-identity clusters so
-        # the brief tier cannot mint duplicates.
+        # The brief tier is intentionally narrow: enough clean temporal support
+        # to rescue ByteTrack misses, but not enough to revive 2-4 frame static
+        # false positives as confirmed identities.
         min_entries_slow = int(getattr(self.settings, "untracked_cluster_promote_min_entries", 6))
         min_visibility_slow = float(getattr(self.settings, "untracked_cluster_promote_min_visibility", 0.65))
         min_entries_fast = int(getattr(self.settings, "untracked_cluster_promote_min_entries_fast", 4))
         min_visibility_fast = float(getattr(self.settings, "untracked_cluster_promote_min_visibility_fast", 0.85))
+        min_fast_consistency = float(
+            getattr(self.settings, "untracked_cluster_promote_fast_min_overall_consistency", 0.88)
+        )
 
         slow_tier_met = n_entries >= min_entries_slow and max_v >= min_visibility_slow
-        fast_tier_met = n_entries >= min_entries_fast and max_v >= min_visibility_fast
+        fast_tier_met = (
+            n_entries >= min_entries_fast
+            and max_v >= min_visibility_fast
+            and float(consistency.overall) >= min_fast_consistency
+        )
 
         if not (slow_tier_met or fast_tier_met):
             return False
@@ -1536,11 +1544,33 @@ class WorkerPipeline:
             cluster_id=cluster["cluster_id"],
             entries=n_entries,
             max_visibility=round(max_v, 4),
+            overall_consistency=round(float(consistency.overall), 4),
             tier=tier,
             min_entries_required=min_entries_required,
             min_visibility_required=min_visibility_required,
         )
         return True
+
+    def _is_synthetic_fast_tracklet_ready(self, tracklet) -> bool:
+        if int(getattr(tracklet, "track_id", 0)) >= 0:
+            return False
+        entries = list(getattr(tracklet, "entries", []) or [])
+        min_entries = int(getattr(self.settings, "untracked_cluster_promote_min_entries_fast", 5))
+        if len(entries) < min_entries:
+            return False
+        min_visibility = float(getattr(self.settings, "untracked_cluster_promote_min_visibility_fast", 0.85))
+        if max((float(entry.v_score) for entry in entries), default=0.0) < min_visibility:
+            return False
+        high_quality_threshold = float(getattr(self.settings, "high_quality_threshold", 0.55))
+        min_high_quality = int(getattr(self.settings, "min_high_quality_frames", 3))
+        high_quality = sum(1 for entry in entries if float(entry.v_score) >= high_quality_threshold)
+        if high_quality < min_high_quality:
+            return False
+        min_consistency = float(
+            getattr(self.settings, "untracked_cluster_promote_fast_min_overall_consistency", 0.88)
+        )
+        consistency = compute_tracklet_consistency(entries)
+        return float(consistency.overall) >= min_consistency
 
     async def _admission_gate_or_split(
         self,
@@ -1675,14 +1705,23 @@ class WorkerPipeline:
                     if not messages:
                         await self._flush_idle_tracklets_if_needed(time.time_ns())
                         continue
-                    self.last_message_time_ns = time.time_ns()
+                    # Heartbeat messages (empty detections) come from the edge
+                    # to keep the streaming preview smooth; they carry no ReID
+                    # signal and must not reset the quiescence gate, otherwise
+                    # `_can_allocate_new_identity` would never fire while the
+                    # edge keeps pumping empty frames.
+                    has_reid_signal = any(msg.get("detections") for msg in messages)
+                    if has_reid_signal:
+                        self.last_message_time_ns = time.time_ns()
                     for msg in messages:
                         await self._process_message(msg)
                         # Refresh per-message so the quiescence gate doesn't
                         # mistake long batch processing time for stream end.
                         # A batch that takes 30s to process must not look
                         # idle from the matcher's perspective at second 21.
-                        self.last_message_time_ns = time.time_ns()
+                        # Heartbeats are excluded for the same reason as above.
+                        if msg.get("detections"):
+                            self.last_message_time_ns = time.time_ns()
                     await asyncio.sleep(self.settings.poll_interval_s)
         finally:
             if reconciler_task is not None:
@@ -1732,11 +1771,13 @@ class WorkerPipeline:
             return
 
         detections = msg["detections"]
+        if not detections:
+            return
         image_data = msg["image_data"]
         timestamp_ns = msg["created_at"]
         img_array = np.frombuffer(image_data, dtype=np.uint8)
         frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-        if frame is None or not detections:
+        if frame is None:
             return
 
         frame_h, frame_w = frame.shape[:2]
@@ -2390,10 +2431,8 @@ class WorkerPipeline:
             return None, None
         if float(v_avg) < float(getattr(self.settings, "fragment_recovery_min_visibility", 0.72)):
             return None, None
-        # Close the bypass that lets stationary objects (WC icons, fire
-        # extinguishers) mint identities through fragment_recovery without ever
-        # being checked by _should_suppress_new_identity. Same static-artifact
-        # filter the regular tracklet path already obeys; no new policy.
+        # Fragment recovery must obey the same static-artifact filter as the
+        # regular tracklet path before minting identities.
         if self._should_suppress_new_identity(tracklet):
             return None, None
 
@@ -2503,12 +2542,10 @@ class WorkerPipeline:
         evidence we can safely collapse the weaker one if they never co-occurred
         on the same device.
 
-        V23 P5: when the top candidate is blocked by a gender conflict, retry
-        with the next-best candidate (up to ``_DUPLICATE_MERGE_MAX_RETRIES``
-        attempts). This lets same-gender same-person fragments unify even when
-        the top embedding match happens to be an opposite-gender identity (e.g.
-        LMBN cross-pose sim 0.78 between two women, but sim 0.85 to an unrelated
-        man).
+        When the top candidate is blocked by an attribute or cooccurrence guard,
+        retry with the next-best candidate up to ``_DUPLICATE_MERGE_MAX_RETRIES``.
+        This lets duplicate fragments merge when the closest gallery neighbor is
+        not the safest merge target.
         """
         if not getattr(self.settings, "duplicate_merge_enabled", False):
             return person_id
@@ -2857,11 +2894,10 @@ class WorkerPipeline:
                 getattr(self.settings, "gender_tracklet_min_consecutive", 2)
             ),
         ):
-            # V23 P3: cooccurrence-safe rescue. Two identities that literally cannot
-            # have been simultaneously present, with strong embedding similarity, are
-            # the same person regardless of what the gender classifier said. Only
-            # rescues when at least one side is weak (≤ weak_limit tracklets) — never
-            # merges two well-established identities on this rule alone.
+            # Cooccurrence-safe rescue: if two identities never appeared together
+            # and have strong embedding similarity, a noisy attribute conflict can
+            # be overridden for weak identities. Do not merge two well-established
+            # identities on this rule alone.
             cooccurrence_safe_override_threshold = float(
                 getattr(self.settings, "duplicate_merge_gender_cooccurrence_override_threshold", 0.70)
             )
@@ -4728,6 +4764,26 @@ class WorkerPipeline:
             "matching": matching or {"method": "new_identity", "source": "fragment_recovery"},
             "attributes": {task: label for task, (label, _) in p_attrs.items()},
         }
+        if bool((matching or {}).get("provisional")):
+            await self._persist_occlusion_candidate(
+                tracklet,
+                reason=str(
+                    (matching or {}).get("provisional_reason")
+                    or (matching or {}).get("source")
+                    or "provisional_occlusion_match"
+                ),
+                selected_entries=[best_entry],
+                embedding_consistency=1.0,
+                matching=matching,
+            )
+            log.info(
+                "fragment_recovery_provisional_attached",
+                track_id=tracklet.track_id,
+                person_id=person_id,
+                entries=len(entries),
+                v_avg=round(v_avg, 4),
+            )
+            return person_id
         await self._persist_tracklet(
             tracklet=tracklet,
             tracklet_id=tracklet_id,
@@ -4755,7 +4811,8 @@ class WorkerPipeline:
         reserved_person_ids: set[int] | None = None,
         allow_tentative_fallback: bool = True,
     ) -> int | None:
-        if not self.topk_selector.is_tracklet_ready(tracklet.entries):
+        synthetic_fast_ready = self._is_synthetic_fast_tracklet_ready(tracklet)
+        if not self.topk_selector.is_tracklet_ready(tracklet.entries) and not synthetic_fast_ready:
             tracklet.state = TrackletState.ACTIVE  # allow re-evaluation as new frames arrive
             recent_v = [round(e.v_score, 3) for e in tracklet.entries[-5:]]
             log.warning("tracklet_quality_gate_fail",
@@ -5028,6 +5085,31 @@ class WorkerPipeline:
                     and not self._identity_cap_reached()
                     and self._can_allocate_new_identity(tracklet)
                 )
+                if (
+                    allow_new_identity
+                    and int(tracklet.track_id) < 0
+                    and float(consistency.overall)
+                    < float(
+                        getattr(
+                            self.settings,
+                            "synthetic_new_identity_min_overall_consistency",
+                            0.75,
+                        )
+                    )
+                ):
+                    allow_new_identity = False
+                    log.warning(
+                        "synthetic_new_identity_blocked_low_consistency",
+                        track_id=tracklet.track_id,
+                        overall_consistency=round(float(consistency.overall), 4),
+                        threshold=float(
+                            getattr(
+                                self.settings,
+                                "synthetic_new_identity_min_overall_consistency",
+                                0.75,
+                            )
+                        ),
+                    )
             else:
                 # A live track_id already carries temporal evidence for its
                 # assigned person. If its current crop no longer clears the
@@ -5086,12 +5168,28 @@ class WorkerPipeline:
             num_high_quality_frames = sum(
                 1 for entry in tracklet.entries if entry.v_score >= high_quality_threshold
             )
+            effective_tracklet_len = len(tracklet.entries)
+            if synthetic_fast_ready:
+                effective_tracklet_len = max(
+                    effective_tracklet_len,
+                    int(getattr(self.settings, "new_identity_min_tracklet_len", 6)),
+                )
+            selected_max_overlap = max(
+                (float(entry.overlap_ratio or 0.0) for entry in consensus_entries),
+                default=0.0,
+            )
+            allow_gallery_update = (
+                selected_max_overlap
+                <= float(getattr(self.settings, "gallery_update_max_overlap_ratio", 0.25))
+                and float(consistency.overall)
+                >= float(getattr(self.settings, "gallery_update_min_overall_consistency", 0.80))
+            )
             person_id = self.matcher.match_tracklet(
                 track_id=tracklet.track_id,
                 embedding=tracklet_embedding,
                 v_avg=v_avg,
                 embedding_consistency=emb_consistency,
-                tracklet_len=len(tracklet.entries),
+                tracklet_len=effective_tracklet_len,
                 num_high_quality_frames=num_high_quality_frames,
                 blocked_person_ids=blocked_person_ids,
                 current_person_id=current_person_id,
@@ -5104,6 +5202,7 @@ class WorkerPipeline:
                 on_new_identity=_register_new_identity_attrs,
                 good_streak=good_streak,
                 allow_tentative_fallback=allow_tentative_fallback,
+                allow_gallery_update=allow_gallery_update,
             )
             pop_last_decision = getattr(self.matcher, "pop_last_decision", None)
             matching = pop_last_decision(tracklet.track_id) if callable(pop_last_decision) else {}
@@ -5181,8 +5280,8 @@ class WorkerPipeline:
             self._update_person_last_observation_from_tracklet(person_id, tracklet)
             reserved_person_ids.add(person_id)  # make visible to other concurrent tasks
 
-            # V23 P1: emit one attachment_decision line per match so we can trace
-            # how each tracklet's gender vote flows into a person identity.
+            # Emit one attachment_decision line per match so identity decisions
+            # can be audited from appearance, attribute, and guard signals.
             try:
                 _pre_snap = self.attribute_voter.person_snapshot(person_id) or {}
                 _pre_gender, _pre_gconf = _pre_snap.get("gender", ("unknown", 0.0))
@@ -5236,23 +5335,37 @@ class WorkerPipeline:
 
             # ── Persistence (fire-and-forget) ─────────────────────────
             try:
-                await self._persist_tracklet(
-                    tracklet=tracklet,
-                    tracklet_id=tracklet_id,
-                    person_id=person_id,
-                    consistency=consistency,
-                    v_avg=v_avg,
-                    emb_consistency=emb_consistency,
-                    best_entry=best_entry,
-                    selected=consensus_entries,
-                    matching=matching,
-                    person_attrs=p_attrs,
-                    tracklet_attrs=t_attrs,
-                )
+                if is_provisional_occlusion:
+                    await self._persist_occlusion_candidate(
+                        tracklet,
+                        reason=str(
+                            matching.get("provisional_reason")
+                            or matching.get("source")
+                            or "provisional_occlusion_match"
+                        ),
+                        selected_entries=consensus_entries,
+                        embedding_consistency=emb_consistency,
+                        matching=matching,
+                    )
+                else:
+                    await self._persist_tracklet(
+                        tracklet=tracklet,
+                        tracklet_id=tracklet_id,
+                        person_id=person_id,
+                        consistency=consistency,
+                        v_avg=v_avg,
+                        emb_consistency=emb_consistency,
+                        best_entry=best_entry,
+                        selected=consensus_entries,
+                        matching=matching,
+                        person_attrs=p_attrs,
+                        tracklet_attrs=t_attrs,
+                    )
             except Exception:
                 log.error("persistence_failed", tracklet_id=tracklet_id, exc_info=True)
 
-            person_id = await self._maybe_merge_duplicate_person(person_id)
+            if not is_provisional_occlusion:
+                person_id = await self._maybe_merge_duplicate_person(person_id)
             tracklet.person_id = person_id
             self.track_id_to_person_id[tracklet.track_id] = person_id
             self._remember_track_identity(person_id, tracklet)
@@ -5325,13 +5438,6 @@ class WorkerPipeline:
             "overall_consistency": round(consistency.overall, 4),
         }
         selected_frame_idxs = {entry.frame_idx for entry in selected}
-        rejected_preview_idxs = {
-            entry.frame_idx
-            for entry in sorted(
-                [entry for entry in entries if entry.frame_idx not in selected_frame_idxs],
-                key=lambda e: (e.v_score, -e.overlap_ratio),
-            )[:3]
-        }
         evidence = {
             "selected_frame_count": len(selected_frame_idxs),
             "selected_frame_indices": sorted(selected_frame_idxs),
@@ -5345,11 +5451,7 @@ class WorkerPipeline:
                     "selection_reason": (
                         "selected_consensus_frame"
                         if entry.frame_idx in selected_frame_idxs
-                        else (
-                            "rejected_low_visibility_preview"
-                            if entry.frame_idx in rejected_preview_idxs
-                            else "not_selected"
-                        )
+                        else "not_selected"
                     ),
                     "crop_key": None,
                 }
@@ -5385,8 +5487,8 @@ class WorkerPipeline:
             and not is_provisional_occlusion
         )
 
-        # V23 P1: log every sighting write so we can grep for the male-sighting that
-        # poisoned the woman identity.
+        # Log every sighting write so attribute evidence can be audited against
+        # later merge or attachment decisions.
         _stored_attrs = tracklet_attrs if tracklet_attrs is not None else person_attrs
         _sighting_gender, _sighting_gconf = (_stored_attrs or {}).get("gender", ("unknown", 0.0))
         log.warning(
@@ -5448,6 +5550,8 @@ class WorkerPipeline:
             self.redis_cache.invalidate(person_id),
             return_exceptions=True,
         )
+        await self.mongo.recompute_person_attributes(person_id)
+        await self.redis_cache.invalidate(person_id)
 
         # Asset upload is secondary to person persistence. Write Mongo first so a
         # newly-assigned identity appears in DB/UI immediately even when MinIO is
@@ -5472,7 +5576,7 @@ class WorkerPipeline:
 
         frame_crop_keys: dict[int, str] = {}
         for entry in entries:
-            if entry.frame_idx not in selected_frame_idxs and entry.frame_idx not in rejected_preview_idxs:
+            if entry.frame_idx not in selected_frame_idxs:
                 continue
             if entry.crop.size <= 0:
                 continue

@@ -22,14 +22,25 @@ class TrackletBuffer:
         tracklet.entries.append(entry)
         if len(tracklet.entries) > self.max_entries:
             tracklet.entries = tracklet.entries[-self.max_entries:]
+            tracklet.created_at_ns = tracklet.entries[0].timestamp_ns
+
+    def _is_ready(self, tracklet: Tracklet, current_time_ns: int) -> bool:
+        if len(tracklet.entries) < self.min_entries:
+            return False
+        if len(tracklet.entries) >= self.max_entries:
+            return True
+        first_ts = tracklet.entries[0].timestamp_ns if tracklet.entries else tracklet.created_at_ns
+        last_ts = tracklet.entries[-1].timestamp_ns if tracklet.entries else first_ts
+        observed_span_ns = max(0, int(last_ts) - int(first_ts))
+        buffered_age_ns = max(0, int(current_time_ns) - int(first_ts))
+        return max(observed_span_ns, buffered_age_ns) >= self.window_ns
 
     def get_ready_tracklets(self, current_time_ns: int) -> list[Tracklet]:
         ready = []
         for tracklet in self.tracklets.values():
             if tracklet.state != TrackletState.ACTIVE:
                 continue
-            has_enough = len(tracklet.entries) >= self.min_entries
-            if has_enough:
+            if self._is_ready(tracklet, current_time_ns):
                 tracklet.state = TrackletState.READY
                 ready.append(tracklet)
         return ready
@@ -46,7 +57,7 @@ class TrackletBuffer:
                 continue
             if tracklet.state != TrackletState.ACTIVE:
                 continue
-            if len(tracklet.entries) < self.min_entries:
+            if not self._is_ready(tracklet, current_time_ns):
                 continue
             del self.tracklets[tid]
             tracklet.state = TrackletState.READY

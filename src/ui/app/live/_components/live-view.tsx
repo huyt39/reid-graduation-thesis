@@ -19,11 +19,11 @@ export function LiveView() {
 
   const processed = useWebSocket(`${WS_URL}/ws`, selectedDevice, {
     enabled: isLiveActive,
-    maxFps: 6,
+    maxFps: 30,
   });
   const raw = useWebSocket(`${WS_URL}/ws/raw`, selectedDevice, {
     enabled: isLiveActive,
-    maxFps: 6,
+    maxFps: 30,
   });
 
   const deviceIds = Array.from(new Set([...processed.deviceIds, ...raw.deviceIds]));

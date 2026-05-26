@@ -365,6 +365,28 @@ def test_existing_match_returns_person_even_when_canonical_update_is_skipped():
     assert alloc_calls["n"] == 0
 
 
+def test_existing_match_can_block_canonical_update_for_unclean_evidence():
+    store = MockQdrantStore()
+    store.search_results = [(42, 0.93)]
+    matcher = ReIDMatcher(store, id_allocator=_make_id_allocator())
+    emb = np.random.randn(512).astype(np.float32)
+
+    pid = matcher.match_tracklet(
+        track_id=50,
+        embedding=emb,
+        v_avg=0.9,
+        embedding_consistency=0.95,
+        tracklet_len=10,
+        allow_gallery_update=False,
+    )
+
+    assert pid == 42
+    assert store.gated_update_calls == []
+    decision = matcher.pop_last_decision(50)
+    assert decision["method"] == "gallery_match"
+    assert decision["canonical_update_applied"] is False
+
+
 def test_blocked_person_is_not_reused_by_score_only():
     store = MockQdrantStore()
     store.search_results = [(42, 0.98)]

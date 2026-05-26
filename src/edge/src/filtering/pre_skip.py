@@ -1,3 +1,7 @@
+import cv2
+import numpy as np
+
+
 class PreFrameSkipper:
     def __init__(
         self,
@@ -16,9 +20,32 @@ class PreFrameSkipper:
 
         self.latest_box_count = 0
         self.frames_until_next_process = 0
+        self._last_gray = None
+
+    def _downsample_gray(self, frame):
+        resized = cv2.resize(frame, self.gray_size, interpolation=cv2.INTER_AREA)
+        if resized.ndim == 2:
+            return resized
+        return cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+
+    def _remember_frame(self, frame) -> None:
+        self._last_gray = self._downsample_gray(frame)
+
+    def _has_large_change(self, frame) -> bool:
+        if self._last_gray is None:
+            return True
+        gray = self._downsample_gray(frame)
+        diff = np.mean(cv2.absdiff(gray, self._last_gray))
+        return bool(diff >= (255.0 * self.criterion_scale))
 
     def should_process(self, frame) -> bool:
         if self.frames_until_next_process <= 0:
+            self._remember_frame(frame)
+            return True
+
+        if self._has_large_change(frame):
+            self._remember_frame(frame)
+            self.frames_until_next_process = 0
             return True
 
         self.frames_until_next_process -= 1

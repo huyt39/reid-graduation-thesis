@@ -195,7 +195,7 @@ export function useWebSocket(
   selectedDevice: string | null = null,
   options: UseWebSocketOptions = {}
 ): UseWebSocketResult {
-  const { enabled = true, maxFps = 6 } = options;
+  const { enabled = true, maxFps = 30 } = options;
   const [connectionState, setConnectionState] = useState<ConnectionState>("disconnected");
   const [deviceIds, setDeviceIds] = useState<string[]>([]);
   const [framesByDevice, setFramesByDevice] = useState<Record<string, FrameUpdate>>({});

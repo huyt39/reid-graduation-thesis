@@ -61,6 +61,8 @@ def test_readyz_returns_ready_when_kafka_loop_is_running():
     try:
         app_module.streaming_state["kafka_loop_running"] = True
         app_module.streaming_state["kafka_loop_failed"] = False
+        app_module.streaming_state["raw_kafka_loop_running"] = True
+        app_module.streaming_state["raw_kafka_loop_failed"] = False
 
         c = TestClient(app)
         r = c.get("/readyz")
@@ -72,6 +74,8 @@ def test_readyz_returns_ready_when_kafka_loop_is_running():
     assert r.json()["checks"] == {
         "kafka_loop_running": True,
         "kafka_loop_failed": False,
+        "raw_kafka_loop_running": True,
+        "raw_kafka_loop_failed": False,
     }
 
 
@@ -91,4 +95,6 @@ def test_readyz_returns_503_when_kafka_loop_failed():
     assert r.json()["detail"]["checks"] == {
         "kafka_loop_running": False,
         "kafka_loop_failed": True,
+        "raw_kafka_loop_running": False,
+        "raw_kafka_loop_failed": False,
     }

@@ -27,9 +27,9 @@ class ReIDMatcher:
         new_identity_min_tracklet_len: int = 6,
         # Default to 0 so legacy unit tests that don't model
         # high-quality-frame counting still pass through the gate.
-        # Production wiring in workers/main.py passes the real value
-        # (settings.min_high_quality_frames, default 2) which enforces
-        # the PDF Bước 5 condition.
+        # Production wiring in workers/main.py passes the configured
+        # settings.min_high_quality_frames value, enforcing the PDF Bước 5
+        # condition in runtime.
         min_high_quality_frames: int = 0,
         update_v_threshold: float = 0.6,
         update_consistency_threshold: float = 0.7,
@@ -442,6 +442,7 @@ class ReIDMatcher:
         on_new_identity: Callable[[int], None] | None = None,
         good_streak: int = 0,
         allow_tentative_fallback: bool = True,
+        allow_gallery_update: bool = True,
     ) -> int | None:
         # on_new_identity fires synchronously after a new pid is allocated,
         # before match_tracklet returns. Used by the worker to register the
@@ -644,7 +645,7 @@ class ReIDMatcher:
                         f"Track {track_id} matched to person {best_pid} (sim={best_score:.3f})"
                     )
                     updated = False
-                    if not is_low_visibility:
+                    if not is_low_visibility and allow_gallery_update:
                         updated = self.store.gated_momentum_update(
                             person_id=best_pid,
                             new_embedding=embedding,
@@ -770,25 +771,12 @@ class ReIDMatcher:
             )
             reuse_person_id = None
 
-        # Note: tracklet_len IS the design's third conjunctive gate, but the
-        # codebase already enforces it via _defer_short_new_identity inside the
-        # can_promote=True branch (line ~568), which records a distinct
-        # "provisional_short_tracklet" status for diagnostic clarity rather
-        # than collapsing it into the generic "quality_gate" path. Leave
-        # can_promote as v_avg + consistency only; the downstream length
-        # check still preserves the design's policy semantics.
-        # PDF Bước 2 — alternative promotion path. A sustained run of consecutive
-        # high-quality frames is a strong occlusion-tolerant signal: a person
-        # clearly detected for K consecutive frames is real even if their v_avg
-        # or embedding_consistency dips (heavily-occluded boundary-region case).
-        can_promote_streak = (
-            self.good_streak_promotion_enabled
-            and int(good_streak or 0) >= self.good_streak_min_consecutive
-        )
+        # PDF Bước 5: creating a new identity remains a conjunctive decision.
+        # The good-frame streak is useful evidence recorded by the worker, but
+        # it must not bypass the visibility + embedding-consistency gates.
         can_promote = (
-            (v_avg >= self.promote_v_threshold
-             and embedding_consistency >= self.promote_consistency_threshold)
-            or can_promote_streak
+            v_avg >= self.promote_v_threshold
+            and embedding_consistency >= self.promote_consistency_threshold
         )
         if can_promote and not allow_new_identity and allow_capped_soft_match:
             capped_pid = self._soft_match_existing(

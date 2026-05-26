@@ -184,7 +184,8 @@ class QdrantPersonStore:
             return False
         if tracklet_len < update_min_tracklet_len:
             return False
-        # max-of-gallery rather than anchor-only — see Defect 1 in the fix plan.
+        # Use max-of-gallery rather than anchor-only so canonical evidence can
+        # grow across valid pose and lighting changes.
         best_score = self.search_person(person_id, new_embedding, min_score=0.0)
         if best_score is not None and best_score < update_anchor_min_score:
             return False

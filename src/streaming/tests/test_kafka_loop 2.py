@@ -64,7 +64,7 @@ def test_run_kafka_loop_throttles_broadcasts_per_device(monkeypatch):
     monkeypatch.setattr(
         kafka_loop,
         "_decode_frame",
-        lambda msg, jpeg_quality, *, minio_urls, source: FrameData(
+        lambda msg, *, minio_urls, source: FrameData(
             device_id=msg["device_id"],
             frame_number=msg["frame_number"],
             tracked_persons=[],
@@ -81,7 +81,6 @@ def test_run_kafka_loop_throttles_broadcasts_per_device(monkeypatch):
                 cache,
                 broadcaster,
                 max_poll_records=10,
-                jpeg_quality=75,
                 broadcast_max_fps=1.0,
             )
         )

@@ -880,5 +880,9 @@ class MongoPersonStore:
             {"person_id": person_id}, {"$set": attr_set}
         )
 
+    async def recompute_person_attributes(self, person_id: int) -> None:
+        """Refresh person-level attributes from confirmed sighting evidence."""
+        await self._recompute_voted_attributes(person_id)
+
     def close(self) -> None:
         self._client.close()

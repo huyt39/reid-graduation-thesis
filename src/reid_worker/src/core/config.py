@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     recent_person_reuse_min_iou: float = 0.2
     recent_person_reuse_max_center_distance_ratio: float = 0.75
 
-    tracklet_min_entries: int = 4
+    tracklet_min_entries: int = 6
     tracklet_max_entries: int = 60
     tracklet_window_seconds: float = 3.0
     tracklet_stale_seconds: float = 5.0
@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     topk_k: int = 5
     topk_min_temporal_gap: int = 3
     overlap_lambda: float = 0.3
-    min_high_quality_frames: int = 2
+    min_high_quality_frames: int = 3
     high_quality_threshold: float = 0.55
     # PDF Bước 2 — tracklet consistency features (bbox_size_stability,
     # position_stability, good_frame_ratio) act as a coarse
@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     # against the running buffer mean. If cosine sim < tracklet_split_threshold
     # the frame is split off into a virtual track_id rather than poisoning the
     # buffer. Cuts contamination from ByteTrack ID-swaps during occlusion.
-    tracklet_appearance_gate_enabled: bool = False
+    tracklet_appearance_gate_enabled: bool = True
     tracklet_appearance_gate_min_v: float = 0.6
     tracklet_split_threshold: float = 0.55
     # The appearance gate calls the embedding service from the per-frame input
@@ -177,11 +177,12 @@ class Settings(BaseSettings):
     untracked_cluster_promote_enabled: bool = True
     untracked_cluster_promote_min_entries: int = 6
     untracked_cluster_promote_min_visibility: float = 0.65
-    # High-confidence brief-appearance tier: a person clearly visible for only a
-    # few frames (e.g., boundary-crossing) should still be ReID-able. The match-
-    # consistency gate downstream prevents this tier from minting duplicates.
-    untracked_cluster_promote_min_entries_fast: int = 4
+    # High-confidence tier recovers short, clean untracked clusters that
+    # ByteTrack missed. It still requires 5 frames plus a strong consistency
+    # gate, so 2-4 frame static/object bursts remain occlusion candidates.
+    untracked_cluster_promote_min_entries_fast: int = 5
     untracked_cluster_promote_min_visibility_fast: float = 0.85
+    untracked_cluster_promote_fast_min_overall_consistency: float = 0.88
     recover_stale_tracklets_enabled: bool = True
     # Keep short occlusion fragments as evidence only by default. Promoting a
     # 2-4 frame fragment to a confirmed identity caused duplicate IDs on
@@ -201,20 +202,16 @@ class Settings(BaseSettings):
 
     promote_v_threshold: float = 0.6
     promote_consistency_threshold: float = 0.65
-    # PDF Bước 2 — "good frame streak" as an alternative promotion path. A
-    # tracklet with K consecutive frames at v_score >= high_quality_threshold
-    # is a strong occlusion-tolerant signal even if v_avg or
-    # embedding_consistency dip. This is an OR-condition with the standard
-    # gates, not a relaxation of them. K must be large enough that random
-    # noise / spurious detections don't trip it (consecutive run requirement
-    # already filters most false positives).
+    synthetic_new_identity_min_overall_consistency: float = 0.75
+    # PDF Bước 2 — "good frame streak" is a tracklet-quality signal. It is
+    # recorded and passed through the matcher, but new identity creation still
+    # follows the conjunctive delayed-promotion gates from Bước 5.
     good_streak_promotion_enabled: bool = True
     good_streak_min_consecutive: int = 4
-    # Aligned with untracked_cluster_promote_min_entries_fast (4). The
-    # mismatch where the fast tier promoted at 4 entries but new identity
-    # required 6 was leaving brief-but-high-quality clusters (the boundary
-    # man's case) permanently stuck in tentative state.
-    new_identity_min_tracklet_len: int = 4
+    # New identities need enough temporal support to avoid minting duplicates
+    # from brief occlusion fragments. Shorter fragments may still attach as
+    # provisional occlusion evidence or remain tentative.
+    new_identity_min_tracklet_len: int = 6
 
     tentative_max_attempts: int = 5
     # Kept True because borderline-quality persons (partial body, occluded)
@@ -229,6 +226,8 @@ class Settings(BaseSettings):
     update_consistency_threshold: float = 0.7
     update_min_tracklet_len: int = 5
     update_sim_threshold: float = 0.55
+    gallery_update_max_overlap_ratio: float = 0.25
+    gallery_update_min_overall_consistency: float = 0.80
     # The design doc (ReID-Pipeline.pdf, Bước 5) specifies a single matching
     # threshold. The historical soft_match / eager_soft_match paths added in
     # earlier iterations were a backdoor that accepted matches BELOW the
@@ -250,8 +249,7 @@ class Settings(BaseSettings):
     # which would otherwise pollute a confirmed person's gallery & snapshots.
     match_consistency_threshold: float = 0.55
     # Multi-person/occluded crops are useful evidence for recovery, but they
-    # must not become canonical identity evidence. Keep this aligned with the
-    # occlusion attribute unreliability cutoff used in workers/main.py.
+    # must not become canonical identity evidence.
     person_snapshot_max_overlap_ratio: float = 0.35
     current_identity_min_score: float = 0.50
     # Current track continuity is useful under occlusion, but it must lose when
@@ -332,12 +330,9 @@ class Settings(BaseSettings):
     static_artifact_filter_enabled: bool = True
     static_artifact_max_mean_width_px: float = 130.0
     static_artifact_max_mean_height_px: float = 260.0
-    # True static objects (WC icons, fire extinguishers) produce 0.01-0.03
-    # path_displacement_ratio from JPEG noise / bbox jitter alone. A standing
-    # but real person produces 0.10+. The previous thresholds (0.35 / 0.18)
-    # were loose enough to suppress real persons standing near the frame edge
-    # (the project's primary target: occluded persons on the right side of
-    # the video). Tightened to actual-static-object ranges.
+    # True static false positives usually produce only tiny bbox jitter. Keep
+    # this filter narrow so standing or boundary-truncated people remain valid
+    # occlusion evidence rather than being suppressed as background artifacts.
     static_artifact_max_path_displacement_ratio: float = 0.05
     static_artifact_max_endpoint_displacement_ratio: float = 0.02
     static_artifact_min_bbox_stability: float = 0.97
@@ -517,20 +512,9 @@ class Settings(BaseSettings):
     duplicate_merge_spatial_continuation_max_gap_frames: int = 60
     duplicate_merge_spatial_continuation_max_center_distance_ratio: float = 0.30
     # Per-sighting confidence required for a gender label to count when
-    # checking cross-gender disagreement at merge time. Calibrated against the
-    # empirical distribution of this gender model:
-    #   - Good crop (well-lit full body):       0.91 – 0.99
-    #   - Partial body / mid-distance:          0.81 – 0.90 (the wide band where
-    #                                            most real males in this video
-    #                                            sit; e.g., max 0.8473)
-    #   - Small/poor crop / model uncertain:    0.76 – 0.80
-    #   - Noise / model guessing:               <0.70
-    # 0.80 sits just above the noise floor and catches the real-male partial
-    # band. Trade-off the user explicitly chose: a person whom the gender
-    # model systematically mislabels at conf >= 0.80 will be treated as "pure"
-    # that wrong gender, preventing their over-split from being auto-merged.
-    # That's acceptable because cross-gender gallery contamination is more
-    # harmful than over-split.
+    # checking cross-gender disagreement at merge time. Attribute disagreement
+    # is supporting evidence only; high appearance confidence can still override
+    # noisy attributes through the duplicate-merge policy above.
     gender_block_sighting_confidence: float = 0.80
 
     model_config = SettingsConfigDict(

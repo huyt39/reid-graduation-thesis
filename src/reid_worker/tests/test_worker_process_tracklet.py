@@ -4199,6 +4199,46 @@ def test_untracked_detection_cluster_persists_after_temporal_support():
     assert kwargs["candidate_id_override"].startswith("cam-1:untracked_cluster:")
 
 
+def test_synthetic_fast_tracklet_ready_requires_five_clean_frames():
+    pipeline = _make_pipeline()
+    pipeline.settings.untracked_cluster_promote_min_entries_fast = 5
+    pipeline.settings.untracked_cluster_promote_min_visibility_fast = 0.85
+    pipeline.settings.untracked_cluster_promote_fast_min_overall_consistency = 0.88
+    pipeline.settings.high_quality_threshold = 0.55
+    pipeline.settings.min_high_quality_frames = 3
+
+    four_frame_tracklet = Tracklet(
+        track_id=-9001,
+        entries=[_make_entry(i, v_score=0.92, overlap_ratio=0.0) for i in range(4)],
+    )
+    five_frame_tracklet = Tracklet(
+        track_id=-9002,
+        entries=[_make_entry(i, v_score=0.92, overlap_ratio=0.0) for i in range(5)],
+    )
+    regular_tracklet = Tracklet(
+        track_id=12,
+        entries=[_make_entry(i, v_score=0.92, overlap_ratio=0.0) for i in range(5)],
+    )
+
+    assert not pipeline._is_synthetic_fast_tracklet_ready(four_frame_tracklet)
+    assert pipeline._is_synthetic_fast_tracklet_ready(five_frame_tracklet)
+    assert not pipeline._is_synthetic_fast_tracklet_ready(regular_tracklet)
+
+
+def test_synthetic_fast_tracklet_rejects_incoherent_cluster():
+    pipeline = _make_pipeline()
+    pipeline.settings.untracked_cluster_promote_min_entries_fast = 5
+    pipeline.settings.untracked_cluster_promote_min_visibility_fast = 0.85
+    pipeline.settings.untracked_cluster_promote_fast_min_overall_consistency = 0.88
+    pipeline.settings.high_quality_threshold = 0.55
+    pipeline.settings.min_high_quality_frames = 3
+    entries = [_make_entry(i, v_score=0.92, overlap_ratio=0.0) for i in range(5)]
+    entries[-1].bbox_xyxy = [180.0, 20.0, 220.0, 120.0]
+    tracklet = Tracklet(track_id=-9003, entries=entries)
+
+    assert not pipeline._is_synthetic_fast_tracklet_ready(tracklet)
+
+
 def test_process_tracklet_match_success_updates_state_and_persists(monkeypatch):
     pipeline = _make_pipeline()
     removed_track_ids = []
@@ -4860,9 +4900,13 @@ def test_short_fragment_near_gallery_defer_attaches_as_provisional(monkeypatch):
     async def fake_persist_tracklet(**kwargs):
         persisted["tracklet"] = kwargs
 
+    async def fake_persist_occlusion_candidate(tracklet, **kwargs):
+        persisted["candidate"] = {"tracklet": tracklet, **kwargs}
+
     pipeline.qdrant_store = DummyQdrant()
     pipeline.model_client = DummyModelClient()
     pipeline._persist_tracklet = fake_persist_tracklet
+    pipeline._persist_occlusion_candidate = fake_persist_occlusion_candidate
     pipeline.attribute_voter.resolve_person(42, {"gender": ("male", 0.95)})
     monkeypatch.setattr(
         "src.workers.main.cv2.imencode",
@@ -4897,9 +4941,10 @@ def test_short_fragment_near_gallery_defer_attaches_as_provisional(monkeypatch):
 
     assert person_id == 42
     assert "add_person" not in persisted
-    assert persisted["tracklet"]["person_id"] == 42
-    assert persisted["tracklet"]["matching"]["method"] == "occlusion_provisional_match"
-    assert persisted["tracklet"]["matching"]["provisional"] is True
+    assert "tracklet" not in persisted
+    assert persisted["candidate"]["tracklet"].person_id == 42
+    assert persisted["candidate"]["matching"]["method"] == "occlusion_provisional_match"
+    assert persisted["candidate"]["matching"]["provisional"] is True
 
 
 def test_new_identity_allocation_blocks_stale_backlog_tracklet(monkeypatch):
