@@ -2,31 +2,35 @@
 
 import { useState, useCallback } from "react";
 import { searchClient } from "@/lib/api/search-client";
+import type { NLQueryResult } from "@/types";
 
 interface UseSearchResult {
-  result: unknown;
+  result: NLQueryResult | null;
   isLoading: boolean;
   error: string | null;
-  run: (queryType: string, params: Record<string, unknown>) => Promise<void>;
+  runNatural: (query: string) => Promise<void>;
   reset: () => void;
 }
 
 export function useSearch(): UseSearchResult {
-  const [result, setResult] = useState<unknown>(null);
+  const [result, setResult] = useState<NLQueryResult | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const run = useCallback(async (queryType: string, params: Record<string, unknown>) => {
+  const runNatural = useCallback(async (query: string) => {
     setIsLoading(true);
     setError(null);
-    const response = await searchClient.structured(queryType, params);
-    if (response.error) {
-      setError(response.error);
-      setResult(null);
-    } else {
-      setResult(response.data);
+    try {
+      const response = await searchClient.natural(query);
+      if (response.error) {
+        setError(response.error);
+        setResult(null);
+      } else {
+        setResult(response.data);
+      }
+    } finally {
+      setIsLoading(false);
     }
-    setIsLoading(false);
   }, []);
 
   const reset = useCallback(() => {
@@ -34,5 +38,5 @@ export function useSearch(): UseSearchResult {
     setError(null);
   }, []);
 
-  return { result, isLoading, error, run, reset };
+  return { result, isLoading, error, runNatural, reset };
 }

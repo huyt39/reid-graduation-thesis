@@ -53,6 +53,8 @@ export function PersonsList() {
                   alt={`Person ${person.person_id} snapshot`}
                   label={`#${person.person_id}`}
                   className="mb-4 aspect-[4/5]"
+                  previewTitle={`Person #${person.person_id} snapshot`}
+                  previewDescription="Snapshot used as the current representative image for this person."
                 />
                 <CardTitle className="flex items-center justify-between text-base">
                   <span>#{person.person_id}</span>
