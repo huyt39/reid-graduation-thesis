@@ -59,6 +59,8 @@ export interface TrackletFrameSample {
   visibility_score: number;
   overlap_ratio: number;
   selected: boolean;
+  selection_reason: string;
+  crop_url: string | null;
 }
 
 export interface TrackletEvidence {
@@ -80,6 +82,22 @@ export interface Tracklet {
   evidence: TrackletEvidence;
   best_crop_url: string | null;
   created_at: string | null;
+}
+
+export interface OcclusionCandidate {
+  candidate_id: string;
+  track_id: number;
+  device_id: string;
+  reason: string;
+  status: string;
+  frame_range: Record<string, number>;
+  entry_count: number;
+  quality: TrackletQuality;
+  matching: TrackletMatching;
+  evidence: TrackletEvidence;
+  best_crop_url: string | null;
+  created_at: string | null;
+  updated_at: string | null;
 }
 
 export interface TimelineEvent {
@@ -140,6 +158,13 @@ export interface PaginatedTracklets {
   page_size: number;
 }
 
+export interface PaginatedOcclusionCandidates {
+  items: OcclusionCandidate[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
 export interface PaginatedTimeline {
   items: TimelineEvent[];
   total: number;
@@ -164,6 +189,7 @@ export interface ParsedQuery {
 export interface NLQueryResult {
   parsed_query?: ParsedQuery;
   result?: unknown;
+  summary?: string;
   message?: string;
 }
 
