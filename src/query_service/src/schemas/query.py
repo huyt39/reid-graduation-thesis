@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # Requests
@@ -127,8 +127,24 @@ class SortSpec(BaseModel):
 # Responses
 
 class PersonAttributes(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     gender: str = "unknown"
     gender_confidence: float = 0.0
+    age_child: str = "unknown"
+    age_child_confidence: float = 0.0
+    backpack: str = "unknown"
+    backpack_confidence: float = 0.0
+    sidebag: str = "unknown"
+    sidebag_confidence: float = 0.0
+    hat: str = "unknown"
+    hat_confidence: float = 0.0
+    glasses: str = "unknown"
+    glasses_confidence: float = 0.0
+    sleeve: str = "unknown"
+    sleeve_confidence: float = 0.0
+    lower: str = "unknown"
+    lower_confidence: float = 0.0
 
 
 class PersonStats(BaseModel):

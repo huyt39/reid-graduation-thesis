@@ -33,7 +33,8 @@ import {
 } from "@/lib/reid-evidence";
 import { cn } from "@/lib/utils";
 import { formatDateTime, formatRelative } from "@/lib/date-format";
-import type { Tracklet } from "@/types";
+import { confidenceLabel, getAttributeGroups } from "@/lib/person-attributes";
+import type { PersonAttributes, Tracklet } from "@/types";
 
 export function PersonDetail({ personId }: { personId: number }) {
   const { data: person, isLoading, error } = usePerson(personId);
@@ -58,6 +59,7 @@ export function PersonDetail({ personId }: { personId: number }) {
 
   const tracklets = trackletsData?.items ?? [];
   const trackletsById = new Map(tracklets.map((tracklet) => [tracklet.tracklet_id, tracklet]));
+  const attributeGroups = getAttributeGroups(person.attributes);
 
   return (
     <div className="space-y-6">
@@ -81,17 +83,13 @@ export function PersonDetail({ personId }: { personId: number }) {
           />
           <div className="space-y-5">
             <div className="grid gap-4 text-sm sm:grid-cols-2 lg:grid-cols-3">
-              <Field label="Gender" value={person.attributes.gender || "—"} />
-              <Field
-                label="Gender confidence"
-                value={`${(person.attributes.gender_confidence * 100).toFixed(1)}%`}
-              />
               <Field label="Sightings" value={person.stats.sighting_count.toLocaleString()} />
               <Field label="Last device" value={person.stats.last_seen_device || "—"} />
               <Field label="First seen" value={formatDateTime(person.stats.first_seen_at)} />
               <Field label="Last seen" value={formatDateTime(person.stats.last_seen_at)} />
               <Field label="Source" value={person.source} />
             </div>
+            <AttributesPanel attributes={person.attributes} groups={attributeGroups} />
             <EvidenceSummary tracklets={tracklets} isLoading={isTrackletsLoading} />
           </div>
         </CardContent>
@@ -117,6 +115,63 @@ export function PersonDetail({ personId }: { personId: number }) {
           <SimilarTab personId={personId} />
         </TabsContent>
       </Tabs>
+    </div>
+  );
+}
+
+function AttributesPanel({
+  attributes,
+  groups,
+}: {
+  attributes: PersonAttributes;
+  groups: ReturnType<typeof getAttributeGroups>;
+}) {
+  if (groups.length === 0) {
+    return (
+      <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
+        Attribute evidence is not confident enough to display yet.
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-lg border bg-muted/20 p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <div className="text-sm font-medium">Attributes</div>
+          <div className="text-xs text-muted-foreground">
+            Stable person-level votes from confirmed tracklets
+          </div>
+        </div>
+        {attributes.gender && attributes.gender !== "unknown" && (
+          <Badge variant="secondary" className="capitalize">
+            {attributes.gender} · {confidenceLabel(attributes.gender_confidence)}
+          </Badge>
+        )}
+      </div>
+      <div className="grid gap-3 md:grid-cols-3">
+        {groups.map((group) => (
+          <div key={group.title} className="space-y-2">
+            <div className="text-[11px] uppercase tracking-wide text-muted-foreground">
+              {group.title}
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {group.items.map((item) => (
+                <Badge
+                  key={String(item.key)}
+                  variant={item.tone === "default" ? "default" : "outline"}
+                  className="max-w-full font-normal capitalize"
+                >
+                  {item.label}: {item.value}
+                  {item.confidence !== null && (
+                    <span className="ml-1 opacity-70">{confidenceLabel(item.confidence)}</span>
+                  )}
+                </Badge>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { PersonSnapshot } from "@/components/person-snapshot";
 import { usePersons } from "@/hooks/use-persons";
 import { formatRelative } from "@/lib/date-format";
+import { getCompactAttributes } from "@/lib/person-attributes";
 
 export function PersonsList() {
   const [page, setPage] = useState(1);
@@ -44,46 +45,62 @@ export function PersonsList() {
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-        {items.map((person) => (
-          <Link key={person.person_id} href={`/persons/${person.person_id}`}>
-            <Card className="hover:border-primary/40 transition-colors h-full">
-              <CardHeader className="pb-3">
-                <PersonSnapshot
-                  src={person.snapshot_url}
-                  alt={`Person ${person.person_id} snapshot`}
-                  label={`#${person.person_id}`}
-                  className="mb-4 aspect-[4/5]"
-                  previewTitle={`Person #${person.person_id} snapshot`}
-                  previewDescription="Snapshot used as the current representative image for this person."
-                />
-                <CardTitle className="flex items-center justify-between text-base">
-                  <span>#{person.person_id}</span>
-                  <Badge variant={person.is_active ? "default" : "secondary"}>
-                    {person.is_active ? "Active" : "Inactive"}
-                  </Badge>
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Gender</span>
-                  <span className="capitalize">{person.attributes.gender || "—"}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Sightings</span>
-                  <span>{person.stats.sighting_count.toLocaleString()}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Last seen</span>
-                  <span>{formatRelative(person.stats.last_seen_at)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Last device</span>
-                  <span className="text-xs">{person.stats.last_seen_device || "—"}</span>
-                </div>
-              </CardContent>
-            </Card>
-          </Link>
-        ))}
+        {items.map((person) => {
+          const compactAttributes = getCompactAttributes(person.attributes);
+          return (
+            <Link key={person.person_id} href={`/persons/${person.person_id}`}>
+              <Card className="hover:border-primary/40 transition-colors h-full">
+                <CardHeader className="pb-3">
+                  <PersonSnapshot
+                    src={person.snapshot_url}
+                    alt={`Person ${person.person_id} snapshot`}
+                    label={`#${person.person_id}`}
+                    className="mb-4 aspect-[4/5]"
+                    previewTitle={`Person #${person.person_id} snapshot`}
+                    previewDescription="Snapshot used as the current representative image for this person."
+                  />
+                  <CardTitle className="flex items-center justify-between text-base">
+                    <span>#{person.person_id}</span>
+                    <Badge variant={person.is_active ? "default" : "secondary"}>
+                      {person.is_active ? "Active" : "Inactive"}
+                    </Badge>
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-2 text-sm">
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Gender</span>
+                    <span className="capitalize">{person.attributes.gender || "—"}</span>
+                  </div>
+                  {compactAttributes.length > 0 && (
+                    <div className="flex flex-wrap gap-1 pt-1">
+                      {compactAttributes.map((attribute) => (
+                        <Badge
+                          key={String(attribute.key)}
+                          variant="outline"
+                          className="max-w-full text-[10px] font-normal capitalize"
+                        >
+                          {attribute.label}: {attribute.value}
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Sightings</span>
+                    <span>{person.stats.sighting_count.toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Last seen</span>
+                    <span>{formatRelative(person.stats.last_seen_at)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Last device</span>
+                    <span className="text-xs">{person.stats.last_seen_device || "—"}</span>
+                  </div>
+                </CardContent>
+              </Card>
+            </Link>
+          );
+        })}
       </div>
 
       <div className="flex items-center justify-between pt-2">

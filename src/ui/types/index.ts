@@ -2,8 +2,23 @@
 // Keep field names and shapes in sync — the gateway proxies these unchanged.
 
 export interface PersonAttributes {
+  [key: string]: number | string | undefined;
   gender: string;
   gender_confidence: number;
+  age_child?: string;
+  age_child_confidence?: number;
+  backpack?: string;
+  backpack_confidence?: number;
+  sidebag?: string;
+  sidebag_confidence?: number;
+  hat?: string;
+  hat_confidence?: number;
+  glasses?: string;
+  glasses_confidence?: number;
+  sleeve?: string;
+  sleeve_confidence?: number;
+  lower?: string;
+  lower_confidence?: number;
 }
 
 export interface PersonStats {
@@ -197,6 +212,13 @@ export interface PersonSearchFilters {
   person_id?: number;
   gender?: string;
   gender_confidence_min?: number;
+  age_child?: string;
+  backpack?: string;
+  sidebag?: string;
+  hat?: string;
+  glasses?: string;
+  sleeve?: string;
+  lower?: string;
   last_seen_device?: string;
   first_seen_after?: string;
   first_seen_before?: string;
