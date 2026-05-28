@@ -54,6 +54,10 @@ class ReIDMatcher:
         near_gallery_defer_threshold: float = 0.50,
         good_streak_min_consecutive: int = 4,
         good_streak_promotion_enabled: bool = True,
+        scale_aux_gallery_enabled: bool = True,
+        scale_aux_match_threshold: float = 0.70,
+        scale_aux_match_margin: float = 0.03,
+        scale_aux_full_gallery_min_score: float = 0.0,
     ):
         self.store = qdrant_store
         self.id_allocator = id_allocator
@@ -86,6 +90,10 @@ class ReIDMatcher:
         self.near_gallery_defer_threshold = near_gallery_defer_threshold
         self.good_streak_min_consecutive = int(good_streak_min_consecutive)
         self.good_streak_promotion_enabled = bool(good_streak_promotion_enabled)
+        self.scale_aux_gallery_enabled = bool(scale_aux_gallery_enabled)
+        self.scale_aux_match_threshold = float(scale_aux_match_threshold)
+        self.scale_aux_match_margin = float(scale_aux_match_margin)
+        self.scale_aux_full_gallery_min_score = float(scale_aux_full_gallery_min_score)
 
     def _has_enough_new_identity_evidence(self, tracklet_len: int) -> bool:
         return int(tracklet_len or 0) >= self.new_identity_min_tracklet_len
@@ -381,6 +389,86 @@ class ReIDMatcher:
         )
         return True
 
+    def _scale_aux_gallery_match(
+        self,
+        *,
+        track_id: int,
+        embedding: np.ndarray,
+        blocked_person_ids: set[int],
+        forbidden_person_ids: set[int],
+        recent_incompatible_person_ids: set[int],
+        tentative_attempts: int | None,
+    ) -> int | None:
+        search_upper_body = getattr(self.store, "search_upper_body", None)
+        if not callable(search_upper_body):
+            return None
+        hits = search_upper_body(
+            embedding,
+            top_k=3,
+            score_threshold=self.scale_aux_match_threshold,
+        )
+        eligible = [
+            (pid, score) for pid, score in (hits or [])
+            if pid not in blocked_person_ids
+            and pid not in forbidden_person_ids
+            and pid not in recent_incompatible_person_ids
+        ]
+        if not eligible:
+            return None
+        pid, score = eligible[0]
+        runner_up = eligible[1][1] if len(eligible) > 1 else None
+        gap = (score - runner_up) if runner_up is not None else float("inf")
+        full_gallery_score = None
+        if self.scale_aux_full_gallery_min_score > 0.0:
+            full_gallery_score = self.store.search_person(
+                pid,
+                embedding,
+                min_score=self.scale_aux_full_gallery_min_score,
+            )
+            if full_gallery_score is None:
+                self._record_decision(
+                    track_id,
+                    method="scale_aux_rejected_low_full_gallery_support",
+                    source="upper_body_gallery",
+                    similarity_score=float(score),
+                    runner_up_score=None if runner_up is None else float(runner_up),
+                    margin_to_runner_up=float(gap),
+                    reuse_person_id=pid,
+                    tentative_attempts=tentative_attempts,
+                    canonical_update_applied=None,
+                )
+                return None
+        if gap < self.scale_aux_match_margin:
+            self._record_decision(
+                track_id,
+                method="scale_aux_ambiguous_rejected",
+                source="upper_body_gallery",
+                similarity_score=float(score),
+                runner_up_score=None if runner_up is None else float(runner_up),
+                margin_to_runner_up=float(gap),
+                reuse_person_id=None,
+                tentative_attempts=tentative_attempts,
+                canonical_update_applied=None,
+            )
+            return None
+        self._record_decision(
+            track_id,
+            method="scale_aux_gallery_match",
+            source="upper_body_gallery",
+            similarity_score=float(score),
+            full_gallery_score=None if full_gallery_score is None else float(full_gallery_score),
+            runner_up_score=None if runner_up is None else float(runner_up),
+            margin_to_runner_up=None if runner_up is None else float(gap),
+            reuse_person_id=None,
+            tentative_attempts=tentative_attempts,
+            canonical_update_applied=False,
+        )
+        logger.info(
+            f"Track {track_id} matched via upper-body auxiliary gallery to person "
+            f"{pid} (sim={score:.3f}, gap={gap:.3f})"
+        )
+        return pid
+
     def _create_new_identity_decision(
         self,
         *,
@@ -443,6 +531,8 @@ class ReIDMatcher:
         good_streak: int = 0,
         allow_tentative_fallback: bool = True,
         allow_gallery_update: bool = True,
+        scale_aux_embedding: np.ndarray | None = None,
+        allow_scale_aux_match: bool = False,
     ) -> int | None:
         # on_new_identity fires synchronously after a new pid is allocated,
         # before match_tracklet returns. Used by the worker to register the
@@ -771,6 +861,24 @@ class ReIDMatcher:
             )
             reuse_person_id = None
 
+        if (
+            self.scale_aux_gallery_enabled
+            and allow_scale_aux_match
+            and scale_aux_embedding is not None
+            and current_person_id is None
+        ):
+            aux_pid = self._scale_aux_gallery_match(
+                track_id=track_id,
+                embedding=scale_aux_embedding,
+                blocked_person_ids=blocked_person_ids,
+                forbidden_person_ids=forbidden_person_ids,
+                recent_incompatible_person_ids=recent_incompatible_person_ids,
+                tentative_attempts=None,
+            )
+            if aux_pid is not None:
+                self.tentative.pop(track_id, None)
+                return aux_pid
+
         # PDF Bước 5: creating a new identity remains a conjunctive decision.
         # The good-frame streak is useful evidence recorded by the worker, but
         # it must not bypass the visibility + embedding-consistency gates.
@@ -900,8 +1008,24 @@ class ReIDMatcher:
                 )
                 if eager_pid is not None:
                     return eager_pid
+            if (
+                self.scale_aux_gallery_enabled
+                and allow_scale_aux_match
+                and scale_aux_embedding is not None
+            ):
+                aux_pid = self._scale_aux_gallery_match(
+                    track_id=track_id,
+                    embedding=scale_aux_embedding,
+                    blocked_person_ids=blocked_person_ids,
+                    forbidden_person_ids=forbidden_person_ids,
+                    recent_incompatible_person_ids=recent_incompatible_person_ids,
+                    tentative_attempts=None,
+                )
+                if aux_pid is not None:
+                    return aux_pid
             self.tentative[track_id] = {
                 "embedding": embedding,
+                "scale_aux_embedding": scale_aux_embedding,
                 "v_avg": v_avg,
                 "consistency": embedding_consistency,
                 "composite": self._composite_quality(v_avg, embedding_consistency),
@@ -933,6 +1057,7 @@ class ReIDMatcher:
         current_composite = self._composite_quality(v_avg, embedding_consistency)
         if current_composite > float(tent.get("composite", -1.0)):
             tent["embedding"] = embedding
+            tent["scale_aux_embedding"] = scale_aux_embedding
             tent["v_avg"] = v_avg
             tent["consistency"] = embedding_consistency
             tent["composite"] = current_composite
@@ -1107,6 +1232,23 @@ class ReIDMatcher:
                         )
                         del self.tentative[track_id]
                         return pid
+                tent_aux_embedding = tent.get("scale_aux_embedding")
+                if (
+                    self.scale_aux_gallery_enabled
+                    and allow_scale_aux_match
+                    and tent_aux_embedding is not None
+                ):
+                    aux_pid = self._scale_aux_gallery_match(
+                        track_id=track_id,
+                        embedding=tent_aux_embedding,
+                        blocked_person_ids=_blocked_t,
+                        forbidden_person_ids=_forbidden_t,
+                        recent_incompatible_person_ids=_recent_incompatible_t,
+                        tentative_attempts=tent["attempts"],
+                    )
+                    if aux_pid is not None:
+                        del self.tentative[track_id]
+                        return aux_pid
                 if self._defer_if_near_existing(
                     track_id=track_id,
                     embedding=tent["embedding"],

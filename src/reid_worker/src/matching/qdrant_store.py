@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 class QdrantPersonStore:
     COLLECTION_NAME = "persons"
+    AUX_UPPER_COLLECTION_NAME = "person_aux_upper"
 
     def __init__(
         self,
@@ -42,6 +43,11 @@ class QdrantPersonStore:
         if self.COLLECTION_NAME not in collections:
             self.client.create_collection(
                 collection_name=self.COLLECTION_NAME,
+                vectors_config=VectorParams(size=self.embedding_dim, distance=Distance.COSINE),
+            )
+        if self.AUX_UPPER_COLLECTION_NAME not in collections:
+            self.client.create_collection(
+                collection_name=self.AUX_UPPER_COLLECTION_NAME,
                 vectors_config=VectorParams(size=self.embedding_dim, distance=Distance.COSINE),
             )
 
@@ -157,6 +163,63 @@ class QdrantPersonStore:
     def add_person(self, person_id: int, embedding: np.ndarray, metadata: dict) -> None:
         """Add the first gallery entry for a newly created person."""
         self._upsert_gallery_point(person_id, embedding, {**metadata, "is_anchor": True})
+
+    def add_upper_body_embedding(self, person_id: int, embedding: np.ndarray, metadata: dict) -> None:
+        """Add an auxiliary upper-body view without touching canonical gallery."""
+        point_id = str(uuid.uuid4())
+        payload = {
+            "person_id": person_id,
+            "added_at": datetime.now(timezone.utc).isoformat(),
+            "embedding_kind": "upper_body",
+            **metadata,
+        }
+        self.client.upsert(
+            collection_name=self.AUX_UPPER_COLLECTION_NAME,
+            points=[PointStruct(id=point_id, vector=embedding.tolist(), payload=payload)],
+        )
+        self._prune_aux_upper(person_id)
+
+    def search_upper_body(
+        self,
+        embedding: np.ndarray,
+        top_k: int = 5,
+        score_threshold: float | None = None,
+    ) -> list[tuple[int, float]]:
+        """Search only the auxiliary upper-body collection."""
+        threshold = score_threshold if score_threshold is not None else self.similarity_threshold
+        query_vector = embedding.tolist()
+        limit = max(top_k * self.max_gallery_size * 2, 100)
+        try:
+            if hasattr(self.client, "search"):
+                hits = self.client.search(
+                    collection_name=self.AUX_UPPER_COLLECTION_NAME,
+                    query_vector=query_vector,
+                    limit=limit,
+                    score_threshold=threshold,
+                    with_payload=True,
+                )
+            else:
+                result = self.client.query_points(
+                    collection_name=self.AUX_UPPER_COLLECTION_NAME,
+                    query=query_vector,
+                    limit=limit,
+                    score_threshold=threshold,
+                    with_payload=True,
+                )
+                hits = getattr(result, "points", result)
+        except Exception:
+            logger.warning("qdrant_aux_upper_search_failed", exc_info=True)
+            return []
+
+        per_person_best: dict[int, float] = {}
+        for hit in hits:
+            pid = self._person_id_from_hit(hit)
+            if pid is None:
+                continue
+            score = float(hit.score)
+            if score > per_person_best.get(pid, -1.0):
+                per_person_best[pid] = score
+        return sorted(per_person_best.items(), key=lambda item: -item[1])[:top_k]
 
     def gated_momentum_update(
         self,
@@ -305,14 +368,63 @@ class QdrantPersonStore:
         """Move all source gallery points into target person's gallery."""
         records = self._scroll_gallery_records(source_person_id)
         point_ids = [record.id for record in records]
-        if not point_ids:
-            return
-        self.client.set_payload(
-            collection_name=self.COLLECTION_NAME,
-            payload={"person_id": target_person_id, "is_anchor": False},
-            points=point_ids,
-        )
+        if point_ids:
+            self.client.set_payload(
+                collection_name=self.COLLECTION_NAME,
+                payload={"person_id": target_person_id, "is_anchor": False},
+                points=point_ids,
+            )
+        aux_point_ids = [record.id for record in self._scroll_aux_upper_records(source_person_id)]
+        if aux_point_ids:
+            self.client.set_payload(
+                collection_name=self.AUX_UPPER_COLLECTION_NAME,
+                payload={"person_id": target_person_id},
+                points=aux_point_ids,
+            )
         self._prune_gallery(target_person_id)
+        self._prune_aux_upper(target_person_id)
+
+    def _scroll_aux_upper_records(self, person_id: int | None = None):
+        scroll_filter = None
+        if person_id is not None:
+            scroll_filter = Filter(must=[
+                FieldCondition(key="person_id", match=MatchValue(value=person_id)),
+            ])
+        records, _ = self.client.scroll(
+            collection_name=self.AUX_UPPER_COLLECTION_NAME,
+            scroll_filter=scroll_filter,
+            limit=1000,
+            with_vectors=True,
+            with_payload=True,
+        )
+        return records
+
+    def _prune_aux_upper(self, person_id: int) -> None:
+        try:
+            records, _ = self.client.scroll(
+                collection_name=self.AUX_UPPER_COLLECTION_NAME,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="person_id", match=MatchValue(value=person_id)),
+                ]),
+                limit=self.max_gallery_size + 20,
+                with_vectors=True,
+                with_payload=True,
+            )
+            if len(records) <= self.max_gallery_size:
+                return
+            sorted_records = sorted(records, key=lambda r: (r.payload or {}).get("added_at", ""))
+            keep_ids = self._select_diverse_records(
+                [r for r in sorted_records if r.vector is not None],
+                self.max_gallery_size,
+            )
+            to_delete = [r.id for r in records if r.id not in keep_ids]
+            if to_delete:
+                self.client.delete(
+                    collection_name=self.AUX_UPPER_COLLECTION_NAME,
+                    points_selector=PointIdsList(points=to_delete),
+                )
+        except Exception as exc:
+            logger.warning("aux_upper_prune_failed person_id=%d error=%s", person_id, exc)
 
     def _prune_gallery(self, person_id: int) -> None:
         """Keep max_gallery_size most-diverse gallery entries.
