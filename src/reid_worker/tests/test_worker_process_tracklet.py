@@ -171,6 +171,17 @@ def _make_pipeline() -> WorkerPipeline:
         duplicate_merge_reentry_bridge_min_attr_matches=2,
         duplicate_merge_reentry_bridge_supported_min_score=0.70,
         duplicate_merge_reentry_bridge_supported_min_margin=0.12,
+        duplicate_merge_scale_aware_reentry_enabled=False,
+        duplicate_merge_scale_aware_reentry_min_score=0.55,
+        duplicate_merge_scale_aware_reentry_max_gap_frames=240,
+        duplicate_merge_scale_aware_reentry_max_tracklets=8,
+        duplicate_merge_scale_aware_reentry_max_center_distance_ratio=1.30,
+        duplicate_merge_scale_aware_reentry_max_bottom_delta_ratio=0.08,
+        duplicate_merge_scale_aware_reentry_min_size_ratio=1.00,
+        duplicate_merge_scale_aware_reentry_max_size_ratio=2.20,
+        duplicate_merge_scale_aware_reentry_max_area_ratio=4.00,
+        duplicate_merge_scale_aware_reentry_attr_confidence=0.65,
+        duplicate_merge_scale_aware_reentry_min_attr_matches=2,
         duplicate_merge_supported_spatial_reentry_enabled=True,
         duplicate_merge_supported_spatial_reentry_min_score=0.53,
         duplicate_merge_supported_spatial_reentry_max_tracklets=8,
@@ -3453,6 +3464,108 @@ def test_spatial_reconciler_allows_attribute_supported_reentry_bridge():
     assert calls["mongo_merge"][0:2] == (6, 3)
     assert calls["mongo_merge"][2]["method"] == "soft_split_gallery_merge"
     assert calls["mongo_merge"][2]["soft_split_reason"] == "reentry_bridge"
+
+
+def test_duplicate_merge_allows_scale_aware_reentry_without_lowering_match_threshold():
+    pipeline = _make_pipeline()
+    pipeline.settings.duplicate_merge_enabled = True
+    pipeline.settings.duplicate_merge_min_score = 0.90
+    pipeline.settings.duplicate_merge_singleton_min_score = 0.90
+    pipeline.settings.duplicate_merge_occlusion_reentry_enabled = True
+    pipeline.settings.duplicate_merge_occlusion_reentry_min_score = 0.58
+    pipeline.settings.duplicate_merge_scale_aware_reentry_enabled = True
+    pipeline.settings.duplicate_merge_scale_aware_reentry_min_score = 0.55
+    pipeline.settings.duplicate_merge_scale_aware_reentry_max_gap_frames = 240
+    pipeline.settings.duplicate_merge_scale_aware_reentry_max_center_distance_ratio = 1.30
+    pipeline.settings.duplicate_merge_scale_aware_reentry_max_bottom_delta_ratio = 0.08
+    pipeline.settings.duplicate_merge_scale_aware_reentry_min_size_ratio = 1.00
+    calls = {}
+
+    class DummyQdrant:
+        def find_duplicate_candidate(self, person_id, min_score, exclude_person_ids=None):
+            assert person_id == 8
+            assert min_score == 0.55
+            return 4, 0.5736, 0.35
+
+        def merge_person_gallery(self, source_person_id, target_person_id):
+            calls["gallery_merge"] = (source_person_id, target_person_id)
+
+    class DummyMongo:
+        async def count_tracklets(self, person_id):
+            return {4: 2, 8: 1}[person_id]
+
+        async def count_canonical_tracklets(self, person_id):
+            return {4: 1, 8: 1}[person_id]
+
+        async def persons_min_frame_gap_with_bboxes(self, person_a, person_b):
+            return {
+                "gap": 219,
+                "bbox_a": [481.9, 319.5, 614.6, 644.3],
+                "bbox_b": [0.5, 310.2, 72.3, 718.6],
+            }
+
+        async def persons_min_frame_gap(self, person_a, person_b):
+            return 219
+
+        async def persons_closest_spatial_transition_with_bboxes(self, person_a, person_b, max_gap_frames):
+            return {
+                "gap": 39,
+                "bbox_a": [132.8, 315.6, 345.0, 720.0],
+                "bbox_b": [552.9, 304.6, 798.6, 719.0],
+            }
+
+        async def persons_cooccur(self, source_person_id, target_person_id):
+            return False
+
+        async def persons_have_clear_gender_disagreement(self, source_person_id, target_person_id, sighting_confidence_threshold=0.90, min_consecutive=2):
+            return False
+
+        async def fetch_two_persons_attributes(self, source_person_id, target_person_id):
+            return (
+                {
+                    "gender": "male",
+                    "gender_confidence": 0.6866,
+                    "hat": "no_hat",
+                    "hat_confidence": 0.8014,
+                    "glasses": "no_glasses",
+                    "glasses_confidence": 0.7931,
+                    "lower": "trousers",
+                    "lower_confidence": 0.8013,
+                    "sleeve": "short_sleeve",
+                    "sleeve_confidence": 0.7595,
+                },
+                {
+                    "gender": "male",
+                    "gender_confidence": 0.845,
+                    "hat": "no_hat",
+                    "hat_confidence": 0.821,
+                    "glasses": "no_glasses",
+                    "glasses_confidence": 0.7332,
+                    "lower": "trousers",
+                    "lower_confidence": 0.6193,
+                    "sleeve": "short_sleeve",
+                    "sleeve_confidence": 0.8433,
+                },
+            )
+
+        async def merge_person(self, source_person_id, target_person_id, reason):
+            calls["mongo_merge"] = (source_person_id, target_person_id, reason)
+
+    class DummyRedis:
+        async def invalidate(self, person_id):
+            calls.setdefault("invalidated", []).append(person_id)
+
+    pipeline.qdrant_store = DummyQdrant()
+    pipeline.mongo = DummyMongo()
+    pipeline.redis_cache = DummyRedis()
+
+    merged_person_id = asyncio.run(pipeline._maybe_merge_duplicate_person(8))
+
+    assert merged_person_id == 4
+    assert calls["gallery_merge"] == (8, 4)
+    assert calls["mongo_merge"][0:2] == (8, 4)
+    assert calls["mongo_merge"][2]["method"] == "soft_split_gallery_merge"
+    assert calls["mongo_merge"][2]["soft_split_reason"] == "scale_aware_reentry"
 
 
 def test_spatial_reconciler_rejects_low_score_reentry_bridge_between_canonical_identities():

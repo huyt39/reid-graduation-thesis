@@ -23,6 +23,7 @@ class MockQdrantStore:
         self.gated_update_calls = []
         self.anchor_scores = {}
         self.person_scores = {}
+        self.upper_body_results = []
 
     def search(self, embedding, top_k=5, score_threshold=None):
         results = self.search_results[:top_k]
@@ -40,6 +41,11 @@ class MockQdrantStore:
         if score is None:
             return None
         return score if score >= min_score else None
+
+    def search_upper_body(self, embedding, top_k=5, score_threshold=None):
+        results = self.upper_body_results[:top_k]
+        threshold = 0.70 if score_threshold is None else score_threshold
+        return [(pid, score) for pid, score in results if score >= threshold]
 
     def add_person(self, person_id, embedding, metadata):
         self.persons[person_id] = {"embedding": embedding, "metadata": metadata}
@@ -65,6 +71,63 @@ def test_good_tracklet_no_match_creates_person():
         embedding_consistency=0.9,
         tracklet_len=10,
     )
+    assert pid == 1
+    assert 1 in store.persons
+
+
+def test_synthetic_tracklet_can_match_upper_body_aux_gallery_before_minting():
+    store = MockQdrantStore()
+    store.upper_body_results = [(4, 0.72)]
+    matcher = ReIDMatcher(
+        store,
+        id_allocator=_make_id_allocator(),
+        promote_v_threshold=0.6,
+        promote_consistency_threshold=0.7,
+        scale_aux_match_threshold=0.70,
+        scale_aux_match_margin=0.03,
+    )
+    emb = np.random.randn(512).astype(np.float32)
+    aux_emb = np.random.randn(512).astype(np.float32)
+
+    pid = matcher.match_tracklet(
+        track_id=-9000015,
+        embedding=emb,
+        scale_aux_embedding=aux_emb,
+        allow_scale_aux_match=True,
+        v_avg=0.82,
+        embedding_consistency=0.90,
+        tracklet_len=8,
+    )
+
+    assert pid == 4
+    assert store.persons == {}
+    decision = matcher.pop_last_decision(-9000015)
+    assert decision["method"] == "scale_aux_gallery_match"
+    assert decision["canonical_update_applied"] is False
+
+
+def test_upper_body_aux_gallery_is_opt_in_for_partial_reentry_only():
+    store = MockQdrantStore()
+    store.upper_body_results = [(4, 0.78)]
+    matcher = ReIDMatcher(
+        store,
+        id_allocator=_make_id_allocator(),
+        promote_v_threshold=0.6,
+        promote_consistency_threshold=0.7,
+    )
+    emb = np.random.randn(512).astype(np.float32)
+    aux_emb = np.random.randn(512).astype(np.float32)
+
+    pid = matcher.match_tracklet(
+        track_id=12,
+        embedding=emb,
+        scale_aux_embedding=aux_emb,
+        allow_scale_aux_match=False,
+        v_avg=0.82,
+        embedding_consistency=0.90,
+        tracklet_len=8,
+    )
+
     assert pid == 1
     assert 1 in store.persons
 

@@ -246,6 +246,19 @@ class Settings(BaseSettings):
     # crops from being wrongly absorbed into existing identities at sim 0.60-0.70.
     low_visibility_threshold: float = 0.65
     low_visibility_match_threshold: float = 0.75
+    # Auxiliary upper-body gallery for scale/viewpoint transitions. This does
+    # not lower the normal full-body threshold: upper-body vectors live in a
+    # separate Qdrant collection and are consulted only for narrow synthetic /
+    # near-camera partial-body re-entry cases before minting a new identity.
+    scale_aux_gallery_enabled: bool = True
+    scale_aux_crop_top_ratio: float = 0.48
+    scale_aux_match_threshold: float = 0.66
+    scale_aux_match_margin: float = 0.03
+    scale_aux_full_gallery_min_score: float = 0.40
+    scale_aux_min_v: float = 0.70
+    scale_aux_min_consistency: float = 0.80
+    scale_aux_min_tracklet_len: int = 5
+    scale_aux_max_overlap_ratio: float = 0.35
     # Reject a tracklet whose selected embeddings disagree with each other
     # below this threshold. Prevents mixed-identity tracklets (e.g., from
     # spatially-close untracked-detection clusters) from matching or minting,
@@ -483,6 +496,22 @@ class Settings(BaseSettings):
     duplicate_merge_high_conf_reentry_max_area_ratio: float = 2.80
     duplicate_merge_high_conf_reentry_attr_confidence: float = 0.65
     duplicate_merge_high_conf_reentry_min_attr_matches: int = 2
+    # Scale-aware re-entry: a person walking toward the camera can produce a
+    # new synthetic/untracked cluster whose embedding is below the normal
+    # match threshold, while the bbox bottom stays on the same floor line and
+    # the box grows quickly. Keep this as a post-hoc duplicate-merge bridge
+    # only; realtime matching thresholds remain unchanged.
+    duplicate_merge_scale_aware_reentry_enabled: bool = True
+    duplicate_merge_scale_aware_reentry_min_score: float = 0.55
+    duplicate_merge_scale_aware_reentry_max_gap_frames: int = 240
+    duplicate_merge_scale_aware_reentry_max_tracklets: int = 8
+    duplicate_merge_scale_aware_reentry_max_center_distance_ratio: float = 1.30
+    duplicate_merge_scale_aware_reentry_max_bottom_delta_ratio: float = 0.08
+    duplicate_merge_scale_aware_reentry_min_size_ratio: float = 1.00
+    duplicate_merge_scale_aware_reentry_max_size_ratio: float = 2.20
+    duplicate_merge_scale_aware_reentry_max_area_ratio: float = 4.00
+    duplicate_merge_scale_aware_reentry_attr_confidence: float = 0.65
+    duplicate_merge_scale_aware_reentry_min_attr_matches: int = 2
     duplicate_merge_supported_spatial_reentry_enabled: bool = True
     duplicate_merge_supported_spatial_reentry_min_score: float = 0.53
     duplicate_merge_supported_spatial_reentry_max_tracklets: int = 8

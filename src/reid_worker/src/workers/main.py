@@ -344,6 +344,10 @@ class WorkerPipeline:
             near_gallery_defer_threshold=self.settings.near_gallery_defer_threshold,
             good_streak_min_consecutive=self.settings.good_streak_min_consecutive,
             good_streak_promotion_enabled=self.settings.good_streak_promotion_enabled,
+            scale_aux_gallery_enabled=self.settings.scale_aux_gallery_enabled,
+            scale_aux_match_threshold=self.settings.scale_aux_match_threshold,
+            scale_aux_match_margin=self.settings.scale_aux_match_margin,
+            scale_aux_full_gallery_min_score=self.settings.scale_aux_full_gallery_min_score,
         )
 
         self.consumer = WorkerKafkaConsumer(
@@ -1775,8 +1779,91 @@ class WorkerPipeline:
                 return None
             return np.asarray(emb, dtype=np.float32)
         except Exception as exc:
-            log.debug("admission_embedding_failed", error=str(exc))
+            logger_fn = getattr(log, "debug", log.info)
+            logger_fn("admission_embedding_failed", error=str(exc))
             return None
+
+    def _build_scale_aux_upper_crop(self, crop: np.ndarray) -> np.ndarray | None:
+        if crop is None or crop.size <= 0:
+            return None
+        h = int(crop.shape[0])
+        if h <= 1:
+            return None
+        ratio = float(getattr(self.settings, "scale_aux_crop_top_ratio", 0.62))
+        cut_y = int(round(h * min(max(ratio, 0.30), 0.90)))
+        cut_y = max(1, min(h, cut_y))
+        upper = crop[:cut_y, :]
+        if upper.size <= 0:
+            return None
+        return upper
+
+    async def _extract_scale_aux_embedding(self, entry) -> np.ndarray | None:
+        if not bool(getattr(self.settings, "scale_aux_gallery_enabled", False)):
+            return None
+        crop = getattr(entry, "crop", None)
+        if crop is None or crop.size <= 0:
+            crop = getattr(entry, "attribute_crop", None)
+        upper = self._build_scale_aux_upper_crop(crop)
+        if upper is None:
+            return None
+        emb = await self._extract_crop_embedding(upper)
+        if emb is None:
+            return None
+        norm = np.linalg.norm(emb)
+        if norm <= 1e-8:
+            return None
+        return emb / norm
+
+    async def _maybe_persist_scale_aux_embedding(
+        self,
+        *,
+        person_id: int,
+        tracklet,
+        entry,
+        v_avg: float,
+        emb_consistency: float,
+        overall_consistency: float,
+        selected_max_overlap: float,
+        matching: dict,
+    ) -> None:
+        if not bool(getattr(self.settings, "scale_aux_gallery_enabled", False)):
+            return
+        if entry is None:
+            return
+        if float(v_avg) < float(getattr(self.settings, "scale_aux_min_v", 0.70)):
+            return
+        if float(emb_consistency) < float(getattr(self.settings, "scale_aux_min_consistency", 0.80)):
+            return
+        if len(getattr(tracklet, "entries", []) or []) < int(getattr(self.settings, "scale_aux_min_tracklet_len", 5)):
+            return
+        if float(selected_max_overlap) > float(getattr(self.settings, "scale_aux_max_overlap_ratio", 0.35)):
+            return
+        if bool((matching or {}).get("provisional")):
+            return
+        aux_emb = await self._extract_scale_aux_embedding(entry)
+        if aux_emb is None:
+            return
+        try:
+            await asyncio.to_thread(
+                self.qdrant_store.add_upper_body_embedding,
+                person_id,
+                aux_emb,
+                {
+                    "source": "scale_aux_upper",
+                    "track_id": int(tracklet.track_id),
+                    "v_avg": round(float(v_avg), 4),
+                    "consistency": round(float(emb_consistency), 4),
+                    "overall_consistency": round(float(overall_consistency), 4),
+                    "match_method": str((matching or {}).get("method", "")),
+                },
+            )
+        except Exception:
+            log.warning(
+                "scale_aux_upper_persist_failed",
+                person_id=person_id,
+                track_id=getattr(tracklet, "track_id", None),
+                exc_info=True,
+            )
 
     def _flush_stale_untracked_detection_clusters(self, frame_number: int) -> None:
         if not hasattr(self, "untracked_detection_clusters"):
@@ -2676,6 +2763,11 @@ class WorkerPipeline:
                 min_score,
                 float(getattr(self.settings, "duplicate_merge_occlusion_reentry_min_score", 0.58)),
             )
+        if bool(getattr(self.settings, "duplicate_merge_scale_aware_reentry_enabled", False)):
+            min_score = min(
+                min_score,
+                float(getattr(self.settings, "duplicate_merge_scale_aware_reentry_min_score", 0.55)),
+            )
         if bool(getattr(self.settings, "duplicate_merge_same_gender_singleton_enabled", False)):
             min_score = min(
                 min_score,
@@ -2757,12 +2849,26 @@ class WorkerPipeline:
             "clothing_supported_reentry",
             "spatial_only_weak_fragment",
             "spatial_continuation",
+            "scale_aware_reentry",
         }
+        scale_aware_weak_bridge = (
+            soft_split_reason == "scale_aware_reentry"
+            and min(int(current_count), int(candidate_count)) <= weak_limit
+            and max(int(current_count), int(candidate_count))
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_scale_aware_reentry_max_tracklets",
+                    8,
+                )
+            )
+        )
         if (
             soft_split_reason in low_score_canonical_bridge_reasons
             and int(current_canonical_count) > 0
             and int(candidate_canonical_count) > 0
             and float(score) < established_min_score
+            and not scale_aware_weak_bridge
         ):
             log.info(
                 "duplicate_merge_rejected_low_score_bridge_between_canonical_identities",
@@ -2955,6 +3061,7 @@ class WorkerPipeline:
                 "tight_spatial_reentry",
                 "adjacent_tight_continuation",
                 "boundary_weak_continuation",
+                "scale_aware_reentry",
             }
             if weak_source_into_supported and soft_split_reason not in hard_geometry_reasons:
                 max_supported_target = int(
@@ -3132,6 +3239,7 @@ class WorkerPipeline:
             "same_frame_established_duplicate",
             "overlap_spatial_duplicate",
             "trajectory_reentry",
+            "scale_aware_reentry",
         }
         if soft_split_can_override_cooccurrence:
             log.info(
@@ -3159,6 +3267,7 @@ class WorkerPipeline:
             "same_frame_established_duplicate",
             "overlap_spatial_duplicate",
             "trajectory_reentry",
+            "scale_aware_reentry",
         }
         if score >= attr_override_threshold or soft_split_can_override_attributes:
             if attr_conflict_present:
@@ -3970,6 +4079,127 @@ class WorkerPipeline:
                                 return "high_conf_reentry_bridge"
 
         if (
+            bool(getattr(self.settings, "duplicate_merge_scale_aware_reentry_enabled", True))
+            and gap > 0
+            and gap
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_scale_aware_reentry_max_gap_frames",
+                    240,
+                )
+            )
+            and max(int(current_count), int(candidate_count))
+            <= int(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_scale_aware_reentry_max_tracklets",
+                    8,
+                )
+            )
+            and float(score)
+            >= float(
+                getattr(
+                    self.settings,
+                    "duplicate_merge_scale_aware_reentry_min_score",
+                    0.55,
+                )
+            )
+        ):
+            if cooccurred is None:
+                cooccurred = await self.mongo.persons_cooccur(int(person_a), int(person_b))
+            if not cooccurred:
+                try:
+                    scale_transition = (
+                        await self.mongo.persons_closest_spatial_transition_with_bboxes(
+                            int(person_a),
+                            int(person_b),
+                            max_gap_frames=int(
+                                getattr(
+                                    self.settings,
+                                    "duplicate_merge_scale_aware_reentry_max_gap_frames",
+                                    240,
+                                )
+                            ),
+                        )
+                    )
+                except AttributeError:
+                    scale_transition = None
+                if scale_transition:
+                    scale_bbox_a = scale_transition.get("bbox_a") or []
+                    scale_bbox_b = scale_transition.get("bbox_b") or []
+                    if len(scale_bbox_a) >= 4 and len(scale_bbox_b) >= 4:
+                        scale_bbox_a = [float(v) for v in scale_bbox_a]
+                        scale_bbox_b = [float(v) for v in scale_bbox_b]
+                        scale_center_ratio = self._center_distance_ratio(
+                            scale_bbox_a,
+                            scale_bbox_b,
+                        )
+                        width_a = max(float(scale_bbox_a[2] - scale_bbox_a[0]), 1.0)
+                        height_a = max(float(scale_bbox_a[3] - scale_bbox_a[1]), 1.0)
+                        width_b = max(float(scale_bbox_b[2] - scale_bbox_b[0]), 1.0)
+                        height_b = max(float(scale_bbox_b[3] - scale_bbox_b[1]), 1.0)
+                        size_a = max(width_a, height_a)
+                        size_b = max(width_b, height_b)
+                        area_a = width_a * height_a
+                        area_b = width_b * height_b
+                        size_ratio = max(size_a, size_b) / max(min(size_a, size_b), 1.0)
+                        area_ratio = max(area_a, area_b) / max(min(area_a, area_b), 1.0)
+                        bottom_delta_ratio = abs(float(scale_bbox_a[3] - scale_bbox_b[3])) / max(
+                            height_a,
+                            height_b,
+                            1.0,
+                        )
+                        if (
+                            scale_center_ratio
+                            <= float(
+                                getattr(
+                                    self.settings,
+                                    "duplicate_merge_scale_aware_reentry_max_center_distance_ratio",
+                                    1.30,
+                                )
+                            )
+                            and bottom_delta_ratio
+                            <= float(
+                                getattr(
+                                    self.settings,
+                                    "duplicate_merge_scale_aware_reentry_max_bottom_delta_ratio",
+                                    0.08,
+                                )
+                            )
+                            and size_ratio
+                            >= float(
+                                getattr(
+                                    self.settings,
+                                    "duplicate_merge_scale_aware_reentry_min_size_ratio",
+                                    1.00,
+                                )
+                            )
+                            and size_ratio
+                            <= float(
+                                getattr(
+                                    self.settings,
+                                    "duplicate_merge_scale_aware_reentry_max_size_ratio",
+                                    2.20,
+                                )
+                            )
+                            and area_ratio
+                            <= float(
+                                getattr(
+                                    self.settings,
+                                    "duplicate_merge_scale_aware_reentry_max_area_ratio",
+                                    4.00,
+                                )
+                            )
+                        ):
+                            attrs_a, attrs_b = await self.mongo.fetch_two_persons_attributes(
+                                int(person_a),
+                                int(person_b),
+                            )
+                            if self._attrs_support_scale_aware_reentry(attrs_a, attrs_b):
+                                return "scale_aware_reentry"
+
+        if (
             bool(getattr(self.settings, "duplicate_merge_clothing_reentry_enabled", True))
             and gap
             >= int(
@@ -4687,6 +4917,39 @@ class WorkerPipeline:
 
         return matches >= int(
             getattr(self.settings, "duplicate_merge_high_conf_reentry_min_attr_matches", 2)
+        )
+
+    def _attrs_support_scale_aware_reentry(self, attrs_a: dict, attrs_b: dict) -> bool:
+        if MongoPersonStore.attributes_have_strong_conflict(attrs_a, attrs_b):
+            return False
+
+        gender_a = attrs_a.get("gender")
+        gender_b = attrs_b.get("gender")
+        if (
+            gender_a in {"male", "female"}
+            and gender_b in {"male", "female"}
+            and gender_a != gender_b
+        ):
+            return False
+
+        attr_conf_threshold = float(
+            getattr(self.settings, "duplicate_merge_scale_aware_reentry_attr_confidence", 0.65)
+        )
+        matches = 0
+        for task in ("hat", "lower", "sleeve", "glasses"):
+            label_a = attrs_a.get(task)
+            label_b = attrs_b.get(task)
+            if not label_a or not label_b or label_a == "unknown" or label_b == "unknown":
+                continue
+            if label_a != label_b:
+                continue
+            conf_a = float(attrs_a.get(f"{task}_confidence", 0.0) or 0.0)
+            conf_b = float(attrs_b.get(f"{task}_confidence", 0.0) or 0.0)
+            if conf_a >= attr_conf_threshold and conf_b >= attr_conf_threshold:
+                matches += 1
+
+        return matches >= int(
+            getattr(self.settings, "duplicate_merge_scale_aware_reentry_min_attr_matches", 2)
         )
 
     def _attrs_support_clothing_reentry(self, attrs_a: dict, attrs_b: dict) -> bool:
@@ -5668,6 +5931,23 @@ class WorkerPipeline:
                 and float(consistency.overall)
                 >= float(getattr(self.settings, "gallery_update_min_overall_consistency", 0.80))
             )
+            allow_scale_aux_match = (
+                bool(getattr(self.settings, "scale_aux_gallery_enabled", False))
+                and current_person_id is None
+                and int(tracklet.track_id) < 0
+                and float(v_avg) >= float(getattr(self.settings, "scale_aux_min_v", 0.70))
+                and float(emb_consistency)
+                >= float(getattr(self.settings, "scale_aux_min_consistency", 0.80))
+                and effective_tracklet_len
+                >= int(getattr(self.settings, "scale_aux_min_tracklet_len", 5))
+                and selected_max_overlap
+                <= float(getattr(self.settings, "scale_aux_max_overlap_ratio", 0.35))
+            )
+            # Query the upper-body auxiliary gallery with the current full
+            # tracklet embedding. Near-camera crops are already upper-body
+            # dominated; cropping them again removes too much discriminative
+            # clothing signal.
+            scale_aux_embedding = tracklet_embedding if allow_scale_aux_match else None
             person_id = self.matcher.match_tracklet(
                 track_id=tracklet.track_id,
                 embedding=tracklet_embedding,
@@ -5687,6 +5967,8 @@ class WorkerPipeline:
                 good_streak=good_streak,
                 allow_tentative_fallback=allow_tentative_fallback,
                 allow_gallery_update=allow_gallery_update,
+                scale_aux_embedding=scale_aux_embedding,
+                allow_scale_aux_match=allow_scale_aux_match,
             )
             pop_last_decision = getattr(self.matcher, "pop_last_decision", None)
             matching = pop_last_decision(tracklet.track_id) if callable(pop_last_decision) else {}
@@ -5855,6 +6137,16 @@ class WorkerPipeline:
                         matching=matching,
                         person_attrs=p_attrs,
                         tracklet_attrs=t_attrs,
+                    )
+                    await self._maybe_persist_scale_aux_embedding(
+                        person_id=person_id,
+                        tracklet=tracklet,
+                        entry=best_entry,
+                        v_avg=v_avg,
+                        emb_consistency=emb_consistency,
+                        overall_consistency=consistency.overall,
+                        selected_max_overlap=selected_max_overlap,
+                        matching=matching,
                     )
             except Exception:
                 log.error("persistence_failed", tracklet_id=tracklet_id, exc_info=True)
