@@ -2,6 +2,8 @@
 
 import { FormEvent, useMemo, useState } from "react";
 import { Search, SendHorizontal } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -20,6 +22,16 @@ function JsonBlock({ value }: { value: unknown }) {
     <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/50 p-3 text-sm leading-relaxed font-sans">
       {text}
     </pre>
+  );
+}
+
+// Renders the natural-language answer as Markdown. No typography plugin is
+// installed, so element spacing/lists are styled via arbitrary variants.
+function AnswerBlock({ markdown }: { markdown: string }) {
+  return (
+    <div className="rounded-md border bg-muted/30 p-4 text-sm leading-relaxed [&_a]:underline [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-xs [&_li]:my-0.5 [&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-5 [&_p]:my-2 [&_strong]:font-semibold [&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-5 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{markdown}</ReactMarkdown>
+    </div>
   );
 }
 
@@ -103,23 +115,29 @@ export function SearchForm() {
               </div>
 
               {result.summary ? (
-                <div className="rounded-md border p-3">
-                  <div className="text-muted-foreground text-xs font-medium uppercase tracking-wide">
-                    Summary
+                <AnswerBlock markdown={result.summary} />
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  No answer was generated for this query. Open the details below to inspect the raw
+                  result.
+                </p>
+              )}
+
+              <details className="rounded-md border p-3">
+                <summary className="text-muted-foreground cursor-pointer text-xs font-medium uppercase tracking-wide">
+                  Details (parsed query &amp; raw result)
+                </summary>
+                <div className="mt-3 space-y-4">
+                  <div>
+                    <div className="mb-2 text-sm font-medium">Parsed query</div>
+                    <JsonBlock value={result.parsed_query ?? null} />
                   </div>
-                  <p className="mt-1 text-sm leading-relaxed">{result.summary}</p>
+                  <div>
+                    <div className="mb-2 text-sm font-medium">Database result</div>
+                    <JsonBlock value={result.result ?? result} />
+                  </div>
                 </div>
-              ) : null}
-
-              <div>
-                <div className="mb-2 text-sm font-medium">Parsed query</div>
-                <JsonBlock value={result.parsed_query ?? null} />
-              </div>
-
-              <div>
-                <div className="mb-2 text-sm font-medium">Database result</div>
-                <JsonBlock value={result.result ?? result} />
-              </div>
+              </details>
             </>
           )}
         </CardContent>

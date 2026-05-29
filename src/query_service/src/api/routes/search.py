@@ -92,17 +92,20 @@ async def natural_language_query(body: NLQueryRequest):
 
     result = await executor.execute(structured)
     structured_payload = structured.model_dump()
-    summary = _deterministic_summary(
-        structured_payload["query_type"],
-        structured_payload["params"],
-        result,
+    # Prefer the LLM summary (natural, richer answer). Fall back to the
+    # deterministic template only when the LLM is unavailable or errors out
+    # (summarize() returns "" on failure), so the UI degrades gracefully.
+    summary = await parser.summarize(
+        question=body.query,
+        query_type=structured_payload["query_type"],
+        params=structured_payload["params"],
+        results=result,
     )
     if not summary:
-        summary = await parser.summarize(
-            question=body.query,
-            query_type=structured_payload["query_type"],
-            params=structured_payload["params"],
-            results=result,
+        summary = _deterministic_summary(
+            structured_payload["query_type"],
+            structured_payload["params"],
+            result,
         )
     return {
         "parsed_query": structured_payload,
