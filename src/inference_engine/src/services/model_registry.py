@@ -105,9 +105,19 @@ class ModelRegistry:
             transforms.Resize((256, 128)),
             transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
         ])
+        # PAR classifier crops are typically taller than wide (~2:1 H:W).
+        # Naive Resize((224, 224)) squeezes that to 1:1 and warps body
+        # geometry — degrades attributes that depend on local layout
+        # (sleeve, lower, hat, glasses). Default to aspect-preserving
+        # letterbox; settings.par_letterbox=False restores the old path.
+        _classification_resize = (
+            _LetterboxResize(target_h=224, target_w=224, fill=0.5)
+            if getattr(settings, "par_letterbox", True)
+            else transforms.Resize((224, 224))
+        )
         self.classification_transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Resize((224, 224)),
+            _classification_resize,
             transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
         ])
 

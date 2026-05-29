@@ -26,8 +26,10 @@ ATTR_LABELS = {
     "sidebag":   ["no_sidebag", "sidebag"],
     "hat":       ["no_hat", "hat"],
     "glasses":   ["no_glasses", "glasses"],
-    "sleeve":    ["short_sleeve", "long_sleeve", "long_sleeve_other"],
-    "lower":     ["trousers", "shorts"],
+    "sleeve":    ["short_sleeve", "long_sleeve"],
+    # idx 1 ↔ idx 2 swapped to match the trained head — see notes on
+    # LABEL_NAMES["lower"] in multi_attr_classifier.py.
+    "lower":     ["trousers", "skirt_dress", "shorts"],
 }
 
 

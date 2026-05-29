@@ -62,7 +62,12 @@ function collectAttributeBadges(person: TrackedPerson): string[] {
   maybeAdd("backpack", person.backpack, person.backpack_confidence);
   maybeAdd("sidebag", person.sidebag, person.sidebag_confidence);
   maybeAdd("hat", person.hat, person.hat_confidence);
-  maybeAdd("glasses", person.glasses, person.glasses_confidence, GLASSES_THRESHOLD);
+  // Glasses temporarily hidden — the PA-100K head's positive class is
+  // unreliable in surveillance footage and no post-processing approach
+  // has improved it. Data still flows from worker → Kafka → DB; this
+  // line is the single switch to re-enable display once the underlying
+  // model is finetuned or replaced.
+  // maybeAdd("glasses", person.glasses, person.glasses_confidence, GLASSES_THRESHOLD);
   maybeAdd("sleeve", person.sleeve, person.sleeve_confidence);
   maybeAdd("lower", person.lower, person.lower_confidence);
 

@@ -28,6 +28,12 @@ const KNOWN_ATTRIBUTE_META: Record<string, { label: string; group: (typeof GROUP
   lower: { label: "Lower", group: "Clothing" },
 };
 
+// Attributes whose classifier output is currently too unreliable to
+// surface in the UI. Data still flows through worker → Kafka → DB; the
+// fields are simply filtered out at render time. Remove from this set
+// to re-enable display once the underlying signal is fixed.
+const HIDDEN_ATTRIBUTE_KEYS = new Set(["glasses"]);
+
 function normalizeLabel(value: string): string {
   return value.replace(/_/g, " ");
 }
@@ -50,6 +56,7 @@ export function confidenceLabel(confidence: number | null): string {
 function getAttributeItems(attributes: PersonAttributes): AttributeDisplayItem[] {
   return Object.entries(attributes)
     .filter(([key]) => !key.endsWith("_confidence"))
+    .filter(([key]) => !HIDDEN_ATTRIBUTE_KEYS.has(key))
     .flatMap(([key, rawValue]) => {
       if (rawValue === undefined || rawValue === null) return [];
       const value = String(rawValue);

@@ -5689,18 +5689,40 @@ class WorkerPipeline:
             top_idx = max(range(len(extracted)), key=lambda i: extracted[i][1].v_score)
             consensus_indices = [top_idx]
 
+        # Loop A — ReID embedding path: stays restricted to consensus_indices.
+        # Embedding aggregation + best_entry tracking feed the matcher and the
+        # glasses_best_frame_override; touching either would shift ReID quality.
         for idx in consensus_indices:
             emb_vec, entry, attrs = extracted[idx]
             embeddings.append(emb_vec)
             v_scores.append(entry.v_score)
             overlap_ratios.append(entry.overlap_ratio)
-            if attrs:
-                self.attribute_voter.vote_frame(tracklet.track_id, attrs)
             if best_entry is None or entry.v_score > best_entry.v_score:
                 best_entry = entry
                 best_entry_attrs = attrs
             elif best_entry is entry:
                 best_entry_attrs = attrs
+
+        # Loop B — PAR voting: broaden coverage to every extracted entry with
+        # sufficient visibility. AttributeVoter does its own confidence-weighted
+        # majority, so more frames → more robust against single-frame errors
+        # under occlusion. consensus_indices filtering above is an embedding-
+        # similarity gate, which is the wrong criterion for attribute coverage.
+        par_vote_all = bool(getattr(self.settings, "par_vote_all_extracted", True))
+        par_min_v = float(getattr(self.settings, "par_min_v_score", 0.55))
+        if par_vote_all:
+            vote_entries = [
+                (entry, attrs) for _, entry, attrs in extracted
+                if attrs and entry.v_score >= par_min_v
+            ]
+        else:
+            vote_entries = [
+                (extracted[idx][1], extracted[idx][2])
+                for idx in consensus_indices
+                if extracted[idx][2]
+            ]
+        for _entry, _attrs in vote_entries:
+            self.attribute_voter.vote_frame(tracklet.track_id, _attrs)
 
         consensus_entries = [extracted[idx][1] for idx in consensus_indices]
         self.embedded_tracklets += 1

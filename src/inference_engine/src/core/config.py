@@ -29,6 +29,16 @@ class Settings(BaseSettings):
     use_triton: bool = False
     triton_url: str = "triton:8000"
 
+    # PAR preprocessing: aspect-preserving letterbox (224x224) for the
+    # multi-attribute classifier crop.
+    # Default OFF: the current PA-100K classifier weights were trained with
+    # naive Resize((224, 224)) (see Yolo-for-Edge-Devices/huy_backup/
+    # MultiAttr_EfficientNetB0.py val_transform). Switching to letterbox at
+    # inference creates a train/test preprocessing mismatch and degrades
+    # accuracy in practice. Re-enable only after retraining the classifier
+    # with letterbox preprocessing.
+    par_letterbox: bool = False
+
     model_config = SettingsConfigDict(
         env_file=".env", env_prefix="INFERENCE_", extra="ignore",
     )

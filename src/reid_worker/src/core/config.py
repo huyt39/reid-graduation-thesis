@@ -324,6 +324,16 @@ class Settings(BaseSettings):
     # attributes while non-gender tasks keep the conservative default below.
     gender_flip_threshold: float = 0.65
     attribute_flip_threshold: float = 0.85
+    # T2.1 — PAR voting coverage. AttributeVoter does internal confidence-
+    # weighted majority, so more vote frames per tracklet → more robust
+    # against single-frame misclassification under occlusion. When True, the
+    # voter accumulates predictions from every extracted entry with v_score
+    # ≥ par_min_v_score, instead of being restricted to embedding consensus
+    # (an embedding-similarity gate, the wrong criterion for attributes).
+    # The embedding path itself still uses consensus_indices only — ReID
+    # quality is not affected. Toggle off via WORKER_PAR_VOTE_ALL_EXTRACTED=false.
+    par_vote_all_extracted: bool = True
+    par_min_v_score: float = 0.55
     glasses_best_frame_override_threshold: float = 0.6
     attribute_crop_top_padding_ratio: float = 0.22
     attribute_crop_side_padding_ratio: float = 0.08
