@@ -516,6 +516,22 @@ class MongoPersonStore:
                 best_gap = gap if best_gap is None else min(best_gap, gap)
         return best_gap
 
+    async def persons_distinct_device_count(self, person_a: int, person_b: int) -> int:
+        """Count distinct cameras across both persons' tracklets.
+
+        Used to scope the cross-device re-link path: it must only fire when the
+        two identities together span >= 2 cameras. In a single-camera (single
+        stream) run this is always 1, so that path provably never fires and the
+        tuned single-stream behaviour is unaffected.
+        """
+        cursor = self._db[self.TRACKLETS].find(
+            {"person_id": {"$in": [person_a, person_b]}},
+            {"_id": 0, "device_id": 1},
+        )
+        docs = await cursor.to_list(length=500)
+        devices = {str(doc.get("device_id", "")) for doc in docs if doc.get("device_id")}
+        return len(devices)
+
     async def persons_min_frame_gap_with_bboxes(
         self,
         person_a: int,

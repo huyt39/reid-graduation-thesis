@@ -112,6 +112,20 @@ class Settings(BaseSettings):
     # Existing cooccurrence + attribute guards apply on top.
     duplicate_merge_established_min_score: float = 0.78
 
+    # Cross-device (cross-camera) re-link. Post-hoc only: lets two identities that
+    # together span >= 2 cameras and never co-occurred merge below the
+    # established-identity threshold, decided primarily by MARGIN (the correct
+    # identity is the clearly-dominant nearest neighbour even when absolute
+    # cross-view similarity is modest ~0.5-0.6). Scoped to multi-camera: in a
+    # single-stream run only one device exists, so this path never fires and the
+    # tuned single-stream behaviour is untouched. Gender/attribute/cooccurrence
+    # guards still apply on top (no overrides), so genuinely-different people are
+    # blocked. Margin-driven + attribute-gated → generalizes, not video-tuned.
+    duplicate_merge_cross_device_enabled: bool = True
+    duplicate_merge_cross_device_min_score: float = 0.50
+    duplicate_merge_cross_device_min_margin: float = 0.12
+    duplicate_merge_cross_device_max_tracklets: int = 8
+
     # Background re-merge reconciler: every N seconds, scan recently-updated
     # persons for cross-person gallery similarity and merge duplicates that the
     # weak-only inline merge cannot catch. Set interval to 0 to disable.
