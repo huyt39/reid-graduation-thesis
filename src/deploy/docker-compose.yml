@@ -45,9 +45,14 @@ services:
       MINIO_ROOT_PASSWORD: minio123
     ports: ["9002:9000", "9003:9001"]
 
-  edge:
+  # ── Camera 1 — plays whatever video EDGE_SOURCE_URL points at (see infer/). ──
+  edge_cam1:
     build: ../edge
     env_file: ../edge/.env
+    environment:
+      - EDGE_SOURCE_URL=/app/infer/device2.mp4
+      - EDGE_DEVICE_ID=cam1
+      - EDGE_REID_TOPIC=reid_input_cam1
     depends_on:
       kafka:
         condition: service_healthy
@@ -55,11 +60,53 @@ services:
       - ../contracts:/app/src/contracts:ro
       - ../../infer:/app/infer:ro
 
-  reid_worker:
+  # ── Camera 2 — plays whatever video EDGE_SOURCE_URL points at (see infer/). ──
+  edge_cam2:
+    build: ../edge
+    env_file: ../edge/.env
+    environment:
+      - EDGE_SOURCE_URL=/app/infer/device_1.mp4
+      - EDGE_DEVICE_ID=cam2
+      - EDGE_REID_TOPIC=reid_input_cam2
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ../contracts:/app/src/contracts:ro
+      - ../../infer:/app/infer:ro
+
+  # ── Worker for camera 1. Shares Qdrant gallery + Redis person-id sequence
+  #    with worker_cam2 → same physical person across cameras = same person_id.
+  worker_cam1:
     build: ../reid_worker
     env_file: ../reid_worker/.env
     environment:
       - WORKER_PERSON_ID_SEQ_KEY=reid:seq:person_id
+      - WORKER_INPUT_TOPIC=reid_input_cam1
+      - WORKER_CONSUMER_GROUP=reid_worker_cam1
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mongo:
+        condition: service_started
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+      inference_engine:
+        condition: service_started
+    volumes:
+      - ../contracts:/app/src/contracts:ro
+
+  worker_cam2:
+    build: ../reid_worker
+    env_file: ../reid_worker/.env
+    environment:
+      - WORKER_PERSON_ID_SEQ_KEY=reid:seq:person_id
+      - WORKER_INPUT_TOPIC=reid_input_cam2
+      - WORKER_CONSUMER_GROUP=reid_worker_cam2
     depends_on:
       kafka:
         condition: service_healthy

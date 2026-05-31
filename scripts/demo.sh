@@ -23,7 +23,8 @@ QDRANT_COLLECTION="persons"
 QDRANT_AUX_COLLECTION="person_aux_upper"
 QDRANT_VECTOR_SIZE="512"
 REDIS_DB="0"
-KAFKA_TOPICS=("reid_input" "reid_output" "edge_preview")
+KAFKA_TOPICS=("reid_input_cam1" "reid_input_cam2" "reid_output" "edge_preview")
+EDGE_SERVICES=("edge_cam1" "edge_cam2")
 KAFKA_BOOTSTRAP="localhost:9092"
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -149,7 +150,7 @@ cmd_up() {
     cmd_reset
   fi
 
-  local app_services=(inference_engine query_service streaming reid_worker gateway ui)
+  local app_services=(inference_engine query_service streaming worker_cam1 worker_cam2 gateway ui)
   if [ -n "$build_flag" ]; then
     echo "Rebuilding app services..."
     if [ "$reset" = "true" ]; then
@@ -173,8 +174,8 @@ cmd_up() {
   wait_for_http "gateway"       "http://localhost:18080/readyz"
   wait_for_http "ui"            "http://localhost:3000"
 
-  echo "Replaying edge stream..."
-  docker compose -f "$COMPOSE_FILE" up -d $build_flag --force-recreate edge >/dev/null
+  echo "Replaying edge streams (${EDGE_SERVICES[*]})..."
+  docker compose -f "$COMPOSE_FILE" up -d $build_flag --force-recreate "${EDGE_SERVICES[@]}" >/dev/null
 
   cat <<EOF
 
@@ -196,8 +197,8 @@ EOF
 }
 
 cmd_replay() {
-  echo "Restarting edge for replay..."
-  docker compose -f "$COMPOSE_FILE" restart edge
+  echo "Restarting edges for replay (${EDGE_SERVICES[*]})..."
+  docker compose -f "$COMPOSE_FILE" restart "${EDGE_SERVICES[@]}"
 }
 
 cmd_diag() {
@@ -219,6 +220,21 @@ db.tracklets.aggregate([
   { \$group: { _id: '\$person_id', n: { \$sum: 1 } } },
   { \$sort: { _id: 1 } }
 ]).forEach(d => printjson(d));
+print('\n--- sightings per device (multi-camera) ---');
+db.sightings.aggregate([
+  { \$group: { _id: '\$device_id', sightings: { \$sum: 1 }, persons: { \$addToSet: '\$person_id' } } },
+  { \$project: { sightings: 1, distinct_persons: { \$size: '\$persons' } } },
+  { \$sort: { _id: 1 } }
+]).forEach(d => printjson(d));
+print('\n--- CROSS-CAMERA persons (same person_id seen on >=2 devices) ---');
+let xcam = 0;
+db.sightings.aggregate([
+  { \$group: { _id: '\$person_id', devices: { \$addToSet: '\$device_id' } } },
+  { \$project: { devices: 1, n_devices: { \$size: '\$devices' } } },
+  { \$match: { n_devices: { \$gte: 2 } } },
+  { \$sort: { _id: 1 } }
+]).forEach(d => { xcam++; printjson(d); });
+print('cross_camera_person_count: ' + xcam);
 "
 }
 
