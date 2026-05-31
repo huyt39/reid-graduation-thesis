@@ -14,6 +14,10 @@ import {
 } from "@/lib/reid-evidence";
 import type { TrackedPerson } from "@/hooks/use-websocket";
 
+// A tracked person tagged with the camera it was seen on, so the panel can
+// badge the source device and flag identities matched across cameras.
+export type PanelPerson = TrackedPerson & { deviceId: string };
+
 // Default threshold for most attributes. Glasses uses a lower value because
 // the PA-100K model's glasses head outputs calibrated confidence in the 0.73–0.84
 // range — systematically below the default — while still being accurate.
@@ -74,7 +78,19 @@ function collectAttributeBadges(person: TrackedPerson): string[] {
   return badges;
 }
 
-export function PersonsPanel({ persons }: { persons: TrackedPerson[] }) {
+interface PersonsPanelProps {
+  persons: PanelPerson[];
+  // person_ids confirmed on >=2 cameras — the cross-camera ReID payoff.
+  crossCameraIds?: Set<number>;
+  // Show the source-camera badge (only meaningful when >1 camera is live).
+  showDeviceBadge?: boolean;
+}
+
+export function PersonsPanel({
+  persons,
+  crossCameraIds,
+  showDeviceBadge = false,
+}: PersonsPanelProps) {
   return (
     <aside className="w-full lg:w-72 shrink-0 flex flex-col gap-3">
       <div className="flex items-center gap-2 text-xs text-muted-foreground uppercase tracking-wider px-1">
@@ -89,14 +105,19 @@ export function PersonsPanel({ persons }: { persons: TrackedPerson[] }) {
         {persons.map((p) => {
           const isTentative = p.tracklet_state === "tentative";
           const isRaw = p.person_id === null;
+          const isCrossCamera = p.person_id != null && !!crossCameraIds?.has(p.person_id);
           const badges = collectAttributeBadges(p);
           const status =
             p.status ?? (isTentative ? "tentative" : isRaw ? "recovering" : "confirmed");
           const displayLabel = getPersonDisplayLabel(p);
           return (
             <Card
-              key={`${p.live_track_key ?? p.tracklet_id ?? p.person_id ?? "raw"}-${p.bbox.join("-")}`}
-              className={cn("py-3 gap-2", isTentative && "opacity-60")}
+              key={`${p.deviceId}-${p.live_track_key ?? p.tracklet_id ?? p.person_id ?? "raw"}-${p.bbox.join("-")}`}
+              className={cn(
+                "py-3 gap-2",
+                isTentative && "opacity-60",
+                isCrossCamera && "ring-2 ring-fuchsia-500"
+              )}
             >
               <CardContent className="grid grid-cols-[52px_minmax(0,1fr)] gap-3 px-3">
                 <PersonSnapshot
@@ -110,7 +131,7 @@ export function PersonsPanel({ persons }: { persons: TrackedPerson[] }) {
                 />
                 <div className="space-y-1 text-xs">
                   <CardTitle className="flex items-center justify-between text-sm">
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <span className={cn("font-semibold", isTentative && "text-muted-foreground")}>
                         {displayLabel}
                         {p.tracklet_state && !isTentative && (
@@ -125,6 +146,16 @@ export function PersonsPanel({ persons }: { persons: TrackedPerson[] }) {
                       >
                         {getLiveStatusLabel(status)}
                       </Badge>
+                      {showDeviceBadge && (
+                        <Badge variant="secondary" className="text-[10px] font-normal">
+                          {p.deviceId}
+                        </Badge>
+                      )}
+                      {isCrossCamera && (
+                        <Badge className="bg-fuchsia-600 text-white hover:bg-fuchsia-600 text-[10px]">
+                          cross-cam
+                        </Badge>
+                      )}
                     </div>
                     <span className="text-xs text-muted-foreground">
                       {(p.confidence * 100).toFixed(0)}%

@@ -2773,6 +2773,11 @@ class WorkerPipeline:
                 min_score,
                 float(getattr(self.settings, "duplicate_merge_same_gender_singleton_min_score", 0.80)),
             )
+        if bool(getattr(self.settings, "duplicate_merge_cross_device_enabled", False)):
+            min_score = min(
+                min_score,
+                float(getattr(self.settings, "duplicate_merge_cross_device_min_score", 0.50)),
+            )
         min_score = min(
             min_score,
             float(getattr(self.settings, "duplicate_merge_soft_split_override_threshold", 0.75)),
@@ -2842,6 +2847,25 @@ class WorkerPipeline:
             candidate_count=candidate_count,
         )
         soft_split_merge = soft_split_reason is not None
+        # Cross-device (cross-camera) re-link: allow a margin-driven merge below
+        # the established-identity threshold when the two identities together span
+        # >= 2 cameras and have a clearly-dominant nearest-neighbour relationship.
+        # Cross-view same-person similarity is modest (~0.5-0.6) yet the correct
+        # identity still ranks #1 with a strong margin; the absolute 0.78 bar would
+        # otherwise reject it. Scoped to multi-camera (single-stream spans one
+        # device → never fires). The gender / attribute / cooccurrence guards below
+        # still apply unchanged, so genuinely-different people remain blocked.
+        cross_device_merge = False
+        if (
+            bool(getattr(self.settings, "duplicate_merge_cross_device_enabled", False))
+            and score >= float(getattr(self.settings, "duplicate_merge_cross_device_min_score", 0.50))
+            and margin >= float(getattr(self.settings, "duplicate_merge_cross_device_min_margin", 0.12))
+            and max(int(current_count), int(candidate_count))
+            <= int(getattr(self.settings, "duplicate_merge_cross_device_max_tracklets", 8))
+        ):
+            cross_device_merge = (
+                await self.mongo.persons_distinct_device_count(person_id, candidate_person_id)
+            ) >= 2
         low_score_canonical_bridge_reasons = {
             "reentry_bridge",
             "supported_spatial_reentry",
@@ -2989,6 +3013,7 @@ class WorkerPipeline:
                 and not same_gender_singleton_merge
                 and not soft_split_merge
                 and not is_supported_singleton_merge
+                and not cross_device_merge
                 and (
                     not is_singleton_merge
                     or score < singleton_min_score
@@ -3017,10 +3042,11 @@ class WorkerPipeline:
             else:
                 source_person_id = person_id
                 target_person_id = candidate_person_id
-        elif score >= established_min_score:
+        elif score >= established_min_score or cross_device_merge:
             # Both sides have accumulated evidence (no weak limit). Embedding
-            # similarity must clear a higher bar than the weak-merge path, and
-            # the cooccurrence + attribute guards below still apply. Source =
+            # similarity must clear a higher bar than the weak-merge path, OR be a
+            # margin-qualified cross-device (cross-camera) re-link. The
+            # cooccurrence + attribute guards below still apply unchanged. Source =
             # smaller-evidence side so the more-anchored ID is preserved.
             if candidate_count <= current_count:
                 source_person_id = candidate_person_id
