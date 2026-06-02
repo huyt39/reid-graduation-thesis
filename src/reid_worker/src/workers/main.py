@@ -285,6 +285,7 @@ class WorkerPipeline:
         self.aggregator = WeightedEmbeddingAggregator(
             gamma=self.settings.gamma,
             outlier_threshold=self.settings.agg_outlier_threshold,
+            exclude_overlap_ratio=self.settings.embedding_aggregate_max_overlap_ratio,
         )
         self.qdrant_store = QdrantPersonStore(
             host=self.settings.qdrant_host,

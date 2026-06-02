@@ -79,6 +79,13 @@ class Settings(BaseSettings):
     # recompute on the survivors. Defends against a single mis-tracked crop
     # skewing the tracklet representation. Set to 0.0 to disable.
     agg_outlier_threshold: float = 0.5
+    # Crop-contamination guard for the matching embedding: drop frames whose
+    # bbox overlaps another person at/above this ratio before aggregating, so a
+    # person who walks close behind another is not represented by a crop full
+    # of the other person's pixels (which would match the wrong identity at an
+    # inflated score). Falls back to all frames when <2 clean ones remain.
+    # 1.0 disables. Mirrors gallery_update_max_overlap_ratio for the anchor.
+    embedding_aggregate_max_overlap_ratio: float = 0.40
 
     # Tracklet-build-time appearance gate: when an existing tracklet receives a
     # new high-quality frame (v_worker ≥ this threshold), compare its embedding
