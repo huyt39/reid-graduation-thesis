@@ -17,13 +17,14 @@ class Settings(BaseSettings):
     output_schema_path: str = "src/contracts/reid_output.avsc"
 
     model_service_url: str = "http://localhost:8000"
-    # Which embedding model the inference engine should use. "osnet" is the
-    # OSNet-x1.0 trained on Market-1501 (single global feature, 512-d).
-    # "lmbn" uses Light Multi-Branch Network — multi-part body features
-    # (global + horizontal stripes + channel branches), more robust to
-    # partial-body / occluded crops. Requires INFERENCE_LMBN_WEIGHTS to be
-    # set in the inference engine.
-    embedding_model: str = "lmbn"
+    # Which embedding model the inference engine should use. "osnet_ain" is
+    # OSNet-AIN (domain-generalization variant with AdaIN, pretrained on
+    # MSMT17) — the embedding that generalized best to cross-view on the
+    # held-out camera pair (see MULTI_CAMERA.md), so it is the default.
+    # "osnet" is OSNet-x1.0 (Market-1501, single 512-d global feature).
+    # "lmbn" is Light Multi-Branch Network (multi-part body features); it
+    # needs INFERENCE_LMBN_WEIGHTS set in the inference engine.
+    embedding_model: str = "osnet_ain"
 
     qdrant_host: str = "localhost"
     qdrant_port: int = 6333
@@ -309,6 +310,13 @@ class Settings(BaseSettings):
     occlusion_provisional_reentry_max_entries: int = 8
     occlusion_provisional_reentry_max_gap_frames: int = 120
     occlusion_provisional_reentry_max_center_distance_ratio: float = 2.0
+    # Crop-contamination guard: when a candidate detection's bbox overlaps another
+    # person's box by more than this ratio, its crop is contaminated by that other
+    # person, so its appearance embedding is untrustworthy and must NOT be absorbed
+    # into an existing identity via occlusion provisional match. Above this overlap
+    # the detection is forced to form its own identity instead. Set high (>=1.0) to
+    # disable. Tuned so a person walking close behind another is not silently merged.
+    occlusion_provisional_match_max_overlap_ratio: float = 0.40
 
     track_high_thresh: float = 0.7
     track_low_thresh: float = 0.35

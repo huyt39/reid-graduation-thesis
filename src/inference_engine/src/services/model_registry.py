@@ -94,6 +94,7 @@ class ModelRegistry:
         self.osnet = None
         self.osnet_onnx = None
         self.osnet_onnx_input_name: str | None = None
+        self.osnet_ain = None
         self.lmbn = None
         self.gender_model = None
         self.multi_attr_model = None  # 8-task PA-100K classifier; takes priority over gender_model
@@ -173,6 +174,25 @@ class ModelRegistry:
                     )
             else:
                 log.warning("model_registry.osnet_weights_missing", path=str(osnet_path) if osnet_path else "")
+
+        # OSNet-AIN (domain-generalization variant; loaded if weights present)
+        if getattr(settings, "osnet_ain_weights", "") and not settings.use_triton:
+            ain_path = _resolve_path(settings.osnet_ain_weights)
+            if ain_path is not None and ain_path.exists():
+                try:
+                    from src.models.osnet_ain import osnet_ain_x1_0
+                    self.osnet_ain = osnet_ain_x1_0(weight_path=str(ain_path), device=self.device)
+                    self.osnet_ain.eval()
+                    log.info("model_registry.osnet_ain_loaded", path=str(ain_path))
+                except Exception as exc:
+                    self.osnet_ain = None
+                    log.warning(
+                        "model_registry.osnet_ain_load_failed",
+                        path=str(ain_path),
+                        error=str(exc),
+                    )
+            else:
+                log.warning("model_registry.osnet_ain_weights_missing", path=str(ain_path) if ain_path else "")
 
         # LMBN (optional, not yet exported to Triton)
         if settings.lmbn_weights and not settings.use_triton:
@@ -322,6 +342,8 @@ class ModelRegistry:
             dummy_emb = torch.randn(1, 3, 256, 128, device=self.device)
             if self.osnet:
                 self.osnet(dummy_emb)
+            if self.osnet_ain:
+                self.osnet_ain(dummy_emb)
             if self.osnet_onnx is not None and self.osnet_onnx_input_name is not None:
                 self._extract_onnx_embedding(dummy_emb)
             if self.lmbn:
@@ -376,6 +398,10 @@ class ModelRegistry:
             arr = tensors.detach().cpu().numpy().astype(np.float32)
             emb = self.triton.embed(arr)
             return emb.tolist()
+        if model == "osnet_ain" and self.osnet_ain is not None:
+            features = self.osnet_ain(tensors)
+            features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            return features.cpu().numpy().tolist()
         if model == "lmbn" and self.lmbn is not None:
             features = self.lmbn(tensors).mean(dim=2)
             features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-8)
@@ -396,6 +422,10 @@ class ModelRegistry:
             arr = tensor.detach().cpu().numpy().astype(np.float32)
             emb = self.triton.embed(arr)
             return emb.flatten().tolist()
+        if model == "osnet_ain" and self.osnet_ain is not None:
+            features = self.osnet_ain(tensor)  # [1, 512]
+            features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            return features.cpu().numpy().flatten().tolist()
         if model == "lmbn" and self.lmbn is not None:
             features = self.lmbn(tensor)  # [1, 512, 7]
             features = features.mean(dim=2)  # [1, 512]
@@ -419,7 +449,10 @@ class ModelRegistry:
             arr = tensors.detach().cpu().numpy().astype(np.float32)
             emb = self.triton.embed(arr)
             return emb.tolist()
-        if model == "lmbn" and self.lmbn is not None:
+        if model == "osnet_ain" and self.osnet_ain is not None:
+            features = self.osnet_ain(tensors)
+            features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        elif model == "lmbn" and self.lmbn is not None:
             features = self.lmbn(tensors).mean(dim=2)
             features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-8)
         elif self.osnet is not None:

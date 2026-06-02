@@ -913,6 +913,25 @@ class WorkerPipeline:
                 return None, matching
 
         max_overlap = max((float(getattr(entry, "overlap_ratio", 0.0) or 0.0) for entry in entries), default=0.0)
+        # Crop-contamination guard: a detection whose box heavily overlaps another
+        # person's box yields a crop polluted by that other person, which can match
+        # an existing identity at an inflated score (the crop literally contains the
+        # target's pixels). Refuse to absorb such a detection so it forms its own
+        # identity instead of contaminating the matched person's snapshots/evidence.
+        contaminated_overlap = float(
+            getattr(self.settings, "occlusion_provisional_match_max_overlap_ratio", 0.40)
+        )
+        if max_overlap >= contaminated_overlap:
+            log.info(
+                "occlusion_provisional_rejected_contaminated_overlap",
+                track_id=tracklet.track_id,
+                reuse_person_id=reuse_pid,
+                similarity_score=round(score_f, 4),
+                max_overlap=round(max_overlap, 4),
+                max_overlap_threshold=round(contaminated_overlap, 4),
+                short_reentry=bool(short_reentry),
+            )
+            return None, matching
         occlusion_like = (
             int(tracklet.track_id) < 0
             or float(v_avg) < float(getattr(self.settings, "low_visibility_threshold", 0.65))
