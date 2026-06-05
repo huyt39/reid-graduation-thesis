@@ -2,36 +2,12 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Card } from "@/components/ui/card";
-import { getLiveStatusLabel } from "@/lib/reid-evidence";
 import type { FrameUpdate, TrackedPerson } from "@/hooks/use-websocket";
 
-function visColor(score: number): string {
-  if (score >= 0.7) return "#22c55e";
-  if (score >= 0.4) return "#eab308";
-  return "#ef4444";
-}
-
-// Golden-ratio hue spacing — gives visually distinct, stable colors per person_id.
-// Returns hex (not hsl()) so the `color + "18"` / `color + "cc"` alpha-hex
-// concatenation downstream produces a valid CSS color.
-function personColor(personId: number): string {
-  const hue = (personId * 137.508) % 360;
-  const s = 0.7;
-  const l = 0.55;
-  const c = (1 - Math.abs(2 * l - 1)) * s;
-  const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
-  const m = l - c / 2;
-  let r = 0, g = 0, b = 0;
-  if (hue < 60) [r, g, b] = [c, x, 0];
-  else if (hue < 120) [r, g, b] = [x, c, 0];
-  else if (hue < 180) [r, g, b] = [0, c, x];
-  else if (hue < 240) [r, g, b] = [0, x, c];
-  else if (hue < 300) [r, g, b] = [x, 0, c];
-  else [r, g, b] = [c, 0, x];
-  const toHex = (v: number) =>
-    Math.round((v + m) * 255).toString(16).padStart(2, "0");
-  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
-}
+// The Live tab is a plain monitoring view (raw edge video + person-detection
+// boxes). ReID identity/colour/score belongs to the Persons/Timeline tabs, not
+// here — so every detected person is drawn as one neutral box, no label.
+const BOX_COLOR = "#22c55e";
 
 function drawOverlay(canvas: HTMLCanvasElement, img: HTMLImageElement, persons: TrackedPerson[]) {
   const ctx = canvas.getContext("2d");
@@ -44,6 +20,8 @@ function drawOverlay(canvas: HTMLCanvasElement, img: HTMLImageElement, persons: 
   const W = canvas.width;
   const H = canvas.height;
 
+  ctx.strokeStyle = BOX_COLOR;
+  ctx.lineWidth = 2;
   for (const p of persons) {
     const [x1, y1, x2, y2] = p.bbox;
     const isNorm = x2 <= 1.0 && y2 <= 1.0;
@@ -51,44 +29,7 @@ function drawOverlay(canvas: HTMLCanvasElement, img: HTMLImageElement, persons: 
     const ry1 = isNorm ? y1 * H : y1;
     const rx2 = isNorm ? x2 * W : x2;
     const ry2 = isNorm ? y2 * H : y2;
-    const bw = rx2 - rx1;
-    const bh = ry2 - ry1;
-
-    const isTentative = p.tracklet_state === "tentative";
-    const status = p.status ?? (isTentative ? "tentative" : "confirmed");
-    const color =
-      isTentative
-        ? "#94a3b8"
-        : p.person_id != null
-          ? personColor(p.person_id)
-          : status === "recovering"
-            ? "#f59e0b"
-            : visColor(p.live_visibility_score);
-
-    ctx.strokeStyle = color;
-    ctx.lineWidth = isTentative ? 1.5 : 2;
-    ctx.setLineDash(isTentative ? [6, 3] : []);
-    ctx.strokeRect(rx1, ry1, bw, bh);
-    ctx.setLineDash([]);
-
-    ctx.fillStyle = color + "18";
-    ctx.fillRect(rx1, ry1, bw, bh);
-
-    const label = isTentative
-      ? p.track_id != null
-        ? `T#${p.track_id}`
-        : "?"
-      : p.person_id === null
-        ? `raw ${Math.max(p.confidence, p.live_visibility_score).toFixed(2)}`
-        : `#${p.person_id} ${getLiveStatusLabel(status)} ${p.live_visibility_score.toFixed(2)}`;
-    ctx.font = "600 12px sans-serif";
-    const tw = ctx.measureText(label).width;
-    const labelY = ry1 > 18 ? ry1 - 4 : ry1 + 16;
-    ctx.fillStyle = color + "cc";
-    ctx.fillRect(rx1, labelY - 13, tw + 8, 16);
-
-    ctx.fillStyle = "#ffffff";
-    ctx.fillText(label, rx1 + 4, labelY);
+    ctx.strokeRect(rx1, ry1, rx2 - rx1, ry2 - ry1);
   }
 }
 

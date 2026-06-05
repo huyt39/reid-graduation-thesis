@@ -14,7 +14,6 @@ import {
 import { DeviceSelector } from "./device-selector";
 import { ConnectionBadge } from "./connection-badge";
 import { LiveFeed } from "./live-feed";
-import { PersonsPanel, type PanelPerson } from "./persons-panel";
 
 const WS_URL = process.env.NEXT_PUBLIC_STREAMING_WS || "ws://localhost:8765";
 
@@ -59,10 +58,9 @@ export function LiveView() {
   // visible camera. Identity-cache keys are `device_id:track_id` (namespaced
   // by the worker), so a single shared cache map is collision-free across
   // cameras. See live-view single-stream notes — same logic, applied per device.
-  const { feeds, panelPersons, crossCameraIds } = useMemo(() => {
+  const { feeds, crossCameraIds } = useMemo(() => {
     const now = Date.now();
     const builtFeeds: FeedView[] = [];
-    const allPanelPersons: PanelPerson[] = [];
     const devicesByPersonId = new Map<number, Set<string>>();
 
     for (const deviceId of visibleDeviceIds) {
@@ -120,11 +118,11 @@ export function LiveView() {
             : 0,
       });
 
-      // Panel uses pure processed persons (real IDs + attribute hysteresis),
-      // tagged with their camera so we can badge + spot cross-camera identities.
+      // Track which cameras each processed person_id appears on, to badge
+      // cross-camera identities (the panel itself was removed — the Live tab is
+      // a plain monitoring view; identities live in Persons/Timeline).
       const sourcePersons = processedFrame?.tracked_persons ?? hybridPersons;
       for (const person of sourcePersons) {
-        allPanelPersons.push({ ...person, deviceId });
         if (person.person_id != null) {
           const set = devicesByPersonId.get(person.person_id) ?? new Set<string>();
           set.add(deviceId);
@@ -138,7 +136,7 @@ export function LiveView() {
       if (devices.size >= 2) xCamIds.add(personId);
     }
 
-    return { feeds: builtFeeds, panelPersons: allPanelPersons, crossCameraIds: xCamIds };
+    return { feeds: builtFeeds, crossCameraIds: xCamIds };
   }, [visibleDeviceIds, processed.framesByDevice, raw.framesByDevice]);
 
   const anyRawFallback = feeds.some((f) => f.usingRawFallback);
@@ -199,27 +197,20 @@ export function LiveView() {
         </div>
       ) : null}
 
-      <div className="flex flex-col lg:flex-row gap-4 lg:items-start">
-        <PersonsPanel
-          persons={isLiveActive ? panelPersons : []}
-          crossCameraIds={crossCameraIds}
-          showDeviceBadge={deviceIds.length > 1}
-        />
-        <div
-          className={
-            feeds.length > 1
-              ? "grid flex-1 gap-3 grid-cols-1 xl:grid-cols-2"
-              : "flex flex-1"
-          }
-        >
-          {feeds.length === 0 ? (
-            <LiveFeed frame={null} isLiveActive={isLiveActive} />
-          ) : (
-            feeds.map((f) => (
-              <LiveFeed key={f.deviceId} frame={f.frame} isLiveActive={isLiveActive} />
-            ))
-          )}
-        </div>
+      <div
+        className={
+          feeds.length > 1
+            ? "grid w-full gap-3 grid-cols-1 xl:grid-cols-2"
+            : "flex w-full"
+        }
+      >
+        {feeds.length === 0 ? (
+          <LiveFeed frame={null} isLiveActive={isLiveActive} />
+        ) : (
+          feeds.map((f) => (
+            <LiveFeed key={f.deviceId} frame={f.frame} isLiveActive={isLiveActive} />
+          ))
+        )}
       </div>
     </div>
   );
