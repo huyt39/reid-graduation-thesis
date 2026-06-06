@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import time
 import uuid
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from src.kafka.consumer import WorkerKafkaConsumer
 from src.kafka.producer import WorkerKafkaProducer
 from src.matching.qdrant_store import QdrantPersonStore
 from src.matching.reid_matcher import ReIDMatcher, PersonIdAllocationError
+from src.matching import color_descriptor
 from src.persistence.minio_store import MinIOSnapshotStore
 from src.persistence.mongo_store import MongoPersonStore
 from src.persistence.redis_cache import RedisPersonCache, RedisPersonIdAllocator
@@ -36,6 +38,15 @@ from src.tracklet.selector import TopKSelector
 from src.utils.ops import xyxy2xywh
 
 log = structlog.get_logger()
+
+# Per-task flag (ContextVar => isolated per asyncio task) marking that the
+# current task already holds the identity-serialization lock, so nested helper
+# calls don't try to re-acquire it (asyncio.Lock is not reentrant). Being a
+# ContextVar (not an instance attribute) it stays correct under concurrency:
+# a different task has its own copy defaulting to False and will wait on the lock.
+_IDENTITY_SERIAL_ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "reid_identity_serial_active", default=False
+)
 
 # Tasks emitted on every TrackedPerson — must match Avro schema field names.
 _ATTRIBUTE_TASKS = ("gender", "age_child", "backpack", "sidebag",
@@ -271,8 +282,8 @@ class WorkerPipeline:
         self.tracklet_buffer = TrackletBuffer(
             min_entries=self.settings.tracklet_min_entries,
             max_entries=self.settings.tracklet_max_entries,
-            window_seconds=self.settings.tracklet_window_seconds,
-            stale_seconds=self.settings.tracklet_stale_seconds,
+            window_frames=self.settings.tracklet_window_frames,
+            stale_frames=self.settings.tracklet_stale_frames,
         )
         self.topk_selector = TopKSelector(
             k=self.settings.topk_k,
@@ -315,6 +326,11 @@ class WorkerPipeline:
             flip_threshold=self.settings.attribute_flip_threshold,
             task_flip_thresholds={"gender": self.settings.gender_flip_threshold},
         )
+        # Within-camera torso color evidence per person: person_id -> device_id ->
+        # {"hist": aggregated HS histogram, "count": n samples}. Updated on confirmed
+        # (non-provisional) assignment; read by the color guard to veto attaching a
+        # clearly different-colored person. In-memory only (demo --reset wipes it).
+        self._person_color_evidence: dict[int, dict[str, dict]] = {}
         self.matcher = ReIDMatcher(
             self.qdrant_store,
             id_allocator=self.person_id_allocator.allocate,
@@ -343,6 +359,7 @@ class WorkerPipeline:
             current_identity_switch_max_current_score=self.settings.current_identity_switch_max_current_score,
             capped_identity_soft_match_threshold=self.settings.capped_identity_soft_match_threshold,
             near_gallery_defer_threshold=self.settings.near_gallery_defer_threshold,
+            near_gallery_deferred_mint_max_score=self.settings.near_gallery_deferred_mint_max_score,
             good_streak_min_consecutive=self.settings.good_streak_min_consecutive,
             good_streak_promotion_enabled=self.settings.good_streak_promotion_enabled,
             scale_aux_gallery_enabled=self.settings.scale_aux_gallery_enabled,
@@ -655,6 +672,30 @@ class WorkerPipeline:
                     self._register_temporal_exclusion(track_id_b, person_id_a)
                 if person_id_b is not None:
                     self._register_temporal_exclusion(track_id_a, person_id_b)
+                # Persist the "two genuinely different people" signal for offline
+                # quality audits: when two KNOWN person_ids have spatially-distinct
+                # boxes in the same frame they cannot be the same person. Dedupe by
+                # unordered pair so the log carries one line per proven-different
+                # pair, not one per frame.
+                if (
+                    person_id_a is not None
+                    and person_id_b is not None
+                    and person_id_a != person_id_b
+                ):
+                    pair = (min(person_id_a, person_id_b), max(person_id_a, person_id_b))
+                    seen = getattr(self, "_logged_spatial_exclusion_pairs", None)
+                    if seen is None:
+                        seen = set()
+                        self._logged_spatial_exclusion_pairs = seen
+                    if pair not in seen:
+                        seen.add(pair)
+                        log.info(
+                            "spatial_exclusion",
+                            person_a=pair[0],
+                            person_b=pair[1],
+                            track_a=track_id_a,
+                            track_b=track_id_b,
+                        )
 
     def _find_attribute_incompatible_person_ids(
         self,
@@ -812,6 +853,120 @@ class WorkerPipeline:
             or p_gender_support >= self._attribute_conflict_ready_person_support()
         )
 
+    def _clean_tracklet_color(self, entries):
+        """Build a torso color descriptor from only CLEAN frames (high visibility,
+        low overlap). Returns None if too few reliable frames — the guard then
+        abstains rather than veto on noisy/occluded color (the attempt-#1 mistake)."""
+        if not entries:
+            return None
+        v_floor = float(getattr(self.settings, "color_guard_min_frame_visibility", 0.5))
+        ov_ceil = float(getattr(self.settings, "color_guard_max_frame_overlap", 0.30))
+        min_frames = int(getattr(self.settings, "color_guard_min_reliable_frames", 3))
+        clean = [
+            e for e in entries
+            if float(getattr(e, "v_score", 0.0)) >= v_floor
+            and float(getattr(e, "overlap_ratio", 0.0)) <= ov_ceil
+        ]
+        if len(clean) < min_frames:
+            return None
+        desc = color_descriptor.descriptor_from_entries(
+            clean, max_frames=int(getattr(self.settings, "color_guard_max_frames", 12))
+        )
+        return desc
+
+    def _update_person_color_evidence(self, person_id, device_id, entries) -> None:
+        """Record a confirmed tracklet's CLEAN torso color into the person's
+        per-device color evidence (running mean of HS histograms)."""
+        if not bool(getattr(self.settings, "color_guard_enabled", True)):
+            return
+        if person_id is None or not device_id:
+            return
+        desc = self._clean_tracklet_color(entries)
+        if desc is None:
+            return
+        per_dev = self._person_color_evidence.setdefault(int(person_id), {})
+        cur = per_dev.get(str(device_id))
+        if cur is None:
+            per_dev[str(device_id)] = {"hist": desc.astype(np.float32), "count": 1}
+        else:
+            n = int(cur["count"])
+            cur["hist"] = (cur["hist"].astype(np.float32) * n + desc) / (n + 1)
+            cur["count"] = n + 1
+
+    def _find_color_incompatible_person_ids(self, tracklet, current_person_id, device_id) -> set[int]:
+        """Within-camera PRIMARY-MATCH color guard: persons on THIS camera whose
+        reference torso color clearly differs from this (clean) tracklet. Fed into
+        the matcher's forbidden set so primary gallery match can't glue two
+        different-colored people (which CLIP-ReID's ~0 margin lets through).
+        Cross-camera persons are never forbidden (color shifts with lighting)."""
+        if not bool(getattr(self.settings, "color_guard_enabled", True)) or not device_id:
+            return set()
+        desc = self._clean_tracklet_color(list(getattr(tracklet, "entries", None) or []))
+        if desc is None:
+            return set()  # tracklet color unreliable -> abstain (never false-veto)
+        thr = float(getattr(self.settings, "color_conflict_veto_threshold", 0.83))
+        min_ev = int(getattr(self.settings, "color_guard_min_person_evidence", 1))
+        incompatible: set[int] = set()
+        for pid, per_dev in self._person_color_evidence.items():
+            if current_person_id is not None and pid == current_person_id:
+                continue
+            cur = per_dev.get(str(device_id))
+            if cur is None or int(cur["count"]) < min_ev:
+                continue
+            sim = color_descriptor.color_sim(desc, cur["hist"])
+            if sim is not None and sim < thr:
+                incompatible.add(int(pid))
+        return incompatible
+
+    def _tracklet_color_conflicts_person(self, entries, person_id, device_id) -> bool:
+        """Reliability-gated color conflict for the occlusion-recovery paths.
+
+        Returns True ONLY when the candidate's color is RELIABLE (>=N clean frames)
+        AND clearly differs from the person's same-camera color evidence. On noisy/
+        occluded crops _clean_tracklet_color returns None -> abstain (no veto). This
+        is the fix for attempt #1, which vetoed on noisy color and over-fragmented."""
+        if not bool(getattr(self.settings, "color_guard_enabled", True)):
+            return False
+        if person_id is None or not device_id:
+            return False
+        desc = self._clean_tracklet_color(list(entries or []))
+        if desc is None:
+            return False  # color not trustworthy here -> let other guards decide
+        per_dev = self._person_color_evidence.get(int(person_id))
+        if not per_dev:
+            return False
+        cur = per_dev.get(str(device_id))
+        if cur is None or int(cur["count"]) < int(getattr(self.settings, "color_guard_min_person_evidence", 1)):
+            return False
+        sim = color_descriptor.color_sim(desc, cur["hist"])
+        if sim is None:
+            return False
+        return sim < float(getattr(self.settings, "color_conflict_veto_threshold", 0.83))
+
+    def _persons_color_conflict(self, source_pid, target_pid) -> bool:
+        """Within-camera color veto for the duplicate-MERGE decision: True if the two
+        persons' reference torso colors clearly differ on a SHARED camera. Both are
+        established persons here, so their color evidence is a clean aggregate — the
+        most reliable place for the guard (validated 0.94 same vs 0.55 diff at the
+        aggregate level). Abstains when they share no device with evidence (e.g. a
+        legitimate cross-camera merge), so cross-view linking is never blocked."""
+        if not bool(getattr(self.settings, "color_guard_enabled", True)):
+            return False
+        src = self._person_color_evidence.get(int(source_pid))
+        tgt = self._person_color_evidence.get(int(target_pid))
+        if not src or not tgt:
+            return False
+        thr = float(getattr(self.settings, "color_conflict_veto_threshold", 0.83))
+        min_ev = int(getattr(self.settings, "color_guard_min_person_evidence", 1))
+        for dev in set(src) & set(tgt):
+            s, t = src[dev], tgt[dev]
+            if int(s["count"]) < min_ev or int(t["count"]) < min_ev:
+                continue
+            sim = color_descriptor.color_sim(s["hist"], t["hist"])
+            if sim is not None and sim < thr:
+                return True
+        return False
+
     def _maybe_accept_occlusion_provisional_match(
         self,
         *,
@@ -863,6 +1018,15 @@ class WorkerPipeline:
                 reuse_person_id=reuse_pid,
                 tracklet_gender=tracklet_attrs.get("gender"),
                 person_snapshot=self.attribute_voter.person_snapshot(reuse_pid),
+            )
+            return None, matching
+        if self._tracklet_color_conflicts_person(
+            getattr(tracklet, "entries", None), reuse_pid, getattr(self, "_current_device_id", "")
+        ):
+            log.warning(
+                "occlusion_provisional_match_rejected_color_conflict",
+                track_id=tracklet.track_id,
+                reuse_person_id=reuse_pid,
             )
             return None, matching
 
@@ -1413,7 +1577,7 @@ class WorkerPipeline:
                 )
 
         if cluster_enabled:
-            self._flush_stale_untracked_detection_clusters(frame_number)
+            await self._flush_stale_untracked_detection_clusters(frame_number)
 
     def _cluster_embedding_similarity(
         self,
@@ -1568,6 +1732,9 @@ class WorkerPipeline:
                 f"{self._current_device_id}:untracked_cluster:"
                 f"{abs(int(cluster['cluster_id']))}:{start_frame}"
             )
+            # Remember the candidate id so a later evidence-attach can mark this
+            # exact row resolved (instead of leaving an orphan / adding a new row).
+            cluster["candidate_id"] = candidate_id
             await self._persist_occlusion_candidate(
                 tracklet,
                 reason="untracked_detection_cluster",
@@ -1885,15 +2052,195 @@ class WorkerPipeline:
                 exc_info=True,
             )
 
-    def _flush_stale_untracked_detection_clusters(self, frame_number: int) -> None:
+    async def _try_attach_cluster_as_evidence(self, cluster: dict) -> bool:
+        """Attach a CLEAR untracked cluster to an EXISTING person as occlusion
+        evidence (a sighting), if it confidently matches that person's gallery.
+
+        This rescues clear occluded-gap detections ByteTrack missed — too short to
+        safely mint a new identity, but clear enough to enrich the matched person.
+        It NEVER mints and NEVER updates the gallery/snapshot/attributes (see
+        _persist_attached_occlusion_evidence). The gallery score + margin guard
+        prevent attaching to the wrong (similar-looking) person.
+        """
+        if not bool(getattr(self.settings, "untracked_cluster_evidence_attach_enabled", True)):
+            return False
+        if cluster.get("evidence_attached") or cluster.get("promoted_to_buffer"):
+            return False
+        entries = list(cluster.get("entries") or [])
+        embs = [np.asarray(e, dtype=np.float32) for e in (cluster.get("embeddings_by_frame") or {}).values()]
+        min_entries = int(getattr(self.settings, "untracked_detection_cluster_min_entries", 2))
+        if len(entries) < min_entries or not embs:
+            return False
+        max_v = max((float(getattr(e, "v_score", 0.0)) for e in entries), default=0.0)
+        if max_v < float(getattr(self.settings, "untracked_cluster_evidence_attach_min_visibility", 0.65)):
+            return False
+        emb = np.mean(np.stack(embs, axis=0), axis=0)
+        emb_norm = float(np.linalg.norm(emb))
+        if emb_norm < 1e-8:
+            return False
+        emb = emb / emb_norm
+        min_score = float(getattr(self.settings, "similarity_threshold", 0.73))
+        hits = self.qdrant_store.search(emb, top_k=2, score_threshold=min_score)
+        if not hits:
+            # No existing person to attach to (best match < similarity_threshold).
+            # Last-resort: mint a NEW person if this is a clear, sustained,
+            # clearly-distinct orphan (the clear-but-missed-person case).
+            return await self._lastresort_mint_clear_cluster(cluster, entries, embs, emb, max_v)
+        pid, score = int(hits[0][0]), float(hits[0][1])
+        runner_up = float(hits[1][1]) if len(hits) > 1 else None
+        margin = (score - runner_up) if runner_up is not None else float("inf")
+        if margin < float(getattr(self.settings, "match_margin", 0.06)):
+            return False
+        # Reliability-gated within-camera color guard: block a CLEAR cluster whose
+        # torso color differs from the person's same-camera color (abstains on
+        # noisy clusters). This path bypasses attribute guards (tracklet_attrs=None).
+        _cluster_device = str(cluster.get("device_id") or getattr(self, "_current_device_id", ""))
+        if self._tracklet_color_conflicts_person(entries, pid, _cluster_device):
+            log.info(
+                "untracked_cluster_evidence_rejected_color_conflict",
+                cluster_id=cluster.get("cluster_id"),
+                person_id=pid,
+                similarity_score=round(score, 4),
+            )
+            return False
+        cluster_tracklet = type(
+            "UntrackedClusterEvidenceTracklet",
+            (),
+            {"track_id": int(cluster["cluster_id"]), "entries": entries},
+        )()
+        consistency = compute_tracklet_consistency(entries)
+        v_avg = float(np.mean([float(getattr(e, "v_score", 0.0)) for e in entries]))
+        emb_consistency = WeightedEmbeddingAggregator.compute_embedding_consistency(embs)
+        tracklet_id = str(uuid.uuid4())
+        await self._persist_attached_occlusion_evidence(
+            tracklet=cluster_tracklet,
+            tracklet_id=tracklet_id,
+            person_id=pid,
+            consistency=consistency,
+            v_avg=v_avg,
+            emb_consistency=emb_consistency,
+            selected=entries,
+            matching={
+                "method": "untracked_cluster_evidence",
+                "source": "untracked_detection_cluster",
+                "reuse_person_id": pid,
+                "similarity_score": score,
+                "provisional": True,
+                "canonical_update_applied": False,
+            },
+            tracklet_attrs=None,
+        )
+        cluster["evidence_attached"] = True
+        cand_id = cluster.get("candidate_id")
+        if cand_id:
+            try:
+                await self.mongo.mark_occlusion_candidate_attached(cand_id, pid)
+            except Exception:
+                log.debug("mark_occlusion_candidate_attached_failed", exc_info=True)
+        log.info(
+            "untracked_cluster_evidence_attached",
+            cluster_id=cluster["cluster_id"],
+            person_id=pid,
+            similarity_score=round(score, 4),
+            margin=None if margin == float("inf") else round(float(margin), 4),
+            entries=len(entries),
+            max_visibility=round(max_v, 4),
+        )
+        return True
+
+    async def _lastresort_mint_clear_cluster(self, cluster, entries, embs, emb, max_v) -> bool:
+        """Final-net mint for a CLEAR, sustained untracked orphan that matched no
+        existing person (best < similarity_threshold). Recovers a clearly-detected
+        person ByteTrack missed whom the matcher never minted (plan E12). Tightly
+        gated so it never mints noise or duplicates a plausible re-entry."""
+        if not bool(getattr(self.settings, "untracked_cluster_lastresort_mint_enabled", True)):
+            return False
+        if float(max_v) < float(getattr(self.settings, "untracked_cluster_lastresort_mint_min_visibility", 0.85)):
+            return False
+        if len(entries) < int(getattr(self.settings, "untracked_cluster_lastresort_mint_min_entries", 6)):
+            return False
+        consistency = compute_tracklet_consistency(entries)
+        if float(consistency.overall) < float(getattr(self.settings, "promote_consistency_threshold", 0.65)):
+            return False
+        # Clearly-distinct guard: the cluster must NOT be a plausible re-entry of an
+        # existing person. If its best gallery match (above the defer floor) is at
+        # or above the clearly-distinct bar, don't mint (avoid duplicating a person
+        # whose cross-view re-entry just scored low) — protects 51/52.
+        distinct_below = float(getattr(self.settings, "near_gallery_deferred_mint_max_score", 0.64)) or 0.64
+        defer_floor = float(getattr(self.settings, "near_gallery_defer_threshold", 0.58))
+        near = self.qdrant_store.search(emb, top_k=1, score_threshold=defer_floor)
+        if near and float(near[0][1]) >= distinct_below:
+            return False
+        cluster_tracklet = type(
+            "UntrackedClusterMintTracklet",
+            (),
+            {"track_id": int(cluster["cluster_id"]), "entries": entries},
+        )()
+        if self._identity_cap_reached() or not self._can_allocate_new_identity(cluster_tracklet):
+            return False
+        try:
+            pid = self.person_id_allocator.allocate()
+        except Exception as err:
+            raise PersonIdAllocationError(str(err)) from err
+        self.qdrant_store.add_person(
+            pid, emb,
+            {"source": "untracked_cluster_lastresort", "total_entries": len(entries)},
+        )
+        v_avg = float(np.mean([float(getattr(e, "v_score", 0.0)) for e in entries]))
+        emb_consistency = WeightedEmbeddingAggregator.compute_embedding_consistency(embs)
+        best_entry = max(entries, key=lambda e: float(getattr(e, "v_score", 0.0)))
+        tracklet_id = str(uuid.uuid4())
+        await self._persist_tracklet(
+            tracklet=cluster_tracklet,
+            tracklet_id=tracklet_id,
+            person_id=pid,
+            consistency=consistency,
+            v_avg=v_avg,
+            emb_consistency=emb_consistency,
+            best_entry=best_entry,
+            selected=entries,
+            matching={
+                "method": "new_identity",
+                "source": "untracked_cluster_lastresort",
+                "similarity_score": None,
+            },
+            person_attrs={},
+            tracklet_attrs=None,
+        )
+        cluster["evidence_attached"] = True
+        cand_id = cluster.get("candidate_id")
+        if cand_id:
+            try:
+                await self.mongo.mark_occlusion_candidate_attached(cand_id, pid)
+            except Exception:
+                log.debug("mark_occlusion_candidate_attached_failed", exc_info=True)
+        log.info(
+            "untracked_cluster_lastresort_minted",
+            cluster_id=cluster["cluster_id"],
+            person_id=pid,
+            entries=len(entries),
+            max_visibility=round(float(max_v), 4),
+            overall_consistency=round(float(consistency.overall), 4),
+            best_existing=None if not near else round(float(near[0][1]), 4),
+        )
+        return True
+
+    async def _flush_stale_untracked_detection_clusters(self, frame_number: int) -> None:
         if not hasattr(self, "untracked_detection_clusters"):
             self.untracked_detection_clusters = []
         flush_after = int(getattr(self.settings, "untracked_detection_cluster_flush_after_frames", 36))
-        self.untracked_detection_clusters = [
-            cluster
-            for cluster in self.untracked_detection_clusters
-            if int(frame_number) - int(cluster["last_frame"]) <= flush_after
-        ]
+        kept: list[dict] = []
+        for cluster in self.untracked_detection_clusters:
+            if int(frame_number) - int(cluster["last_frame"]) <= flush_after:
+                kept.append(cluster)
+                continue
+            # Cluster is leaving memory — last chance to turn a clear orphan into
+            # evidence for an existing person before it's dropped.
+            try:
+                await self._try_attach_cluster_as_evidence(cluster)
+            except Exception:
+                log.debug("cluster_evidence_attach_failed", exc_info=True)
+        self.untracked_detection_clusters = kept
 
     def run(self) -> None:
         log.info("worker_started", service=self.settings.service_name)
@@ -2056,6 +2403,7 @@ class WorkerPipeline:
                 v_edge,
                 compute_iou_prev(bbox_xyxy, bbox_prev),
                 compute_vel_smooth(center_curr, center_prev, bbox_prev2_center, bbox_size),
+                v_edge_floor_ratio=float(getattr(self.settings, "v_worker_edge_floor_ratio", 0.0)),
             )
             self.prev_bboxes.setdefault(track_id, []).append(bbox_xyxy.copy())
             keep_frames = max(3, int(self.settings.pretrack_static_filter_min_frames))
@@ -2114,17 +2462,21 @@ class WorkerPipeline:
                 ),
             )
 
+        # Buffer readiness/staleness is keyed on frame index (deterministic),
+        # not wall-clock current_time_ns, so the same video flushes the same
+        # tracklets in the same order every run.
+        buffer_clock = int(frame_number)
         pop_ready_tracklets = getattr(self.tracklet_buffer, "pop_ready_tracklets", None)
         processing_tracklet_ids = set(getattr(self, "processing_tracklet_ids", set()))
         ready_tracklets = (
-            pop_ready_tracklets(current_time_ns, skip_track_ids=processing_tracklet_ids)
+            pop_ready_tracklets(buffer_clock, skip_track_ids=processing_tracklet_ids)
             if callable(pop_ready_tracklets)
-            else self.tracklet_buffer.get_ready_tracklets(current_time_ns)
+            else self.tracklet_buffer.get_ready_tracklets(buffer_clock)
         )
         self.ready_tracklets += len(ready_tracklets)
         pop_stale_tracklets = getattr(self.tracklet_buffer, "pop_stale_tracklets", None)
         stale_tracklets = (
-            pop_stale_tracklets(current_time_ns, skip_track_ids=processing_tracklet_ids)
+            pop_stale_tracklets(buffer_clock, skip_track_ids=processing_tracklet_ids)
             if callable(pop_stale_tracklets)
             else []
         )
@@ -2355,6 +2707,7 @@ class WorkerPipeline:
                 passes=int(getattr(self.settings, "final_reconciler_passes", 3)),
                 reason="end_of_stream",
             )
+            await self._filter_static_artifact_persons()
             self.tracklet_buffer.tracklets.clear()
             getattr(self, "untracked_detection_clusters", []).clear()
             getattr(self, "fragment_recovery_clusters", []).clear()
@@ -2363,6 +2716,72 @@ class WorkerPipeline:
         finally:
             self._stream_finalizing = False
 
+    async def _filter_static_artifact_persons(self) -> None:
+        """Drop false-positive identities that are actually STATIC objects (e.g. a
+        fire extinguisher): a person whose bbox centroid barely moved across all
+        its tracklets, with a small bbox. Person-level + size-gated so tall moving
+        or standing people are never removed. Robust to per-tracklet jitter that
+        evades the per-tracklet `_should_suppress_new_identity` guard."""
+        if not bool(getattr(self.settings, "static_person_filter_enabled", True)):
+            return
+        ratio = float(getattr(self.settings, "static_person_max_centroid_spread_ratio", 1.5))
+        max_w = float(getattr(self.settings, "static_artifact_max_mean_width_px", 130.0))
+        max_h = float(getattr(self.settings, "static_artifact_max_mean_height_px", 260.0))
+        min_tracklets = int(getattr(self.settings, "static_person_min_tracklets", 2))
+        zm_x = float(getattr(self.settings, "static_person_zero_motion_max_spread_x_px", 150.0))
+        zm_y = float(getattr(self.settings, "static_person_zero_motion_max_spread_y_px", 45.0))
+        zm_min_tracklets = int(getattr(self.settings, "static_person_zero_motion_min_tracklets", 1))
+        try:
+            person_ids = await self.mongo.list_recent_person_ids(
+                limit=int(getattr(self.settings, "background_reconciler_max_persons", 50))
+            )
+        except Exception:
+            return
+        for pid in person_ids:
+            try:
+                m = await self.mongo.person_motion_extent(int(pid))
+            except Exception:
+                continue
+            if not m:
+                continue
+            tracklets = int(m["tracklet_count"])
+            spread_x = float(m["spread_x"])
+            spread_y = float(m["spread_y"])
+            mean_w = max(float(m["mean_width"]), 1.0)
+            mean_h = max(float(m["mean_height"]), 1.0)
+            # Branch A (original): small bbox (not a tall person) AND centroid
+            # barely moved relative to its size — catches small static objects.
+            small_static = (
+                tracklets >= min_tracklets
+                and mean_w <= max_w and mean_h <= max_h
+                and spread_x <= ratio * mean_w
+                and spread_y <= ratio * mean_h
+            )
+            # Branch B (new): near-zero ABSOLUTE motion, size-INDEPENDENT — catches
+            # LARGE fixed objects (e.g. a door) a person walking never matches.
+            zero_motion = (
+                zm_x > 0.0 and zm_y > 0.0
+                and tracklets >= zm_min_tracklets
+                and spread_x <= zm_x
+                and spread_y <= zm_y
+            )
+            if small_static or zero_motion:
+                log.warning(
+                    "static_artifact_person_removed",
+                    person_id=int(pid),
+                    branch="zero_motion" if zero_motion else "small_static",
+                    spread_x=round(spread_x, 1),
+                    spread_y=round(spread_y, 1),
+                    mean_width=round(mean_w, 1),
+                    mean_height=round(mean_h, 1),
+                    tracklets=tracklets,
+                )
+                try:
+                    await self.mongo.remove_person(int(pid))
+                    await self.redis_cache.invalidate(int(pid))
+                except Exception:
+                    log.debug("static_artifact_person_remove_failed", person_id=int(pid), exc_info=True)
+
     async def _reconcile_recent_persons(self, *, max_persons: int, passes: int, reason: str) -> None:
         if not getattr(self.settings, "duplicate_merge_enabled", False):
             return
@@ -2370,6 +2789,11 @@ class WorkerPipeline:
             person_ids = await self.mongo.list_recent_person_ids(limit=max_persons)
         except Exception:
             person_ids = list(self.person_last_observation.keys())[-max_persons:]
+        # Iterate in a deterministic (ascending pid) order. The recency order
+        # from list_recent_person_ids varies run-to-run with frame timing, which
+        # changes the chain-merge sequence (A->B->C vs B->A->C) and makes the
+        # final identity set non-deterministic. Sorting removes that variance.
+        person_ids = sorted({int(pid) for pid in person_ids})
         for pass_idx in range(max(1, int(passes))):
             if not person_ids:
                 return
@@ -2407,6 +2831,7 @@ class WorkerPipeline:
                 person_ids = await self.mongo.list_recent_person_ids(limit=max_persons)
             except Exception:
                 person_ids = list(self.person_last_observation.keys())[-max_persons:]
+            person_ids = sorted({int(pid) for pid in person_ids})
 
     async def _reconcile_spatial_split_persons(self, person_ids: list[int]) -> int:
         """Repair tracker/detector splits that embedding search does not rank first.
@@ -2907,12 +3332,28 @@ class WorkerPipeline:
                 )
             )
         )
+        # Unambiguous-match carve-out: a moderate appearance score is trustworthy
+        # for a canonical re-entry merge when the candidate is the clear mutual
+        # nearest neighbour (large margin to the runner-up). osnet different people
+        # sit ~0.5-0.6 and are rarely each other's NN with a big gap, so this links
+        # a genuinely-split person (e.g. weak-appearance grey clothing, score 0.76
+        # but margin 0.19) without lowering the bar for ambiguous pairs.
+        canonical_bridge_margin_ok = (
+            float(score) >= float(getattr(self.settings, "similarity_threshold", 0.73))
+            and margin >= float(getattr(self.settings, "duplicate_merge_canonical_bridge_min_margin", 0.12))
+        )
         if (
             soft_split_reason in low_score_canonical_bridge_reasons
             and int(current_canonical_count) > 0
             and int(candidate_canonical_count) > 0
+            # Block a spatial-bridge merge between two canonical identities when
+            # appearance is below the established bar (osnet 0.78) AND the match is
+            # ambiguous. The margin carve-out below (canonical_bridge_margin_ok)
+            # still admits an UNAMBIGUOUS mutual-NN re-entry (e.g. weak-appearance
+            # grey clothing at 0.76 with a 0.19 margin) so one person isn't split.
             and float(score) < established_min_score
             and not scale_aware_weak_bridge
+            and not canonical_bridge_margin_ok
         ):
             log.info(
                 "duplicate_merge_rejected_low_score_bridge_between_canonical_identities",
@@ -3347,6 +3788,20 @@ class WorkerPipeline:
         }
         if soft_split_reason is not None:
             reason["soft_split_reason"] = soft_split_reason
+        # Final within-camera color veto: even when a soft_split/spatial bridge
+        # overrode the cosine gate (e.g. scale_aware_reentry / trajectory_reentry
+        # merged at 0.87), don't glue two established persons whose same-camera
+        # torso color clearly differs. Color is the last word; cross-camera merges
+        # (no shared-device evidence) abstain so cross-view linking is preserved.
+        if self._persons_color_conflict(source_person_id, target_person_id):
+            log.info(
+                "duplicate_merge_rejected_color_conflict",
+                source_person_id=source_person_id,
+                target_person_id=target_person_id,
+                similarity_score=round(float(score), 4),
+                soft_split_reason=soft_split_reason,
+            )
+            return _MergeAttemptResult(person_id=person_id, retryable_blocked=True)
         await asyncio.to_thread(
             self.qdrant_store.merge_person_gallery,
             source_person_id,
@@ -3373,6 +3828,14 @@ class WorkerPipeline:
             source_person_id=source_person_id,
             target_person_id=target_person_id,
             similarity_score=round(score, 4),
+            # Full provenance so a "3-in-1" run can be traced to the exact merges
+            # and the guard/path that allowed each one (Phase B seed pinning).
+            method=reason.get("method"),
+            runner_up_score=reason.get("runner_up_score"),
+            margin_to_runner_up=reason.get("margin_to_runner_up"),
+            soft_split_reason=reason.get("soft_split_reason"),
+            source_tracklet_count=reason.get("source_tracklet_count"),
+            target_tracklet_count=reason.get("target_tracklet_count"),
         )
         new_pid = target_person_id if person_id == source_person_id else person_id
         return _MergeAttemptResult(person_id=new_pid, merged=True)
@@ -5431,7 +5894,35 @@ class WorkerPipeline:
             similarity_score=(matching or {}).get("similarity_score"),
         )
 
+    async def _run_identity_serial(self, coro_fn):
+        """Serialize identity-mutating work under one lock so concurrent
+        fire-and-forget tasks cannot interleave their match/gallery-update steps
+        (the source of run-to-run nondeterminism). The lock is acquired in task
+        creation order (asyncio.Lock is FIFO), making processing order
+        deterministic. _IDENTITY_SERIAL_ACTIVE (per-task ContextVar) lets a call
+        already inside the serialized section run nested helpers without
+        re-acquiring."""
+        lock = getattr(self, "_identity_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._identity_lock = lock
+        if _IDENTITY_SERIAL_ACTIVE.get():
+            return await coro_fn()
+        async with lock:
+            token = _IDENTITY_SERIAL_ACTIVE.set(True)
+            try:
+                return await coro_fn()
+            finally:
+                _IDENTITY_SERIAL_ACTIVE.reset(token)
+
     async def _process_short_fragment_tracklet(self, tracklet, *, reason: str) -> int | None:
+        if not getattr(self.settings, "deterministic_processing_enabled", True):
+            return await self._process_short_fragment_tracklet_impl(tracklet, reason=reason)
+        return await self._run_identity_serial(
+            lambda: self._process_short_fragment_tracklet_impl(tracklet, reason=reason)
+        )
+
+    async def _process_short_fragment_tracklet_impl(self, tracklet, *, reason: str) -> int | None:
         entries = list(tracklet.entries or [])
         if not entries:
             return None
@@ -5599,6 +6090,22 @@ class WorkerPipeline:
         return person_id
 
     async def _process_tracklet(
+        self,
+        tracklet,
+        reserved_person_ids: set[int] | None = None,
+        allow_tentative_fallback: bool = True,
+    ) -> int | None:
+        if not getattr(self.settings, "deterministic_processing_enabled", True):
+            return await self._process_tracklet_impl(
+                tracklet, reserved_person_ids, allow_tentative_fallback
+            )
+        return await self._run_identity_serial(
+            lambda: self._process_tracklet_impl(
+                tracklet, reserved_person_ids, allow_tentative_fallback
+            )
+        )
+
+    async def _process_tracklet_impl(
         self,
         tracklet,
         reserved_person_ids: set[int] | None = None,
@@ -5869,6 +6376,21 @@ class WorkerPipeline:
             else:
                 forbidden_person_ids.update(
                     self._find_attribute_incompatible_person_ids(t_attrs, current_person_id)
+                )
+            # Within-camera color guard at PRIMARY match: forbid same-camera persons
+            # whose reference torso color clearly differs (clean-frame gated; abstains
+            # on noisy color). Keeps each identity's color anchor pure and stops
+            # different-colored people gluing via gallery_match at the embedding ceiling.
+            _color_incompatible = self._find_color_incompatible_person_ids(
+                tracklet, current_person_id, getattr(self, "_current_device_id", "")
+            )
+            if _color_incompatible:
+                forbidden_person_ids.update(_color_incompatible)
+                log.info(
+                    "color_incompatible_persons_forbidden",
+                    track_id=tracklet.track_id,
+                    forbidden=sorted(_color_incompatible),
+                    device_id=getattr(self, "_current_device_id", ""),
                 )
             # A2: temporal co-active guard — any person_id already bound to a
             # live track in the last 600ms can't also be this tracklet.
@@ -6337,10 +6859,23 @@ class WorkerPipeline:
             overlap_ratio=snapshot_overlap_ratio,
         )
         is_provisional_occlusion = bool((matching or {}).get("provisional"))
+        # A confirmed person should always get an avatar. Prefer a clean (low-overlap)
+        # entry, but fall back to the best available entry when every frame overlapped
+        # (an occluded-throughout person) so the identity isn't left with a NULL
+        # snapshot. update_person_snapshot is score-gated (high overlap -> low score),
+        # so this only FILLS a missing avatar; it never overrides a better one.
         allow_person_snapshot = (
-            person_snapshot_entry is not None
-            and not is_provisional_occlusion
+            not is_provisional_occlusion
+            and (person_snapshot_entry is not None or best_entry is not None)
         )
+        # Record torso color evidence for the within-camera color guard, but only
+        # for CONFIRMED (non-provisional) assignments — provisional occlusion
+        # evidence must not define a person's reference color.
+        if not is_provisional_occlusion:
+            try:
+                self._update_person_color_evidence(person_id, device_id, selected or entries)
+            except Exception:
+                log.debug("person_color_evidence_update_failed", exc_info=True)
 
         # Log every sighting write so attribute evidence can be audited against
         # later merge or attachment decisions.

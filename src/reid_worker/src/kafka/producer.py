@@ -107,7 +107,9 @@ class WorkerKafkaProducer:
             "schema_version": 3,
         }
         msg_bytes = serialize_avro(self.schema, datum)
-        self.producer.send(self.topic, value=msg_bytes)
+        # Key by device_id so per-camera output frames stay ordered on one
+        # partition (consistent with the edge input producer).
+        self.producer.send(self.topic, key=str(device_id).encode("utf-8"), value=msg_bytes)
 
     def close(self):
         self.producer.flush()

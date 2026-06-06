@@ -426,6 +426,25 @@ class MongoPersonStore:
                 exc_info=True,
             )
 
+    async def mark_occlusion_candidate_attached(self, candidate_id: str, person_id: int) -> None:
+        """Resolve an orphan occlusion candidate after it was attached to a person
+        as evidence — flips its status so it no longer reads as unresolved."""
+        try:
+            await self._db[self.OCCLUSION_CANDIDATES].update_one(
+                {"candidate_id": candidate_id},
+                {"$set": {
+                    "status": "attached",
+                    "attached_person_id": int(person_id),
+                    "updated_at": datetime.now(timezone.utc),
+                }},
+            )
+        except Exception:
+            log.error(
+                "mongo.mark_occlusion_candidate_attached_failed",
+                candidate_id=candidate_id,
+                exc_info=True,
+            )
+
     async def count_tracklets(self, person_id: int) -> int:
         return await self._db[self.TRACKLETS].count_documents({"person_id": person_id})
 
@@ -444,6 +463,55 @@ class MongoPersonStore:
                 "matching.provisional": {"$ne": True},
             }
         )
+
+    async def person_motion_extent(self, person_id: int) -> dict | None:
+        """Aggregate a person's bbox centroid spread + mean size across ALL its
+        tracklets (first+last bbox of each). Used by the person-level static-
+        artifact filter: a static object (e.g. fire extinguisher) has near-zero
+        centroid spread relative to its bbox size, robustly across the whole run
+        (immune to single-tracklet jitter). Returns None if no bbox data."""
+        cur = self._db[self.TRACKLETS].find(
+            {"person_id": person_id},
+            {"_id": 0, "first_bbox_xyxy": 1, "last_bbox_xyxy": 1},
+        )
+        docs = await cur.to_list(length=10000)
+        cxs: list[float] = []
+        cys: list[float] = []
+        ws: list[float] = []
+        hs: list[float] = []
+        for d in docs:
+            for key in ("first_bbox_xyxy", "last_bbox_xyxy"):
+                b = d.get(key)
+                if not b or len(b) < 4:
+                    continue
+                cxs.append((float(b[0]) + float(b[2])) / 2.0)
+                cys.append((float(b[1]) + float(b[3])) / 2.0)
+                ws.append(abs(float(b[2]) - float(b[0])))
+                hs.append(abs(float(b[3]) - float(b[1])))
+        if not cxs:
+            return None
+        mean_w = sum(ws) / len(ws)
+        mean_h = sum(hs) / len(hs)
+        return {
+            "spread_x": max(cxs) - min(cxs),
+            "spread_y": max(cys) - min(cys),
+            "mean_width": mean_w,
+            "mean_height": mean_h,
+            "tracklet_count": len(docs),
+            "point_count": len(cxs),
+        }
+
+    async def remove_person(self, person_id: int) -> None:
+        """Hard-delete a person and all its records (PERSONS/SIGHTINGS/TRACKLETS/
+        TIMELINE). Used by the static-artifact filter to drop a false-positive
+        (static object) identity at stream finalization."""
+        try:
+            await self._db[self.TRACKLETS].delete_many({"person_id": person_id})
+            await self._db[self.SIGHTINGS].delete_many({"person_id": person_id})
+            await self._db[self.TIMELINE].delete_many({"person_id": person_id})
+            await self._db[self.PERSONS].delete_one({"person_id": person_id})
+        except Exception:
+            log.error("mongo.remove_person_failed", person_id=person_id, exc_info=True)
 
     async def list_recent_person_ids(self, limit: int = 50) -> list[int]:
         cursor = self._db[self.PERSONS].find(

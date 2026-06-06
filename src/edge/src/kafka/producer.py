@@ -45,7 +45,11 @@ class EdgeKafkaProducer:
             "image_data": image_data,
         }
         msg_bytes = serialize_avro(self.schema, datum)
-        self.producer.send(self.topic, value=msg_bytes)
+        # Key by device_id so all frames from one camera land on the same
+        # partition and are consumed in produce order. Without a key, frames
+        # spread across partitions and per-device ordering is not guaranteed,
+        # which makes downstream matching/merge results non-deterministic.
+        self.producer.send(self.topic, key=device_id.encode("utf-8"), value=msg_bytes)
 
     def send_end_of_stream(
         self,
@@ -61,7 +65,9 @@ class EdgeKafkaProducer:
             "image_data": b"",
         }
         msg_bytes = serialize_avro(self.schema, datum)
-        self.producer.send(self.topic, value=msg_bytes)
+        # Same key as data frames so the end-of-stream marker stays ordered
+        # behind this device's frames on the same partition.
+        self.producer.send(self.topic, key=device_id.encode("utf-8"), value=msg_bytes)
         self.producer.flush()
 
     def close(self):
