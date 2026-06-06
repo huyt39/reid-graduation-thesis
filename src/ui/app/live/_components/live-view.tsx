@@ -33,12 +33,16 @@ export function LiveView() {
   const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
   const [isLiveActive, setIsLiveActive] = useState(true);
   const identityCacheRef = useRef(new Map<string, LiveIdentityCacheEntry>());
+  const subscribedDeviceIds = useMemo(
+    () => (selectedDevice ? [selectedDevice] : []),
+    [selectedDevice]
+  );
 
-  const processed = useWebSocket(`${WS_URL}/ws`, selectedDevice, {
+  const processed = useWebSocket(`${WS_URL}/ws`, subscribedDeviceIds, {
     enabled: isLiveActive,
     maxFps: 30,
   });
-  const raw = useWebSocket(`${WS_URL}/ws/raw`, selectedDevice, {
+  const raw = useWebSocket(`${WS_URL}/ws/raw`, subscribedDeviceIds, {
     enabled: isLiveActive,
     maxFps: 30,
   });

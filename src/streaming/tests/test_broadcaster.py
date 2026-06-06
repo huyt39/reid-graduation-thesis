@@ -84,6 +84,8 @@ async def test_broadcast_reaches_all_clients(broadcaster: WebSocketBroadcaster):
     ws1, ws2 = FakeWebSocket(), FakeWebSocket()
     broadcaster.add(ws1)
     broadcaster.add(ws2)
+    broadcaster.subscribe(ws1, ["cam-2"])
+    broadcaster.subscribe(ws2, ["cam-2"])
 
     frame = FrameData(
         device_id="cam-2",
@@ -101,11 +103,30 @@ async def test_broadcast_reaches_all_clients(broadcaster: WebSocketBroadcaster):
 
 
 @pytest.mark.asyncio
+async def test_broadcast_skips_unsubscribed_clients(broadcaster: WebSocketBroadcaster):
+    ws = FakeWebSocket()
+    broadcaster.add(ws)
+
+    frame = FrameData(
+        device_id="cam-1",
+        frame_number=99,
+        tracked_persons=[],
+        created_at=0,
+        image_base64="x",
+    )
+    await broadcaster.broadcast(frame)
+
+    assert ws.sent == []
+
+
+@pytest.mark.asyncio
 async def test_broadcast_removes_broken_client(broadcaster: WebSocketBroadcaster):
     good_ws = FakeWebSocket()
     bad_ws = BrokenWebSocket()
     broadcaster.add(good_ws)
     broadcaster.add(bad_ws)
+    broadcaster.subscribe(good_ws, ["cam-1"])
+    broadcaster.subscribe(bad_ws, ["cam-1"])
 
     frame = FrameData(
         device_id="cam-1",

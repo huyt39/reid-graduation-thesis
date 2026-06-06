@@ -18,6 +18,7 @@ class WebSocketBroadcaster:
     def __init__(self, frame_cache: FrameCache, semaphore_limit: int = 20) -> None:
         self.frame_cache = frame_cache
         self._connections: list[WebSocket] = []
+        self._subscriptions: dict[WebSocket, set[str]] = {}
         self._semaphore = asyncio.Semaphore(semaphore_limit)
 
     @property
@@ -26,10 +27,15 @@ class WebSocketBroadcaster:
 
     def add(self, ws: WebSocket) -> None:
         self._connections.append(ws)
+        self._subscriptions[ws] = set()
 
     def remove(self, ws: WebSocket) -> None:
         if ws in self._connections:
             self._connections.remove(ws)
+        self._subscriptions.pop(ws, None)
+
+    def subscribe(self, ws: WebSocket, device_ids: list[str]) -> None:
+        self._subscriptions[ws] = set(device_ids)
 
     async def send_device_list(self, ws: WebSocket) -> None:
         devices = self.frame_cache.device_ids()
@@ -53,6 +59,9 @@ class WebSocketBroadcaster:
 
         tasks = []
         for ws in self._connections:
+            subscribed_devices = self._subscriptions.get(ws, set())
+            if frame.device_id not in subscribed_devices:
+                continue
             tasks.append(self._safe_send(ws, message, disconnected))
 
         if tasks:
