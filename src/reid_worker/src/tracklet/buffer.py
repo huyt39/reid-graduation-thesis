@@ -2,18 +2,27 @@ from src.tracklet.models import Tracklet, TrackletEntry, TrackletState
 
 
 class TrackletBuffer:
+    """Buffers tracklet entries and decides readiness/staleness.
+
+    Readiness is measured in FRAME INDEX units (deterministic across runs),
+    not wall-clock time. The previous wall-clock version made readiness depend
+    on how fast messages were processed, so the same video produced different
+    person sets run-to-run. Frame indices come from the source video and are
+    identical every run.
+    """
+
     def __init__(
         self,
         min_entries: int = 8,
         max_entries: int = 60,
-        window_seconds: float = 3.0,
-        stale_seconds: float = 5.0,
+        window_frames: int = 90,
+        stale_frames: int = 150,
     ):
         self.tracklets: dict[int, Tracklet] = {}
         self.min_entries = min_entries
         self.max_entries = max_entries
-        self.window_ns = int(window_seconds * 1e9)
-        self.stale_ns = int(stale_seconds * 1e9)
+        self.window_frames = int(window_frames)
+        self.stale_frames = int(stale_frames)
 
     def append(self, track_id: int, entry: TrackletEntry) -> None:
         if track_id not in self.tracklets:
@@ -24,30 +33,30 @@ class TrackletBuffer:
             tracklet.entries = tracklet.entries[-self.max_entries:]
             tracklet.created_at_ns = tracklet.entries[0].timestamp_ns
 
-    def _is_ready(self, tracklet: Tracklet, current_time_ns: int) -> bool:
+    def _is_ready(self, tracklet: Tracklet, current_frame_idx: int) -> bool:
         if len(tracklet.entries) < self.min_entries:
             return False
         if len(tracklet.entries) >= self.max_entries:
             return True
-        first_ts = tracklet.entries[0].timestamp_ns if tracklet.entries else tracklet.created_at_ns
-        last_ts = tracklet.entries[-1].timestamp_ns if tracklet.entries else first_ts
-        observed_span_ns = max(0, int(last_ts) - int(first_ts))
-        buffered_age_ns = max(0, int(current_time_ns) - int(first_ts))
-        return max(observed_span_ns, buffered_age_ns) >= self.window_ns
+        first_f = int(tracklet.entries[0].frame_idx)
+        last_f = int(tracklet.entries[-1].frame_idx)
+        observed_span = max(0, last_f - first_f)
+        buffered_age = max(0, int(current_frame_idx) - first_f)
+        return max(observed_span, buffered_age) >= self.window_frames
 
-    def get_ready_tracklets(self, current_time_ns: int) -> list[Tracklet]:
+    def get_ready_tracklets(self, current_frame_idx: int) -> list[Tracklet]:
         ready = []
         for tracklet in self.tracklets.values():
             if tracklet.state != TrackletState.ACTIVE:
                 continue
-            if self._is_ready(tracklet, current_time_ns):
+            if self._is_ready(tracklet, current_frame_idx):
                 tracklet.state = TrackletState.READY
                 ready.append(tracklet)
         return ready
 
     def pop_ready_tracklets(
         self,
-        current_time_ns: int,
+        current_frame_idx: int,
         skip_track_ids: set[int] | None = None,
     ) -> list[Tracklet]:
         skip_track_ids = skip_track_ids or set()
@@ -57,7 +66,7 @@ class TrackletBuffer:
                 continue
             if tracklet.state != TrackletState.ACTIVE:
                 continue
-            if not self._is_ready(tracklet, current_time_ns):
+            if not self._is_ready(tracklet, current_frame_idx):
                 continue
             del self.tracklets[tid]
             tracklet.state = TrackletState.READY
@@ -65,18 +74,20 @@ class TrackletBuffer:
             ready.append(tracklet)
         return ready
 
-    def evict_stale(self, current_time_ns: int) -> list[int]:
+    def _last_frame(self, tracklet: Tracklet) -> int:
+        return int(tracklet.entries[-1].frame_idx) if tracklet.entries else 0
+
+    def evict_stale(self, current_frame_idx: int) -> list[int]:
         evicted = []
         for tid, tracklet in list(self.tracklets.items()):
-            last_ts = tracklet.entries[-1].timestamp_ns if tracklet.entries else 0
-            if current_time_ns - last_ts > self.stale_ns:
+            if int(current_frame_idx) - self._last_frame(tracklet) > self.stale_frames:
                 del self.tracklets[tid]
                 evicted.append(tid)
         return evicted
 
     def pop_stale_tracklets(
         self,
-        current_time_ns: int,
+        current_frame_idx: int,
         skip_track_ids: set[int] | None = None,
     ) -> list[Tracklet]:
         skip_track_ids = skip_track_ids or set()
@@ -84,8 +95,7 @@ class TrackletBuffer:
         for tid, tracklet in list(self.tracklets.items()):
             if tid in skip_track_ids:
                 continue
-            last_ts = tracklet.entries[-1].timestamp_ns if tracklet.entries else 0
-            if current_time_ns - last_ts > self.stale_ns:
+            if int(current_frame_idx) - self._last_frame(tracklet) > self.stale_frames:
                 stale.append(tracklet)
                 del self.tracklets[tid]
         return stale

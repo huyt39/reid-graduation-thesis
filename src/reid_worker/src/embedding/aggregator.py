@@ -2,9 +2,20 @@ import numpy as np
 
 
 class WeightedEmbeddingAggregator:
-    def __init__(self, gamma: float = 0.5, outlier_threshold: float = 0.5):
+    def __init__(
+        self,
+        gamma: float = 0.5,
+        outlier_threshold: float = 0.5,
+        exclude_overlap_ratio: float = 1.0,
+    ):
         self.gamma = gamma
         self.outlier_threshold = outlier_threshold
+        # Frames whose bbox overlaps another person at or above this ratio are
+        # crop-contaminated (the crop contains the other person's pixels) and
+        # are dropped before aggregation so the matching embedding represents
+        # this person's clean appearance. 1.0 disables the exclusion. Falls
+        # back to all frames when too few clean ones survive.
+        self.exclude_overlap_ratio = exclude_overlap_ratio
 
     def aggregate(
         self,
@@ -20,11 +31,25 @@ class WeightedEmbeddingAggregator:
         partially-contaminated tracklet (e.g., one stray crop from another
         person) from skewing the final representation toward the outlier.
         Falls back to the first-pass mean if too few frames survive.
+
+        Frames whose overlap_ratio is at or above ``exclude_overlap_ratio`` are
+        dropped up front (crop-contamination guard), unless fewer than two
+        clean frames remain, in which case all frames are kept.
         """
         assert len(embeddings) == len(v_scores)
         assert len(embeddings) > 0
         if overlap_ratios is None:
             overlap_ratios = [0.0] * len(embeddings)
+
+        if self.exclude_overlap_ratio < 1.0:
+            clean = [
+                i for i, o in enumerate(overlap_ratios)
+                if float(o or 0.0) < self.exclude_overlap_ratio
+            ]
+            if 2 <= len(clean) < len(embeddings):
+                embeddings = [embeddings[i] for i in clean]
+                v_scores = [v_scores[i] for i in clean]
+                overlap_ratios = [overlap_ratios[i] for i in clean]
 
         stacked = np.stack(embeddings, axis=0)
         raw_weights = np.array(

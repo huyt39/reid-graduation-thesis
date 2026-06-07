@@ -17,20 +17,41 @@ class Settings(BaseSettings):
     output_schema_path: str = "src/contracts/reid_output.avsc"
 
     model_service_url: str = "http://localhost:8000"
-    # Which embedding model the inference engine should use. "osnet" is the
-    # OSNet-x1.0 trained on Market-1501 (single global feature, 512-d).
-    # "lmbn" uses Light Multi-Branch Network — multi-part body features
-    # (global + horizontal stripes + channel branches), more robust to
-    # partial-body / occluded crops. Requires INFERENCE_LMBN_WEIGHTS to be
-    # set in the inference engine.
-    embedding_model: str = "lmbn"
+    # Which embedding model the inference engine should use. "osnet_ain" is
+    # OSNet-AIN (domain-generalization variant with AdaIN, pretrained on
+    # MSMT17) — the embedding that generalized best to cross-view on the
+    # held-out camera pair (see MULTI_CAMERA.md), so it is the default.
+    # "osnet" is OSNet-x1.0 (Market-1501, single 512-d global feature).
+    # "lmbn" is Light Multi-Branch Network (multi-part body features); it
+    # needs INFERENCE_LMBN_WEIGHTS set in the inference engine.
+    embedding_model: str = "osnet_ain"
 
     qdrant_host: str = "localhost"
     qdrant_port: int = 6333
     embedding_dim: int = 512
     similarity_threshold: float = 0.73
+
     match_margin: float = 0.06
+
     spatial_reuse_threshold: float = 0.62
+
+    # Within-camera color guard: veto attaching/merging a tracklet/cluster to a
+    # person whose same-camera torso color clearly differs. Orthogonal to the
+    # ReID embedding (which has ~0 margin on this footage). Threshold from
+    # held-out calibration (scripts/eval_color_guard.py): same-person within-cam
+    # CORREL p05=0.84, different-person p50=0.56 -> 0.83 = ~2% false-veto, blocks
+    # ~92% of wrong-color attaches. Cross-camera NOT guarded (color shifts with
+    # lighting). See [[project_two_women_occlusion_color]].
+    color_guard_enabled: bool = False  # reverted to osnet_ain baseline; color hue guard net-negative (false-split grey clothing)
+    color_conflict_veto_threshold: float = 0.83
+    color_guard_min_person_evidence: int = 1  # person needs >=N color samples on the device before vetoing
+    color_guard_max_frames: int = 12          # crops aggregated into one descriptor
+    # Reliability gate: only build/compare color from CLEAN frames (high visibility,
+    # low overlap). If a tracklet has fewer than N such frames, the guard ABSTAINS
+    # (never vetoes on noisy/occluded torso) — the fix for attempt-#1 false-vetoes.
+    color_guard_min_frame_visibility: float = 0.5
+    color_guard_max_frame_overlap: float = 0.30
+    color_guard_min_reliable_frames: int = 3
     momentum: float = 0.8
     max_gallery_size: int = 8
     recent_person_reuse_enabled: bool = True
@@ -42,6 +63,11 @@ class Settings(BaseSettings):
     tracklet_max_entries: int = 60
     tracklet_window_seconds: float = 3.0
     tracklet_stale_seconds: float = 5.0
+    # Tracklet readiness/staleness in FRAME INDEX units (deterministic) instead
+    # of wall-clock seconds. ~3s/5s at 30fps source. Frame-based decisions make
+    # the same video produce the same person set every run.
+    tracklet_window_frames: int = 90
+    tracklet_stale_frames: int = 150
     tracklet_idle_flush_enabled: bool = True
     # Frame-index based continuity memory. This survives short wall-clock
     # stalls/backpressure, where active-track cleanup may remove the live
@@ -71,13 +97,26 @@ class Settings(BaseSettings):
     tracklet_readiness_consistency_threshold: float = 0.35
 
     gamma: float = 0.5
+    # v_worker floor: keep v_worker >= this ratio * v_edge, so tracking-continuity
+    # penalties (IoU/velocity, which crater on occlusion re-entry) can't drag a
+    # clear high-v_edge crop below the promotion gates. 0.0 disables.
+    v_worker_edge_floor_ratio: float = 0.85
     embedding_consensus_threshold: float = 0.66
+
     min_consensus_embeddings: int = 2
     # Outlier-aware aggregation: after the first weighted mean is computed,
     # drop frames whose cosine sim to that mean is below this threshold and
     # recompute on the survivors. Defends against a single mis-tracked crop
     # skewing the tracklet representation. Set to 0.0 to disable.
     agg_outlier_threshold: float = 0.5
+
+    # Crop-contamination guard for the matching embedding: drop frames whose
+    # bbox overlaps another person at/above this ratio before aggregating, so a
+    # person who walks close behind another is not represented by a crop full
+    # of the other person's pixels (which would match the wrong identity at an
+    # inflated score). Falls back to all frames when <2 clean ones remain.
+    # 1.0 disables. Mirrors gallery_update_max_overlap_ratio for the anchor.
+    embedding_aggregate_max_overlap_ratio: float = 0.40
 
     # Tracklet-build-time appearance gate: when an existing tracklet receives a
     # new high-quality frame (v_worker ≥ this threshold), compare its embedding
@@ -87,6 +126,7 @@ class Settings(BaseSettings):
     tracklet_appearance_gate_enabled: bool = True
     tracklet_appearance_gate_min_v: float = 0.6
     tracklet_split_threshold: float = 0.55
+
     # The appearance gate calls the embedding service from the per-frame input
     # path. Checking every high-quality frame makes the worker fall behind video
     # playback; sample periodically after the gate is armed.
@@ -112,6 +152,13 @@ class Settings(BaseSettings):
     # Existing cooccurrence + attribute guards apply on top.
     duplicate_merge_established_min_score: float = 0.78
 
+    # Canonical re-entry merge via spatial bridge is allowed below the standard bar
+    # when the match is UNAMBIGUOUS: score >= similarity_threshold AND margin to the
+    # runner-up >= this. Recovers genuinely-split persons whose absolute appearance
+    # is weak (e.g. grey clothing) but who are the clear mutual nearest neighbour,
+    # without merging ambiguous pairs. Set very high (e.g. 1.0) to disable.
+    duplicate_merge_canonical_bridge_min_margin: float = 0.12
+
     # Cross-device (cross-camera) re-link. Post-hoc only: lets two identities that
     # together span >= 2 cameras and never co-occurred merge below the
     # established-identity threshold, decided primarily by MARGIN (the correct
@@ -123,15 +170,27 @@ class Settings(BaseSettings):
     # blocked. Margin-driven + attribute-gated → generalizes, not video-tuned.
     duplicate_merge_cross_device_enabled: bool = True
     duplicate_merge_cross_device_min_score: float = 0.50
+
     duplicate_merge_cross_device_min_margin: float = 0.12
+
     duplicate_merge_cross_device_max_tracklets: int = 8
 
     # Background re-merge reconciler: every N seconds, scan recently-updated
     # persons for cross-person gallery similarity and merge duplicates that the
     # weak-only inline merge cannot catch. Set interval to 0 to disable.
-    background_reconciler_interval_s: float = 30.0
+    # Default 0 (disabled): running it concurrently with live matching made
+    # results non-deterministic (merging persons mid-formation). Finalize-time
+    # reconcile still runs at stream end. Raise (e.g. 30.0) to re-enable.
+    background_reconciler_interval_s: float = 0.0
     background_reconciler_max_persons: int = 50
     final_reconciler_passes: int = 3
+
+    # When True, identity-mutating tracklet processing is serialized under a
+    # single lock so concurrent fire-and-forget tasks cannot interleave their
+    # match/gallery-update steps. This removes run-to-run nondeterminism (same
+    # video gave 5 vs 3 persons) at the cost of throughput. Set False to revert
+    # to fully concurrent processing.
+    deterministic_processing_enabled: bool = True
 
     # Stream quiescence: cut off new person_id minting after the worker has
     # been receiving no Kafka traffic for this many seconds. Reference is the
@@ -174,11 +233,12 @@ class Settings(BaseSettings):
     untracked_detection_max_track_iou: float = 0.20
     untracked_detection_cluster_enabled: bool = True
     untracked_detection_cluster_min_entries: int = 2
-    untracked_detection_cluster_max_gap_frames: int = 15
+    untracked_detection_cluster_max_gap_frames: int = 60  # ~2s: rejoin a briefly-occluded person's detections (same pos+appearance) instead of fragmenting into sub-promote clusters
     untracked_detection_cluster_max_center_distance_ratio: float = 0.95
     untracked_detection_cluster_appearance_gate_enabled: bool = True
     untracked_detection_cluster_appearance_min_visibility: float = 0.55
     untracked_detection_cluster_appearance_min_similarity: float = 0.62
+
     # Sliding-window cap on per-cluster TrackletEntry retention. Each entry
     # holds a full-resolution image crop, so unbounded growth OOM-kills the
     # worker. After promotion the tracklet_buffer copy is authoritative; the
@@ -200,6 +260,14 @@ class Settings(BaseSettings):
     untracked_cluster_promote_min_entries_fast: int = 5
     untracked_cluster_promote_min_visibility_fast: float = 0.85
     untracked_cluster_promote_fast_min_overall_consistency: float = 0.83
+    # Evidence-attach: a CLEAR but short untracked cluster (below the mint tiers)
+    # that confidently matches an EXISTING person's gallery is attached to that
+    # person as occlusion evidence (a sighting) at flush time, instead of being
+    # left as an orphan candidate — turning clear occluded-gap detections of known
+    # people into usable evidence. Never mints. Gallery score + margin guard
+    # prevent attaching to the wrong (similar-looking) person.
+    untracked_cluster_evidence_attach_enabled: bool = True
+    untracked_cluster_evidence_attach_min_visibility: float = 0.65
     recover_stale_tracklets_enabled: bool = True
     # Keep short occlusion fragments as evidence only by default. Promoting a
     # 2-4 frame fragment to a confirmed identity caused duplicate IDs on
@@ -210,12 +278,14 @@ class Settings(BaseSettings):
     fragment_recovery_min_total_entries: int = 5
     fragment_recovery_min_visibility: float = 0.72
     fragment_recovery_min_similarity: float = 0.62
+
     fragment_recovery_max_gap_frames: int = 180
     fragment_recovery_max_center_distance_ratio: float = 1.8
     # Search floor for diagnostics. Any fragment cluster near an existing
     # gallery is deferred instead of minted here; the main matcher should own
     # ambiguous occlusion decisions.
     fragment_recovery_near_gallery_threshold: float = 0.52
+
 
     promote_v_threshold: float = 0.6
     promote_consistency_threshold: float = 0.65
@@ -243,6 +313,7 @@ class Settings(BaseSettings):
     update_consistency_threshold: float = 0.7
     update_min_tracklet_len: int = 5
     update_sim_threshold: float = 0.55
+
     gallery_update_max_overlap_ratio: float = 0.25
     gallery_update_min_overall_consistency: float = 0.80
     # The design doc (ReID-Pipeline.pdf, Bước 5) specifies a single matching
@@ -253,13 +324,16 @@ class Settings(BaseSettings):
     # similarity_threshold so the soft paths cannot accept what the primary
     # gallery search has rejected.
     soft_match_threshold: float = 0.73
+
     eager_soft_match_threshold: float = 0.73
+
     # Visibility-aware match threshold: tracklets with v_avg < low_visibility_threshold
     # must clear low_visibility_match_threshold (instead of similarity_threshold)
     # against an existing person before matching. Prevents partial-body / boundary
     # crops from being wrongly absorbed into existing identities at sim 0.60-0.70.
     low_visibility_threshold: float = 0.65
     low_visibility_match_threshold: float = 0.75
+
     # Auxiliary upper-body gallery for scale/viewpoint transitions. This does
     # not lower the normal full-body threshold: upper-body vectors live in a
     # separate Qdrant collection and are consulted only for narrow synthetic /
@@ -267,8 +341,16 @@ class Settings(BaseSettings):
     scale_aux_gallery_enabled: bool = True
     scale_aux_crop_top_ratio: float = 0.48
     scale_aux_match_threshold: float = 0.66
+
     scale_aux_match_margin: float = 0.03
-    scale_aux_full_gallery_min_score: float = 0.40
+
+    # Upper-body scale-aux matches must also clear this score against the
+    # candidate's FULL-body gallery. 0.40 was effectively off (everything passed)
+    # and let different people at different scale glue together (red-jacket vs
+    # black-shirt matched 0.74 on the torso crop). Raised to discriminate; tune
+    # from the scale_aux_accept/rejected full=... logs. Set back to 0.40 to revert.
+    scale_aux_full_gallery_min_score: float = 0.62
+
     scale_aux_min_v: float = 0.70
     scale_aux_min_consistency: float = 0.80
     scale_aux_min_tracklet_len: int = 5
@@ -282,33 +364,63 @@ class Settings(BaseSettings):
     # must not become canonical identity evidence.
     person_snapshot_max_overlap_ratio: float = 0.35
     current_identity_min_score: float = 0.50
+
     # Current track continuity is useful under occlusion, but it must lose when
     # the current person's appearance is weak and another gallery identity is
     # clearly stronger. This prevents ByteTrack ID-swap fragments from polluting
     # the previously-bound person's snapshots.
     current_identity_switch_min_score: float = 0.78
+
     current_identity_switch_min_margin: float = 0.18
+
     current_identity_switch_max_current_score: float = 0.70
+
     max_person_identities: int = 0
     capped_identity_soft_match_threshold: float = 0.57
+
     # Defer high-quality but appearance-ambiguous re-entry fragments instead
     # of minting a confirmed person. This keeps occlusion evidence visible
     # without polluting the confirmed identity set with singleton duplicates.
     # Must be < soft_match_threshold so the gate actually fires — setting it
     # equal to the match threshold disables the noise band.
     near_gallery_defer_threshold: float = 0.60
+    # Recall fallback (plan E9): after sustained non-match + strong evidence, mint a
+    # deferred-near-gallery cluster as a NEW person when its best gallery match is
+    # still below this (clearly different-person-level for osnet; <0.73 match bar).
+    # 0.0 disables (pure defer). Risk: may split weak same-person cross-view
+    # re-entries — verify 51/52 does not regress before trusting.
+    near_gallery_deferred_mint_max_score: float = 0.64
+    # Last-resort mint (plan E12): at the untracked-cluster flush, if a CLEAR +
+    # sustained orphan cluster matches no existing person >= similarity_threshold,
+    # mint it as a NEW person instead of dropping (the clear-but-missed-person case),
+    # but only when its best gallery match is clearly different-person-level
+    # (< near_gallery_deferred_mint_max_score) so a re-entry isn't duplicated.
+    untracked_cluster_lastresort_mint_enabled: bool = True
+    untracked_cluster_lastresort_mint_min_visibility: float = 0.85
+    untracked_cluster_lastresort_mint_min_entries: int = 6
+
     # Narrow occlusion-only bridge for near-gallery deferred fragments. These
     # tracklets are attached as provisional sightings, never canonical/gallery
     # updates, so occluded evidence can be shown without teaching the identity
     # model from partial or boundary crops.
     occlusion_provisional_match_enabled: bool = True
     occlusion_provisional_match_threshold: float = 0.75
+
     occlusion_provisional_min_margin: float = 0.03
+
     occlusion_provisional_short_reentry_enabled: bool = True
     occlusion_provisional_reentry_min_similarity: float = 0.55
+
     occlusion_provisional_reentry_max_entries: int = 8
     occlusion_provisional_reentry_max_gap_frames: int = 120
     occlusion_provisional_reentry_max_center_distance_ratio: float = 2.0
+    # Crop-contamination guard: when a candidate detection's bbox overlaps another
+    # person's box by more than this ratio, its crop is contaminated by that other
+    # person, so its appearance embedding is untrustworthy and must NOT be absorbed
+    # into an existing identity via occlusion provisional match. Above this overlap
+    # the detection is forced to form its own identity instead. Set high (>=1.0) to
+    # disable. Tuned so a person walking close behind another is not silently merged.
+    occlusion_provisional_match_max_overlap_ratio: float = 0.40
 
     track_high_thresh: float = 0.7
     track_low_thresh: float = 0.35
@@ -353,6 +465,7 @@ class Settings(BaseSettings):
     attribute_crop_side_padding_ratio: float = 0.08
     attribute_crop_bottom_padding_ratio: float = 0.04
     blocked_match_score_threshold: float = 0.9
+
     duplicate_track_iou_threshold: float = 0.5
     cooccurrence_guard_enabled: bool = True
     cooccurrence_guard_min_shared_frames: int = 1
@@ -384,36 +497,62 @@ class Settings(BaseSettings):
     # them. Short-circuit suppression when at least this fraction of frames
     # had bbox touching any frame edge (≤2 px from boundary).
     static_artifact_boundary_contact_skip: float = 0.3
+    # Person-level static-artifact filter (plan E15): the per-tracklet guard above
+    # is fragile (one jittery 6-frame segment, or a boundary-touching static object
+    # like a fire extinguisher on the floor, evades it). At stream finalization,
+    # drop a person whose bbox centroid barely moved across ALL its tracklets
+    # (spread < ratio * mean bbox dimension on BOTH axes) AND whose bbox is small
+    # (<= the size thresholds above, so tall standing people are never dropped).
+    # Robust to per-tracklet jitter; reversible via the flag.
+    static_person_filter_enabled: bool = True
+    static_person_max_centroid_spread_ratio: float = 1.5
+    static_person_min_tracklets: int = 2
+    # Size-INDEPENDENT near-zero-motion branch: catches LARGE static objects
+    # (e.g. a door) the small+static branch misses. A person walking through view
+    # has centroid spread in the 100s-1000s of px; a fixed object stays put.
+    # Observed: door spread_x=57/spread_y=3 vs real people >=618/>=90 (10-30x
+    # margin). Allows 1-tracklet objects. Set spreads to 0 to disable the branch.
+    static_person_zero_motion_max_spread_x_px: float = 150.0
+    static_person_zero_motion_max_spread_y_px: float = 45.0
+    static_person_zero_motion_min_tracklets: int = 1
     recent_match_guard_enabled: bool = True
     recent_match_guard_seconds: float = 4.0
     recent_match_guard_min_iou: float = 0.1
     recent_match_guard_max_center_distance_ratio: float = 0.9
     gallery_update_anchor_min_score: float = 0.50
+
     gallery_consensus_weight: float = 0.5
     duplicate_merge_enabled: bool = True
     duplicate_merge_min_score: float = 0.90
+
     duplicate_merge_weak_max_tracklets: int = 2
     duplicate_merge_singleton_min_score: float = 0.90
+
     duplicate_merge_singleton_min_target_tracklets: int = 3
     duplicate_merge_min_margin: float = 0.10
+
     # Occlusion/edge re-entry often produces two short identities separated by
     # only a few frames. Allow that narrow temporal-continuity case below the
     # normal high-confidence duplicate threshold, while keeping cooccurrence and
     # attribute guards active.
     duplicate_merge_temporal_continuity_enabled: bool = True
     duplicate_merge_temporal_continuity_min_score: float = 0.85
+
     duplicate_merge_temporal_continuity_max_gap_frames: int = 15
     duplicate_merge_adjacent_fragment_enabled: bool = True
     duplicate_merge_adjacent_fragment_min_score: float = 0.70
+
     duplicate_merge_adjacent_fragment_max_gap_frames: int = 3
     duplicate_merge_occlusion_reentry_enabled: bool = True
     duplicate_merge_occlusion_reentry_min_score: float = 0.58
+
     duplicate_merge_occlusion_reentry_max_gap_frames: int = 180
     duplicate_merge_occlusion_reentry_max_center_distance_ratio: float = 2.0
     duplicate_merge_same_gender_singleton_enabled: bool = True
     duplicate_merge_same_gender_singleton_min_score: float = 0.80
     duplicate_merge_same_gender_singleton_gender_confidence: float = 0.80
     duplicate_merge_singleton_unknown_attr_min_score: float = 0.88
+
     # When two persons' canonical galleries match above this cosine threshold,
     # treat them as the same physical human regardless of attribute conflict.
     # Calibrated above typical "different people" cosine band (~0.65) so it
@@ -421,6 +560,7 @@ class Settings(BaseSettings):
     # range so a wrong attribute prediction can no longer permanently fragment
     # one identity. Video-agnostic; depends only on the embedding model.
     duplicate_merge_attr_override_threshold: float = 0.80
+
     # Same principle for the cooccurrence check, but at a higher threshold
     # because cooccurrence is a stronger signal (two persons appearing in
     # overlapping frame ranges). Set above 0.80 so we don't merge two physically
@@ -428,6 +568,7 @@ class Settings(BaseSettings):
     # same-person identity-split (where the same physical person's detections
     # got attributed to two IDs in overlapping frames) can still be repaired.
     duplicate_merge_cooccurrence_override_threshold: float = 0.85
+
     # Soft override: at moderate similarity (0.75-0.85), attribute conflict is
     # itself evidence of identity-split (attribute model misclassified one side
     # of the same physical person), so we override BOTH guards together.
@@ -435,15 +576,20 @@ class Settings(BaseSettings):
     # score this high in embedding cosine — high-sim + attr-flip is the
     # identity-split signature. Video-agnostic.
     duplicate_merge_soft_split_override_threshold: float = 0.70
+
     duplicate_merge_soft_split_max_weak_tracklets: int = 8
     duplicate_merge_soft_split_max_center_distance_ratio: float = 0.15
     duplicate_merge_soft_split_duplicate_iou_threshold: float = 0.75
     duplicate_merge_soft_split_duplicate_box_multitrack_min_score: float = 0.78
+
     duplicate_merge_soft_split_spatial_only_min_score: float = 0.50
+
     duplicate_merge_soft_split_spatial_only_multitrack_min_score: float = 0.60
+
     duplicate_merge_soft_split_spatial_only_max_center_distance_ratio: float = 0.30
     duplicate_merge_overlap_spatial_duplicate_enabled: bool = True
     duplicate_merge_overlap_spatial_duplicate_min_score: float = 0.78
+
     duplicate_merge_overlap_spatial_duplicate_max_gap_frames: int = 4
     duplicate_merge_overlap_spatial_duplicate_max_tracklets: int = 24
     duplicate_merge_overlap_spatial_duplicate_max_center_distance_ratio: float = 0.08
@@ -451,18 +597,21 @@ class Settings(BaseSettings):
     duplicate_merge_overlap_spatial_duplicate_max_area_ratio: float = 1.60
     duplicate_merge_trajectory_reentry_enabled: bool = True
     duplicate_merge_trajectory_reentry_min_score: float = 0.60
+
     duplicate_merge_trajectory_reentry_max_gap_frames: int = 240
     duplicate_merge_trajectory_reentry_max_tracklets: int = 24
     duplicate_merge_trajectory_reentry_max_center_distance_ratio: float = 0.06
     duplicate_merge_trajectory_reentry_max_size_ratio: float = 1.30
     duplicate_merge_trajectory_reentry_max_area_ratio: float = 2.00
     duplicate_merge_singleton_spatial_continuation_min_score: float = 0.30
+
     duplicate_merge_singleton_spatial_continuation_max_gap_frames: int = 15
     duplicate_merge_singleton_spatial_continuation_max_center_distance_ratio: float = 0.30
     duplicate_merge_singleton_spatial_continuation_max_size_ratio: float = 1.80
     duplicate_merge_singleton_spatial_continuation_max_area_ratio: float = 2.20
     duplicate_merge_adjacent_tight_continuation_enabled: bool = True
     duplicate_merge_adjacent_tight_continuation_min_score: float = 0.50
+
     duplicate_merge_adjacent_tight_continuation_max_gap_frames: int = 4
     duplicate_merge_adjacent_tight_continuation_max_tracklets: int = 8
     duplicate_merge_adjacent_tight_continuation_max_center_distance_ratio: float = 0.06
@@ -470,6 +619,7 @@ class Settings(BaseSettings):
     duplicate_merge_adjacent_tight_continuation_max_area_ratio: float = 1.15
     duplicate_merge_boundary_weak_continuation_enabled: bool = True
     duplicate_merge_boundary_weak_continuation_min_score: float = 0.50
+
     duplicate_merge_boundary_weak_continuation_max_gap_frames: int = 12
     duplicate_merge_boundary_weak_continuation_max_weak_tracklets: int = 2
     duplicate_merge_boundary_weak_continuation_max_supported_tracklets: int = 8
@@ -479,15 +629,18 @@ class Settings(BaseSettings):
     duplicate_merge_boundary_weak_continuation_max_area_ratio: float = 2.30
     duplicate_merge_boundary_weak_continuation_max_bottom_delta_ratio: float = 0.06
     duplicate_merge_boundary_duplicate_min_score: float = 0.68
+
     duplicate_merge_boundary_duplicate_min_iou: float = 0.10
     duplicate_merge_boundary_duplicate_max_center_distance_ratio: float = 0.45
     duplicate_merge_ultra_continuity_min_score: float = 0.50
+
     duplicate_merge_ultra_continuity_max_gap_frames: int = 6
     duplicate_merge_ultra_continuity_max_center_distance_ratio: float = 0.12
     duplicate_merge_ultra_continuity_max_weak_tracklets: int = 2
     duplicate_merge_ultra_continuity_max_supported_tracklets: int = 8
     duplicate_merge_tight_spatial_reentry_enabled: bool = True
     duplicate_merge_tight_spatial_reentry_min_score: float = 0.50
+
     duplicate_merge_tight_spatial_reentry_max_gap_frames: int = 6
     duplicate_merge_tight_spatial_reentry_max_center_distance_ratio: float = 0.12
     duplicate_merge_tight_spatial_reentry_max_size_ratio: float = 1.15
@@ -495,12 +648,14 @@ class Settings(BaseSettings):
     duplicate_merge_tight_spatial_reentry_max_weak_tracklets: int = 2
     duplicate_merge_same_frame_established_duplicate_enabled: bool = True
     duplicate_merge_same_frame_established_duplicate_min_score: float = 0.50
+
     duplicate_merge_same_frame_established_duplicate_min_iou: float = 0.75
     duplicate_merge_same_frame_established_duplicate_max_center_distance_ratio: float = 0.05
     duplicate_merge_same_frame_established_duplicate_max_size_ratio: float = 1.15
     duplicate_merge_same_frame_established_duplicate_max_area_ratio: float = 1.25
     duplicate_merge_reentry_bridge_enabled: bool = True
     duplicate_merge_reentry_bridge_min_score: float = 0.535
+
     duplicate_merge_reentry_bridge_max_tracklets: int = 4
     duplicate_merge_reentry_bridge_max_supported_tracklets: int = 8
     duplicate_merge_reentry_bridge_min_gap_frames: int = 30
@@ -509,9 +664,12 @@ class Settings(BaseSettings):
     duplicate_merge_reentry_bridge_gender_confidence: float = 0.70
     duplicate_merge_reentry_bridge_min_attr_matches: int = 2
     duplicate_merge_reentry_bridge_supported_min_score: float = 0.70
+
     duplicate_merge_reentry_bridge_supported_min_margin: float = 0.12
+
     duplicate_merge_high_conf_reentry_enabled: bool = True
     duplicate_merge_high_conf_reentry_min_score: float = 0.86
+
     duplicate_merge_high_conf_reentry_max_tracklets: int = 8
     duplicate_merge_high_conf_reentry_min_gap_frames: int = 30
     duplicate_merge_high_conf_reentry_max_gap_frames: int = 120
@@ -527,6 +685,7 @@ class Settings(BaseSettings):
     # only; realtime matching thresholds remain unchanged.
     duplicate_merge_scale_aware_reentry_enabled: bool = True
     duplicate_merge_scale_aware_reentry_min_score: float = 0.55
+
     duplicate_merge_scale_aware_reentry_max_gap_frames: int = 240
     duplicate_merge_scale_aware_reentry_max_tracklets: int = 8
     duplicate_merge_scale_aware_reentry_max_center_distance_ratio: float = 1.30
@@ -538,6 +697,7 @@ class Settings(BaseSettings):
     duplicate_merge_scale_aware_reentry_min_attr_matches: int = 2
     duplicate_merge_supported_spatial_reentry_enabled: bool = True
     duplicate_merge_supported_spatial_reentry_min_score: float = 0.53
+
     duplicate_merge_supported_spatial_reentry_max_tracklets: int = 8
     duplicate_merge_supported_spatial_reentry_min_gap_frames: int = 24
     duplicate_merge_supported_spatial_reentry_max_gap_frames: int = 90
@@ -550,6 +710,7 @@ class Settings(BaseSettings):
     # stronger appearance or geometry supports them.
     duplicate_merge_clothing_reentry_enabled: bool = False
     duplicate_merge_clothing_reentry_min_score: float = 0.515
+
     duplicate_merge_clothing_reentry_max_weak_tracklets: int = 2
     duplicate_merge_clothing_reentry_max_supported_tracklets: int = 8
     duplicate_merge_clothing_reentry_min_gap_frames: int = 30
@@ -560,12 +721,18 @@ class Settings(BaseSettings):
     duplicate_merge_weak_to_supported_min_target_tracklets: int = 5
     duplicate_merge_weak_to_supported_max_target_tracklets: int = 8
     duplicate_merge_weak_to_supported_min_score: float = 0.78
+
     duplicate_merge_weak_to_supported_min_margin: float = 0.08
+
     duplicate_merge_weak_to_supported_strong_score: float = 0.89
+
     duplicate_merge_weak_to_supported_strong_margin: float = 0.18
+
     duplicate_merge_occlusion_spatial_rejoin_enabled: bool = False
     duplicate_merge_occlusion_spatial_rejoin_min_score: float = 0.53
+
     duplicate_merge_occlusion_spatial_rejoin_strong_min_score: float = 0.59
+
     duplicate_merge_occlusion_spatial_rejoin_max_gap_frames: int = 180
     duplicate_merge_occlusion_spatial_rejoin_max_center_distance_ratio: float = 0.50
     duplicate_merge_occlusion_spatial_rejoin_tight_center_distance_ratio: float = 0.42
@@ -575,6 +742,7 @@ class Settings(BaseSettings):
     duplicate_merge_occlusion_spatial_rejoin_tight_area_ratio: float = 2.00
     duplicate_merge_spatial_continuation_enabled: bool = False
     duplicate_merge_spatial_continuation_min_score: float = 0.20
+
     duplicate_merge_spatial_continuation_max_gap_frames: int = 60
     duplicate_merge_spatial_continuation_max_center_distance_ratio: float = 0.30
     # Per-sighting confidence required for a gender label to count when

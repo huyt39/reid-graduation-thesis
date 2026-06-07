@@ -250,7 +250,39 @@ async def _serve_websocket(ws: WebSocket, ws_broadcaster: WebSocketBroadcaster):
                 data = json.loads(raw)
                 if data.get("type") == "subscribe_device":
                     device_id = data.get("device_id", "")
-                    await ws_broadcaster.send_latest_frame(ws, device_id)
+                    frame = ws_broadcaster.frame_cache.get(device_id)
+                    if frame is None:
+                        await ws.send_json(
+                            {"type": "error", "message": f"Device {device_id} not found"}
+                        )
+                        continue
+                    ws_broadcaster.subscribe(ws, [device_id])
+                    await ws.send_text(ws_broadcaster._frame_to_json(frame))
+                elif data.get("type") == "subscribe_devices":
+                    requested_ids = data.get("device_ids", [])
+                    if not isinstance(requested_ids, list):
+                        await ws.send_json(
+                            {"type": "error", "message": "device_ids must be a list"}
+                        )
+                        continue
+                    device_ids = [device_id for device_id in requested_ids if isinstance(device_id, str)]
+                    available_ids = set(ws_broadcaster.frame_cache.device_ids())
+                    valid_device_ids = [device_id for device_id in device_ids if device_id in available_ids]
+                    missing_ids = [device_id for device_id in device_ids if device_id not in available_ids]
+
+                    if missing_ids:
+                        await ws.send_json(
+                            {
+                                "type": "error",
+                                "message": f"Devices not found: {', '.join(missing_ids)}",
+                            }
+                        )
+                    if not valid_device_ids:
+                        continue
+
+                    ws_broadcaster.subscribe(ws, valid_device_ids)
+                    for device_id in valid_device_ids:
+                        await ws_broadcaster.send_latest_frame(ws, device_id)
             except json.JSONDecodeError:
                 logger.warning("ws.invalid_json")
     except WebSocketDisconnect:

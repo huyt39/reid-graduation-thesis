@@ -52,6 +52,12 @@ class ReIDMatcher:
         current_identity_switch_max_current_score: float = 0.70,
         capped_identity_soft_match_threshold: float = 0.72,
         near_gallery_defer_threshold: float = 0.50,
+        # Recall fallback: after sustained non-match, a deferred-near-gallery
+        # cluster whose best gallery match is still clearly different-person-level
+        # (< this) is minted as a NEW person instead of deferring forever. 0.0
+        # disables (pure defer). Risk: may split a same-person cross-view re-entry
+        # whose embedding is weak — keep low. See plan E9.
+        near_gallery_deferred_mint_max_score: float = 0.0,
         good_streak_min_consecutive: int = 4,
         good_streak_promotion_enabled: bool = True,
         scale_aux_gallery_enabled: bool = True,
@@ -88,6 +94,7 @@ class ReIDMatcher:
         self.current_identity_switch_max_current_score = current_identity_switch_max_current_score
         self.capped_identity_soft_match_threshold = capped_identity_soft_match_threshold
         self.near_gallery_defer_threshold = near_gallery_defer_threshold
+        self.near_gallery_deferred_mint_max_score = float(near_gallery_deferred_mint_max_score)
         self.good_streak_min_consecutive = int(good_streak_min_consecutive)
         self.good_streak_promotion_enabled = bool(good_streak_promotion_enabled)
         self.scale_aux_gallery_enabled = bool(scale_aux_gallery_enabled)
@@ -418,26 +425,36 @@ class ReIDMatcher:
         pid, score = eligible[0]
         runner_up = eligible[1][1] if len(eligible) > 1 else None
         gap = (score - runner_up) if runner_up is not None else float("inf")
-        full_gallery_score = None
-        if self.scale_aux_full_gallery_min_score > 0.0:
-            full_gallery_score = self.store.search_person(
-                pid,
-                embedding,
-                min_score=self.scale_aux_full_gallery_min_score,
+        # Always compute full-body gallery support for this candidate (min_score
+        # =0.0 so the real value is visible even when low). The upper-body crop
+        # alone is weak: two different people at different scale can score high on
+        # torso-cropped embeddings (observed red-jacket vs black-shirt = 0.74 on
+        # the upper crop while being different people). Requiring full-body support
+        # rejects those cross-person glues while keeping genuine same-person
+        # cross-scale links (which retain decent full-body similarity).
+        full_gallery_score = self.store.search_person(pid, embedding, min_score=0.0)
+        full_fmt = "n/a" if full_gallery_score is None else f"{full_gallery_score:.3f}"
+        if self.scale_aux_full_gallery_min_score > 0.0 and (
+            full_gallery_score is None
+            or full_gallery_score < self.scale_aux_full_gallery_min_score
+        ):
+            self._record_decision(
+                track_id,
+                method="scale_aux_rejected_low_full_gallery_support",
+                source="upper_body_gallery",
+                similarity_score=float(score),
+                full_gallery_score=None if full_gallery_score is None else float(full_gallery_score),
+                runner_up_score=None if runner_up is None else float(runner_up),
+                margin_to_runner_up=float(gap),
+                reuse_person_id=pid,
+                tentative_attempts=tentative_attempts,
+                canonical_update_applied=None,
             )
-            if full_gallery_score is None:
-                self._record_decision(
-                    track_id,
-                    method="scale_aux_rejected_low_full_gallery_support",
-                    source="upper_body_gallery",
-                    similarity_score=float(score),
-                    runner_up_score=None if runner_up is None else float(runner_up),
-                    margin_to_runner_up=float(gap),
-                    reuse_person_id=pid,
-                    tentative_attempts=tentative_attempts,
-                    canonical_update_applied=None,
-                )
-                return None
+            logger.info(
+                f"scale_aux_rejected_low_full_gallery track={track_id} person={pid} "
+                f"upper={score:.3f} full={full_fmt} min={self.scale_aux_full_gallery_min_score:.3f}"
+            )
+            return None
         if gap < self.scale_aux_match_margin:
             self._record_decision(
                 track_id,
@@ -464,8 +481,8 @@ class ReIDMatcher:
             canonical_update_applied=False,
         )
         logger.info(
-            f"Track {track_id} matched via upper-body auxiliary gallery to person "
-            f"{pid} (sim={score:.3f}, gap={gap:.3f})"
+            f"scale_aux_accept track={track_id} person={pid} "
+            f"upper={score:.3f} full={full_fmt} gap={gap:.3f}"
         )
         return pid
 
@@ -734,6 +751,15 @@ class ReIDMatcher:
                     logger.info(
                         f"Track {track_id} matched to person {best_pid} (sim={best_score:.3f})"
                     )
+                    # Observability: flag borderline acceptances where no runner-up
+                    # existed, so the margin/ambiguity gate was skipped entirely. This
+                    # is a primary over-merge door — a different person at ~0.74 can be
+                    # absorbed when alone above threshold. Log to pin seed merges.
+                    if runner_up_score is None and best_score < 0.80:
+                        logger.info(
+                            f"no_runner_up_accept track={track_id} person={best_pid} "
+                            f"sim={best_score:.3f} threshold={self.similarity_threshold:.3f}"
+                        )
                     updated = False
                     if not is_low_visibility and allow_gallery_update:
                         updated = self.store.gated_momentum_update(
@@ -1249,7 +1275,32 @@ class ReIDMatcher:
                     if aux_pid is not None:
                         del self.tentative[track_id]
                         return aux_pid
-                if self._defer_if_near_existing(
+                # Recall fallback: after sustained non-match (>= max attempts) with
+                # strong evidence, a deferred cluster whose best gallery match is
+                # still clearly different-person-level is a NEW person, not a
+                # re-entry — mint it instead of deferring forever. Plausible
+                # re-entries (best match near the soft threshold) keep deferring.
+                allow_deferred_mint = False
+                if (
+                    self.near_gallery_deferred_mint_max_score > 0.0
+                    and int(tent.get("attempts", 0)) >= self.tentative_max_attempts
+                    and float(tent["v_avg"]) >= self.promote_v_threshold
+                    and float(tent["consistency"]) >= self.promote_consistency_threshold
+                    and self._has_enough_new_identity_evidence(int(tent.get("tracklet_len", 0) or 0))
+                ):
+                    _mh = self.store.search(
+                        tent["embedding"], top_k=1,
+                        score_threshold=self.near_gallery_defer_threshold,
+                    )
+                    _best = float(_mh[0][1]) if _mh else 0.0
+                    if _best < self.near_gallery_deferred_mint_max_score:
+                        allow_deferred_mint = True
+                        logger.info(
+                            f"Track {track_id} deferred->mint fallback "
+                            f"(best={_best:.3f} < {self.near_gallery_deferred_mint_max_score:.2f}, "
+                            f"sustained {tent['attempts']} attempts)"
+                        )
+                if not allow_deferred_mint and self._defer_if_near_existing(
                     track_id=track_id,
                     embedding=tent["embedding"],
                     blocked_person_ids=_blocked_t,

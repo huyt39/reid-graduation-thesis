@@ -1,9 +1,8 @@
-import json
-
 import pytest
 from fastapi.testclient import TestClient
 
-from src.api.app import app
+from src.api.app import app, frame_cache
+from src.services.frame_cache import FrameData
 
 
 def test_healthz():
@@ -43,3 +42,32 @@ def test_websocket_subscribe_unknown_device():
             ws.send_json({"type": "subscribe_device", "device_id": "nonexistent"})
             data = ws.receive_json()
             assert data["type"] == "error"
+
+
+def test_websocket_subscribe_devices_receives_only_requested_frames():
+    frame_cache.update(
+        FrameData(
+            device_id="cam-1",
+            frame_number=1,
+            tracked_persons=[],
+            created_at=1,
+            image_base64="a",
+        )
+    )
+    frame_cache.update(
+        FrameData(
+            device_id="cam-2",
+            frame_number=2,
+            tracked_persons=[],
+            created_at=2,
+            image_base64="b",
+        )
+    )
+
+    with TestClient(app) as c:
+        with c.websocket_connect("/ws") as ws:
+            ws.receive_json()
+            ws.send_json({"type": "subscribe_devices", "device_ids": ["cam-2"]})
+            data = ws.receive_json()
+            assert data["type"] == "frame_update"
+            assert data["device_id"] == "cam-2"

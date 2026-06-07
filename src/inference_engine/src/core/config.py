@@ -7,6 +7,9 @@ class Settings(BaseSettings):
 
     # Model weight paths
     osnet_weights: str = "src/assets/models/osnet/model.pth.tar-150"
+    # OSNet-AIN (domain-generalization variant): the embedding that generalized best
+    # to cross-view on the held-out 51/52 set (see MULTI_CAMERA.md). Empty to disable.
+    osnet_ain_weights: str = "src/assets/models/osnet_ain/osnet_ain_msmt17.pth"
     osnet_onnx_path: str = ""
     lmbn_weights: str = ""  # optional, leave empty to skip
     efficientnet_weights: str = "src/assets/models/efficientnet/best_model.pth"

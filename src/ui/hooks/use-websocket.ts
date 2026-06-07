@@ -193,14 +193,18 @@ function normalizeFrameUpdate(raw: Record<string, unknown>): FrameUpdate {
   };
 }
 
-function subscribeToDevice(ws: WebSocket | null, deviceId: string | null): void {
-  if (!ws || ws.readyState !== WebSocket.OPEN || !deviceId) return;
-  ws.send(JSON.stringify({ type: "subscribe_device", device_id: deviceId }));
+function subscribeToDevices(ws: WebSocket | null, deviceIds: string[]): void {
+  if (!ws || ws.readyState !== WebSocket.OPEN || deviceIds.length === 0) return;
+  if (deviceIds.length === 1) {
+    ws.send(JSON.stringify({ type: "subscribe_device", device_id: deviceIds[0] }));
+    return;
+  }
+  ws.send(JSON.stringify({ type: "subscribe_devices", device_ids: deviceIds }));
 }
 
 export function useWebSocket(
   url: string | null,
-  selectedDevice: string | null = null,
+  subscribedDeviceIds: string[] = [],
   options: UseWebSocketOptions = {}
 ): UseWebSocketResult {
   const { enabled = true, maxFps = 30 } = options;
@@ -212,7 +216,7 @@ export function useWebSocket(
   const backoffRef = useRef(1000);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const unmountedRef = useRef(false);
-  const selectedDeviceRef = useRef<string | null>(selectedDevice);
+  const subscribedDeviceIdsRef = useRef<string[]>(subscribedDeviceIds);
   const pendingFramesRef = useRef<Record<string, FrameUpdate>>({});
   const pendingDeviceIdsRef = useRef<Set<string>>(new Set());
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -275,7 +279,11 @@ export function useWebSocket(
           : [];
         pendingDeviceIdsRef.current = new Set(devices);
         scheduleFlush();
-        subscribeToDevice(ws, selectedDeviceRef.current ?? devices[0] ?? null);
+        const nextDeviceIds =
+          subscribedDeviceIdsRef.current.length > 0
+            ? subscribedDeviceIdsRef.current
+            : devices;
+        subscribeToDevices(ws, nextDeviceIds);
         return;
       }
 
@@ -300,8 +308,8 @@ export function useWebSocket(
   }, [enabled, scheduleFlush, url]);
 
   useEffect(() => {
-    selectedDeviceRef.current = selectedDevice;
-  }, [selectedDevice]);
+    subscribedDeviceIdsRef.current = subscribedDeviceIds;
+  }, [subscribedDeviceIds]);
 
   useEffect(() => {
     unmountedRef.current = false;
@@ -326,8 +334,12 @@ export function useWebSocket(
   }, [connect, enabled]);
 
   useEffect(() => {
-    subscribeToDevice(wsRef.current, selectedDevice ?? deviceIds[0] ?? null);
-  }, [selectedDevice, deviceIds]);
+    const nextDeviceIds =
+      subscribedDeviceIds.length > 0
+        ? subscribedDeviceIds
+        : deviceIds;
+    subscribeToDevices(wsRef.current, nextDeviceIds);
+  }, [subscribedDeviceIds, deviceIds]);
 
   return { connectionState, deviceIds, framesByDevice };
 }
