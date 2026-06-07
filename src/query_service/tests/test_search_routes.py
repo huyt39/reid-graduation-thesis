@@ -29,6 +29,7 @@ async def test_natural_language_query_returns_error_result_without_validation(mo
 async def test_natural_language_query_validates_and_executes_structured_query(monkeypatch):
     parser = AsyncMock()
     parser.parse.return_value = {"query_type": "person_lookup", "params": {"person_id": 7}}
+    parser.summarize.return_value = ""
     executor = AsyncMock()
     executor.execute.return_value = {"person": {"person_id": 7}}
 
@@ -43,7 +44,7 @@ async def test_natural_language_query_validates_and_executes_structured_query(mo
         "summary": "Found person 7.",
     }
     executor.execute.assert_awaited_once()
-    parser.summarize.assert_not_awaited()
+    parser.summarize.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -6,8 +6,10 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { PersonSnapshot } from "@/components/person-snapshot";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useSearch } from "@/hooks/use-search";
+import type { NLQueryResult, Person } from "@/types";
 
 const EXAMPLE_QUERIES = [
   "show me person 42",
@@ -31,6 +33,93 @@ function AnswerBlock({ markdown }: { markdown: string }) {
   return (
     <div className="rounded-md border bg-muted/30 p-4 text-sm leading-relaxed [&_a]:underline [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-xs [&_li]:my-0.5 [&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-5 [&_p]:my-2 [&_strong]:font-semibold [&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-5 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
       <ReactMarkdown remarkPlugins={[remarkGfm]}>{markdown}</ReactMarkdown>
+    </div>
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isPerson(value: unknown): value is Person {
+  return isRecord(value) && typeof value.person_id === "number";
+}
+
+function extractPeople(result: NLQueryResult): Person[] {
+  const payload = result.result;
+  if (!isRecord(payload)) return [];
+
+  if (isPerson(payload.person)) {
+    return [payload.person];
+  }
+
+  if (Array.isArray(payload.items)) {
+    return payload.items.filter(isPerson);
+  }
+
+  if (Array.isArray(payload.similar_persons)) {
+    return payload.similar_persons
+      .map((item) => (isRecord(item) ? item.person : null))
+      .filter(isPerson);
+  }
+
+  return [];
+}
+
+function personAttributeSummary(person: Person): string {
+  const labels = [
+    person.attributes.gender,
+    person.attributes.age_child,
+    person.attributes.backpack,
+    person.attributes.sidebag,
+    person.attributes.hat,
+    person.attributes.glasses,
+    person.attributes.sleeve,
+    person.attributes.lower,
+  ].filter((value) => value && value !== "unknown");
+
+  return labels.length > 0 ? labels.join(", ") : "No stable attributes";
+}
+
+function PeopleResults({ result }: { result: NLQueryResult }) {
+  const people = extractPeople(result);
+  if (people.length === 0) return null;
+
+  return (
+    <div className="rounded-md border p-3">
+      <div className="text-muted-foreground text-xs font-medium uppercase tracking-wide">
+        People
+      </div>
+      <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        {people.map((person) => (
+          <div
+            key={person.person_id}
+            className="grid grid-cols-[88px_1fr] gap-3 rounded-md border bg-background p-2"
+          >
+            <PersonSnapshot
+              src={person.snapshot_url}
+              alt={`Person ${person.person_id} snapshot`}
+              label={`#${person.person_id}`}
+              className="aspect-[4/5] w-[88px] rounded-md"
+              previewTitle={`Person #${person.person_id} snapshot`}
+            />
+            <div className="min-w-0 py-1">
+              <div className="truncate text-sm font-medium">Person #{person.person_id}</div>
+              <div className="mt-1 line-clamp-2 text-xs text-muted-foreground">
+                {personAttributeSummary(person)}
+              </div>
+              <div className="mt-2 text-xs text-muted-foreground">
+                {person.stats?.sighting_count ?? 0} sightings
+              </div>
+              {person.stats?.last_seen_device ? (
+                <div className="truncate text-xs text-muted-foreground">
+                  Last seen at {person.stats.last_seen_device}
+                </div>
+              ) : null}
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -122,6 +211,8 @@ export function SearchForm() {
                   result.
                 </p>
               )}
+
+              <PeopleResults result={result} />
 
               <details className="rounded-md border p-3">
                 <summary className="text-muted-foreground cursor-pointer text-xs font-medium uppercase tracking-wide">

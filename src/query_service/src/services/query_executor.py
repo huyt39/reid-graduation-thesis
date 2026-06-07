@@ -1,6 +1,8 @@
 """Dispatches structured queries to the appropriate backend."""
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 
 from src.db.mongo_client import MongoQueryClient
@@ -26,10 +28,23 @@ class QueryExecutor:
         mongo: MongoQueryClient,
         qdrant: QdrantQueryClient,
         redis_cache: RedisQueryCache,
+        minio_urls: Any | None = None,
     ) -> None:
         self.mongo = mongo
         self.qdrant = qdrant
         self.redis = redis_cache
+        self.minio_urls = minio_urls
+
+    def _attach_snapshot_url(self, item: dict | None) -> dict | None:
+        if item is None:
+            return None
+
+        enriched = dict(item)
+        if self.minio_urls is None:
+            return enriched
+
+        enriched["snapshot_url"] = self.minio_urls.presigned_url(item.get("snapshot_key"))
+        return enriched
 
     async def execute(self, query: dict | StructuredQueryRequest) -> dict:
         if isinstance(query, StructuredQueryRequest):
@@ -60,12 +75,13 @@ class QueryExecutor:
         # Check cache first
         cached = await self.redis.get_person(pid)
         if cached:
-            return {"person": cached}
+            return {"person": self._attach_snapshot_url(cached)}
         person = await self.mongo.get_person(pid)
         if person is None:
             return {"error": f"Person {pid} not found"}
-        await self.redis.set_person(pid, person)
-        return {"person": person}
+        enriched_person = self._attach_snapshot_url(person)
+        await self.redis.set_person(pid, enriched_person or person)
+        return {"person": enriched_person}
 
     async def _person_search(self, params: dict) -> dict:
         parsed = PersonSearchParams(**params)
@@ -101,7 +117,13 @@ class QueryExecutor:
         items, total = await self.mongo.search_persons(
             filters=mongo_query, skip=skip, limit=parsed.page_size,
         )
-        return {"items": items, "total": total, "page": parsed.page, "page_size": parsed.page_size}
+        enriched_items = [self._attach_snapshot_url(item) for item in items]
+        return {
+            "items": enriched_items,
+            "total": total,
+            "page": parsed.page,
+            "page_size": parsed.page_size,
+        }
 
     async def _timeline(self, params: dict) -> dict:
         parsed = TimelineParams(**params)
@@ -122,7 +144,13 @@ class QueryExecutor:
             top_k=parsed.top_k,
             min_score=parsed.min_score,
         )
-        return {"similar_persons": results}
+        enriched = []
+        for result in results:
+            item = dict(result)
+            person = await self.mongo.get_person(item["person_id"])
+            item["person"] = self._attach_snapshot_url(person)
+            enriched.append(item)
+        return {"similar_persons": enriched}
 
     async def _sighting_aggregation(self, params: dict) -> dict:
         parsed = SightingAggregationParams(**params)

@@ -53,6 +53,27 @@ async def test_person_lookup(executor, mongo):
 
 
 @pytest.mark.asyncio
+async def test_person_lookup_attaches_snapshot_url():
+    mongo = AsyncMock()
+    qdrant = MagicMock()
+    redis_cache = AsyncMock()
+    minio_urls = MagicMock()
+
+    mongo.get_person = AsyncMock(return_value={"person_id": 1, "snapshot_key": "persons/1.jpg"})
+    redis_cache.get_person = AsyncMock(return_value=None)
+    redis_cache.set_person = AsyncMock()
+    minio_urls.presigned_url.return_value = "https://snapshots.example/persons/1.jpg"
+
+    executor = QueryExecutor(mongo, qdrant, redis_cache, minio_urls)
+
+    result = await executor.execute({"query_type": "person_lookup", "params": {"person_id": 1}})
+
+    assert result["person"]["snapshot_url"] == "https://snapshots.example/persons/1.jpg"
+    minio_urls.presigned_url.assert_called_once_with("persons/1.jpg")
+    redis_cache.set_person.assert_awaited_once_with(1, result["person"])
+
+
+@pytest.mark.asyncio
 async def test_execute_accepts_structured_query_request(executor):
     query = PersonLookupQuery(query_type="person_lookup", params={"person_id": 1})
 
@@ -77,6 +98,37 @@ async def test_person_search(executor, mongo):
         "params": {"filters": {"gender": "male"}},
     })
     assert result["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_person_search_attaches_snapshot_urls():
+    mongo = AsyncMock()
+    qdrant = MagicMock()
+    redis_cache = AsyncMock()
+    minio_urls = MagicMock()
+
+    mongo.search_persons = AsyncMock(
+        return_value=(
+            [
+                {"person_id": 1, "snapshot_key": "persons/1.jpg"},
+                {"person_id": 2, "snapshot_key": None},
+            ],
+            2,
+        )
+    )
+    minio_urls.presigned_url.side_effect = (
+        lambda key: f"https://snapshots.example/{key}" if key else None
+    )
+
+    executor = QueryExecutor(mongo, qdrant, redis_cache, minio_urls)
+
+    result = await executor.execute({
+        "query_type": "person_search",
+        "params": {"filters": {}},
+    })
+
+    assert result["items"][0]["snapshot_url"] == "https://snapshots.example/persons/1.jpg"
+    assert result["items"][1]["snapshot_url"] is None
 
 
 @pytest.mark.asyncio

@@ -24,7 +24,6 @@ async def lifespan(app: FastAPI):
     mongo = MongoQueryClient(settings.mongo_uri, settings.mongo_db)
     qdrant = QdrantQueryClient(settings.qdrant_host, settings.qdrant_port)
     redis_cache = RedisQueryCache(settings.redis_url)
-    executor = QueryExecutor(mongo, qdrant, redis_cache)
     nl_parser = NLQueryParser(vllm_url=settings.vllm_service_url)
     minio_urls = MinIOURLBuilder(
         internal_endpoint=settings.minio_internal_endpoint,
@@ -33,6 +32,7 @@ async def lifespan(app: FastAPI):
         secret_key=settings.minio_secret_key,
         secure=settings.minio_secure,
     )
+    executor = QueryExecutor(mongo, qdrant, redis_cache, minio_urls)
 
     deps.init(mongo, qdrant, redis_cache, executor, nl_parser, minio_urls)
     log.info("query_service.started")
