@@ -5,14 +5,7 @@ from fastapi.testclient import TestClient
 
 from src.api import app as app_module
 from src.api.app import app
-from src.auth.jwt_handler import create_token
-from src.auth.models import Role
 from src.proxy import http_proxy
-
-
-def _auth_headers() -> dict[str, str]:
-    token, _ = create_token("alice", Role.ADMIN)
-    return {"Authorization": f"Bearer {token}"}
 
 
 def test_api_proxy_returns_504_when_query_service_times_out():
@@ -23,7 +16,7 @@ def test_api_proxy_returns_504_when_query_service_times_out():
     app_module._http_client = client
     try:
         c = TestClient(app)
-        r = c.get("/api/v1/persons", headers=_auth_headers())
+        r = c.get("/api/v1/persons")
     finally:
         app_module._http_client = old_client
 
@@ -43,7 +36,7 @@ def test_api_proxy_returns_502_when_query_service_is_unavailable():
     app_module._http_client = client
     try:
         c = TestClient(app)
-        r = c.get("/api/v1/persons", headers=_auth_headers())
+        r = c.get("/api/v1/persons")
     finally:
         app_module._http_client = old_client
 
@@ -68,8 +61,7 @@ def test_api_proxy_preserves_existing_request_id_header():
     app_module._http_client = client
     try:
         c = TestClient(app)
-        headers = _auth_headers() | {"X-Request-ID": "req-123"}
-        r = c.get("/api/v1/persons", headers=headers)
+        r = c.get("/api/v1/persons", headers={"X-Request-ID": "req-123"})
     finally:
         app_module._http_client = old_client
 
@@ -91,7 +83,7 @@ def test_api_proxy_generates_request_id_when_missing():
     app_module._http_client = client
     try:
         c = TestClient(app)
-        r = c.get("/api/v1/persons", headers=_auth_headers())
+        r = c.get("/api/v1/persons")
     finally:
         app_module._http_client = old_client
 
@@ -114,7 +106,7 @@ def test_api_proxy_returns_request_id_header_to_client():
     app_module._http_client = client
     try:
         c = TestClient(app)
-        r = c.get("/api/v1/persons", headers=_auth_headers() | {"X-Request-ID": "req-456"})
+        r = c.get("/api/v1/persons", headers={"X-Request-ID": "req-456"})
     finally:
         app_module._http_client = old_client
 
@@ -138,7 +130,7 @@ def test_api_proxy_preserves_upstream_response_request_id_header():
     app_module._http_client = client
     try:
         c = TestClient(app)
-        r = c.get("/api/v1/persons", headers=_auth_headers() | {"X-Request-ID": "client-req-123"})
+        r = c.get("/api/v1/persons", headers={"X-Request-ID": "client-req-123"})
     finally:
         app_module._http_client = old_client
 
@@ -170,7 +162,7 @@ def test_api_proxy_logs_success_with_request_context(monkeypatch):
     app_module._http_client = client
     try:
         c = TestClient(app)
-        r = c.get("/api/v1/persons", headers=_auth_headers() | {"X-Request-ID": "req-log-1"})
+        r = c.get("/api/v1/persons", headers={"X-Request-ID": "req-log-1"})
     finally:
         app_module._http_client = old_client
 
@@ -205,7 +197,7 @@ def test_api_proxy_logs_timeout_with_request_context(monkeypatch):
     app_module._http_client = client
     try:
         c = TestClient(app)
-        r = c.get("/api/v1/persons", headers=_auth_headers() | {"X-Request-ID": "req-timeout-1"})
+        r = c.get("/api/v1/persons", headers={"X-Request-ID": "req-timeout-1"})
     finally:
         app_module._http_client = old_client
 
@@ -239,7 +231,7 @@ def test_api_proxy_logs_http_error_with_request_context(monkeypatch):
     app_module._http_client = client
     try:
         c = TestClient(app)
-        r = c.get("/api/v1/persons", headers=_auth_headers() | {"X-Request-ID": "req-error-1"})
+        r = c.get("/api/v1/persons", headers={"X-Request-ID": "req-error-1"})
     finally:
         app_module._http_client = old_client
 

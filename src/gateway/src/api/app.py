@@ -4,12 +4,9 @@ from contextlib import asynccontextmanager
 
 import httpx
 import structlog
-from fastapi import Depends, FastAPI, Request, WebSocket, HTTPException
+from fastapi import FastAPI, Request, WebSocket, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.auth.jwt_handler import create_token, decode_token
-from src.auth.models import LoginRequest, Role, TokenResponse
-from src.auth.rbac import get_current_user, get_ws_user
 from src.core.config import settings
 from src.middleware.rate_limiter import RateLimiterMiddleware
 from src.proxy.http_proxy import proxy_request
@@ -87,29 +84,10 @@ async def readyz():
     }
 
 
-# Auth endpoints
-
-@app.post("/auth/login", response_model=TokenResponse)
-def login(body: LoginRequest):
-    # Bootstrap auth: single admin user from env. Replace with DB lookup later.
-    if body.username != settings.admin_username or body.password != settings.admin_password:
-        from fastapi import HTTPException, status
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
-
-    token, expires_in = create_token(sub=body.username, role=Role.ADMIN)
-    return TokenResponse(access_token=token, expires_in=expires_in)
-
-
-@app.post("/auth/refresh", response_model=TokenResponse)
-def refresh(user=Depends(get_current_user)):
-    token, expires_in = create_token(sub=user.sub, role=user.role)
-    return TokenResponse(access_token=token, expires_in=expires_in)
-
-
 # WebSocket proxy to streaming service
 
 @app.websocket("/ws/stream")
-async def ws_stream(ws: WebSocket, user=Depends(get_ws_user)):
+async def ws_stream(ws: WebSocket):
     upstream = f"{settings.streaming_url}/ws"
     await proxy_websocket(ws, upstream)
 
@@ -120,7 +98,7 @@ async def ws_stream(ws: WebSocket, user=Depends(get_ws_user)):
     "/api/v1/{path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
 )
-async def api_proxy(path: str, request: Request, user=Depends(get_current_user)):
+async def api_proxy(path: str, request: Request):
     return await proxy_request(
         request,
         target_base=settings.query_service_url,
