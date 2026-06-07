@@ -9,3 +9,45 @@ dist/
 build/
 coverage/
 .pytest_cache/
+
+# OS / editor / agent local files
+.DS_Store
+.claude/
+
+# Build artifacts / backups
+*.tsbuildinfo
+*.bak*
+
+# Model weights & large archives (mount or download separately; never in git)
+*.pth
+*.pt
+*.pth.tar
+*.onnx
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.pdf
+
+# Local datasets / experiment bundles / vendored external repos (not services)
+/infer/
+/Human-Detection-ReID/
+/Yolo-for-Edge-Devices/
+/gender-finetuning/
+/osnet_ain_finetune/
+/reid-microservices/
+/reid_label_crops/
+/reid_tuning_package/
+/clipreid_eval_kit/
+/classification models/
+/triton_models/
+/docs/
+
+# Untracked model assets / experimental backbones under inference_engine
+src/inference_engine/src/assets/models/clipreid/
+src/inference_engine/src/assets/models/osnet_ain_ms/
+src/inference_engine/src/assets/models/osnet_ibn/
+src/inference_engine/src/models/clipreid/
+
+# Planning notes / handoffs / service docs (kept local — user excludes .md)
+*.md
