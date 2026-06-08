@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useDevice } from "@/hooks/use-devices";
 import { formatDateTime } from "@/lib/date-format";
+import { getDeviceDisplayLocation, getDeviceDisplayName } from "@/lib/device-labels";
 
 interface PageProps {
   params: Promise<{ deviceId: string }>;
@@ -36,23 +37,23 @@ export default function DeviceDetailPage({ params }: PageProps) {
             Could not load device {deviceId}: {error?.message ?? "Not found"}
           </p>
         ) : (
-          <Card>
+            <Card>
             <CardHeader>
               <CardTitle className="flex items-center justify-between">
-                <span className="text-base">{device.device_id}</span>
+                <span className="text-base">{getDeviceDisplayName(device)}</span>
                 <Badge variant={device.status === "online" ? "default" : "secondary"}>
                   {device.status || "unknown"}
                 </Badge>
               </CardTitle>
             </CardHeader>
             <CardContent className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 text-sm">
-              <Field label="Name" value={device.name || "—"} />
-              <Field label="Location" value={device.location || "—"} />
+              <Field label="Device ID" value={device.device_id} />
+              <Field label="Name" value={getDeviceDisplayName(device)} />
+              <Field label="Location" value={getDeviceDisplayLocation()} />
               <Field label="Sightings" value={device.sighting_count.toLocaleString()} />
               <Field label="Unique persons" value={device.unique_person_count.toLocaleString()} />
               <Field label="First seen" value={formatDateTime(device.first_seen_at)} />
               <Field label="Last seen" value={formatDateTime(device.last_seen_at)} />
-              <Field label="Last frame" value={formatDateTime(device.last_frame_at)} />
             </CardContent>
           </Card>
         )}

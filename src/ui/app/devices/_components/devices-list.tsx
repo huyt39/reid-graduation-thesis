@@ -5,7 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useDevices } from "@/hooks/use-devices";
-import { formatRelative } from "@/lib/date-format";
+import { getDeviceDisplayLocation, getDeviceDisplayName } from "@/lib/device-labels";
 
 export function DevicesList() {
   const { data, isLoading, error } = useDevices();
@@ -49,19 +49,15 @@ export function DevicesList() {
             <CardContent className="space-y-2 text-sm">
               <div className="flex justify-between">
                 <span className="text-muted-foreground">Name</span>
-                <span>{d.name || "—"}</span>
+                <span>{getDeviceDisplayName(d)}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-muted-foreground">Location</span>
-                <span>{d.location || "—"}</span>
+                <span>{getDeviceDisplayLocation()}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-muted-foreground">Sightings</span>
                 <span>{d.sighting_count.toLocaleString()}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Last frame</span>
-                <span>{formatRelative(d.last_frame_at)}</span>
               </div>
             </CardContent>
           </Card>
