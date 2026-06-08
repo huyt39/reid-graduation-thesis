@@ -4712,6 +4712,11 @@ def test_attached_occlusion_evidence_persists_under_person_without_canonical_upd
     assert "person_snapshot" not in calls
     assert "upsert_person" not in calls
     assert calls["assets"][1]["best_crop_key"] == "tracklets/occ-1/best.jpg"
+    frame_samples = calls["assets"][1]["evidence"]["frame_samples"]
+    assert frame_samples[0]["selected"] is False
+    assert frame_samples[0]["crop_key"] == "tracklets/occ-1/frames/10.jpg"
+    assert frame_samples[1]["selected"] is True
+    assert frame_samples[1]["crop_key"] == "tracklets/occ-1/frames/12.jpg"
 
 
 def test_process_tracklet_match_success_updates_state_and_persists(monkeypatch):

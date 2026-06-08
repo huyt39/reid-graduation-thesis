@@ -5845,9 +5845,17 @@ class WorkerPipeline:
                     buf.tobytes(),
                 )
 
+        context_preview_entries = sorted(
+            (entry for entry in entries if int(entry.frame_idx) not in selected_frame_idxs),
+            key=lambda entry: (-float(entry.v_score), float(entry.overlap_ratio), int(entry.frame_idx)),
+        )[:4]
+        frame_upload_idxs = selected_frame_idxs | {
+            int(entry.frame_idx) for entry in context_preview_entries
+        }
+
         frame_crop_keys: dict[int, str] = {}
         for entry in entries:
-            if int(entry.frame_idx) not in selected_frame_idxs:
+            if int(entry.frame_idx) not in frame_upload_idxs:
                 continue
             if entry.crop.size <= 0:
                 continue
@@ -6964,9 +6972,17 @@ class WorkerPipeline:
                 if tracklet.track_id in self.track_metadata:
                     self.track_metadata[tracklet.track_id]["snapshot_key"] = crop_key
 
+        context_preview_entries = sorted(
+            (entry for entry in entries if int(entry.frame_idx) not in selected_frame_idxs),
+            key=lambda entry: (-float(entry.v_score), float(entry.overlap_ratio), int(entry.frame_idx)),
+        )[:4]
+        frame_upload_idxs = selected_frame_idxs | {
+            int(entry.frame_idx) for entry in context_preview_entries
+        }
+
         frame_crop_keys: dict[int, str] = {}
         for entry in entries:
-            if entry.frame_idx not in selected_frame_idxs:
+            if int(entry.frame_idx) not in frame_upload_idxs:
                 continue
             if entry.crop.size <= 0:
                 continue
