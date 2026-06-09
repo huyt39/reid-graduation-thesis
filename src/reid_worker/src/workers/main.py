@@ -383,6 +383,11 @@ class WorkerPipeline:
         self.track_id_to_person_id: dict[int, int] = {}
         self.track_metadata: dict[int, dict] = {}
         self.track_last_seen_ns: dict[int, int] = {}
+        # Frame-index counterpart of track_last_seen_ns, used by the
+        # frame-clock lifecycle path so track staleness/co-active checks are
+        # deterministic under host CPU load. Always populated (cheap) so the
+        # feature flag can flip without warm-up.
+        self.track_last_seen_frame: dict[int, int] = {}
         self.person_last_observation: dict[int, dict] = {}
         self.current_track_metrics: dict[int, dict[str, float]] = {}
         self.track_identity_memory: dict[int, dict] = {}
@@ -415,29 +420,53 @@ class WorkerPipeline:
         self.matched_tracklets = 0
         self.worker_started_at = time.time()
 
-    def _cleanup_inactive_tracks(self, current_time_ns: int) -> None:
-        stale_after_ns = int(self.settings.tracklet_stale_seconds * 1e9)
-        stale_track_ids = {
-            track_id
-            for track_id, last_seen_ns in self.track_last_seen_ns.items()
-            if current_time_ns - last_seen_ns > stale_after_ns
-        }
+    def _cleanup_inactive_tracks(
+        self, current_time_ns: int, current_frame_idx: int | None = None
+    ) -> None:
+        use_frames = (
+            getattr(self.settings, "frame_clock_lifecycle_enabled", False)
+            and current_frame_idx is not None
+        )
+        if use_frames:
+            stale_after_frames = int(self.settings.tracklet_stale_frames)
+            stale_track_ids = {
+                track_id
+                for track_id, last_seen_frame in self.track_last_seen_frame.items()
+                if current_frame_idx - last_seen_frame > stale_after_frames
+            }
+        else:
+            stale_after_ns = int(self.settings.tracklet_stale_seconds * 1e9)
+            stale_track_ids = {
+                track_id
+                for track_id, last_seen_ns in self.track_last_seen_ns.items()
+                if current_time_ns - last_seen_ns > stale_after_ns
+            }
 
         for track_id in stale_track_ids:
             self.prev_bboxes.pop(track_id, None)
             self.track_id_to_person_id.pop(track_id, None)
             self.track_metadata.pop(track_id, None)
             self.track_last_seen_ns.pop(track_id, None)
+            self.track_last_seen_frame.pop(track_id, None)
             self.current_track_metrics.pop(track_id, None)
             self.track_forbidden_person_ids.pop(track_id, None)
             self.track_cooccurrence_counts.pop(track_id, None)
             getattr(self, "occlusion_candidate_track_ids", set()).discard(track_id)
             getattr(self, "processing_tracklet_ids", set()).discard(track_id)
-        stale_person_ids = {
-            person_id
-            for person_id, obs in self.person_last_observation.items()
-            if current_time_ns - int(obs["timestamp_ns"]) > stale_after_ns
-        }
+        if use_frames:
+            stale_after_frames = int(self.settings.tracklet_stale_frames)
+            stale_person_ids = {
+                person_id
+                for person_id, obs in self.person_last_observation.items()
+                if current_frame_idx - int(obs.get("frame_idx", -(10**9))) > stale_after_frames
+            }
+        else:
+            stale_after_ns = int(self.settings.tracklet_stale_seconds * 1e9)
+            stale_person_ids = {
+                person_id
+                for person_id, obs in self.person_last_observation.items()
+                if current_time_ns - int(obs["timestamp_ns"]) > stale_after_ns
+            }
         for person_id in stale_person_ids:
             self.person_last_observation.pop(person_id, None)
 
@@ -599,19 +628,30 @@ class WorkerPipeline:
         bbox_xyxy: list[float],
         current_time_ns: int,
         blocked_person_ids: set[int],
+        current_frame_idx: int | None = None,
     ) -> int | None:
         if not self.settings.recent_person_reuse_enabled:
             return None
 
         best_person_id = None
         best_score = -1.0
+        use_frames = (
+            getattr(self.settings, "frame_clock_lifecycle_enabled", False)
+            and current_frame_idx is not None
+        )
         max_gap_ns = int(self.settings.recent_person_reuse_seconds * 1e9)
+        max_gap_frames = int(getattr(self.settings, "recent_person_reuse_max_gap_frames", 75))
         for person_id, obs in self.person_last_observation.items():
             if person_id in blocked_person_ids:
                 continue
-            gap_ns = current_time_ns - int(obs["timestamp_ns"])
-            if gap_ns < 0 or gap_ns > max_gap_ns:
-                continue
+            if use_frames:
+                gap = current_frame_idx - int(obs.get("frame_idx", -(10**9)))
+                if gap < 0 or gap > max_gap_frames:
+                    continue
+            else:
+                gap_ns = current_time_ns - int(obs["timestamp_ns"])
+                if gap_ns < 0 or gap_ns > max_gap_ns:
+                    continue
 
             obs_bbox = obs["bbox_xyxy"]
             iou = self._bbox_iou(bbox_xyxy, obs_bbox)
@@ -1200,6 +1240,7 @@ class WorkerPipeline:
         current_person_id: int | None,
         current_time_ns: int,
         co_active_window_ns: int = int(0.6 * 1e9),
+        current_frame_idx: int | None = None,
     ) -> set[int]:
         """Person IDs currently bound to other live tracks.
 
@@ -1208,17 +1249,29 @@ class WorkerPipeline:
         a track fragments mid-life and the new track_id tries to merge into
         the still-active twin's identity.
         """
+        use_frames = (
+            getattr(self.settings, "frame_clock_lifecycle_enabled", False)
+            and current_frame_idx is not None
+        )
+        max_gap_frames = int(getattr(self.settings, "co_active_max_gap_frames", 18))
         co_active: set[int] = set()
         for other_track_id, person_id in self.track_id_to_person_id.items():
             if other_track_id == own_track_id:
                 continue
             if current_person_id is not None and person_id == current_person_id:
                 continue
-            last_seen_ns = self.track_last_seen_ns.get(other_track_id)
-            if last_seen_ns is None:
-                continue
-            if current_time_ns - last_seen_ns <= co_active_window_ns:
-                co_active.add(person_id)
+            if use_frames:
+                last_seen_frame = self.track_last_seen_frame.get(other_track_id)
+                if last_seen_frame is None:
+                    continue
+                if current_frame_idx - last_seen_frame <= max_gap_frames:
+                    co_active.add(person_id)
+            else:
+                last_seen_ns = self.track_last_seen_ns.get(other_track_id)
+                if last_seen_ns is None:
+                    continue
+                if current_time_ns - last_seen_ns <= co_active_window_ns:
+                    co_active.add(person_id)
         return co_active
 
     def _find_recent_incompatible_person_ids(
@@ -1226,18 +1279,29 @@ class WorkerPipeline:
         bbox_xyxy: list[float],
         current_time_ns: int,
         current_person_id: int | None,
+        current_frame_idx: int | None = None,
     ) -> set[int]:
         if not self.settings.recent_match_guard_enabled:
             return set()
 
         incompatible_person_ids: set[int] = set()
+        use_frames = (
+            getattr(self.settings, "frame_clock_lifecycle_enabled", False)
+            and current_frame_idx is not None
+        )
         max_gap_ns = int(self.settings.recent_match_guard_seconds * 1e9)
+        max_gap_frames = int(getattr(self.settings, "recent_match_guard_max_gap_frames", 120))
         for person_id, obs in self.person_last_observation.items():
             if current_person_id is not None and person_id == current_person_id:
                 continue
-            gap_ns = current_time_ns - int(obs["timestamp_ns"])
-            if gap_ns < 0 or gap_ns > max_gap_ns:
-                continue
+            if use_frames:
+                gap = current_frame_idx - int(obs.get("frame_idx", -(10**9)))
+                if gap < 0 or gap > max_gap_frames:
+                    continue
+            else:
+                gap_ns = current_time_ns - int(obs["timestamp_ns"])
+                if gap_ns < 0 or gap_ns > max_gap_ns:
+                    continue
 
             obs_bbox = obs["bbox_xyxy"]
             iou = self._bbox_iou(bbox_xyxy, obs_bbox)
@@ -2363,7 +2427,7 @@ class WorkerPipeline:
             timestamp_ns=timestamp_ns,
         )
         if len(track_results) == 0:
-            self._cleanup_inactive_tracks(current_time_ns)
+            self._cleanup_inactive_tracks(current_time_ns, int(frame_number))
             return
 
         visible_track_ids = {int(track[4]) for track in track_results}
@@ -2374,6 +2438,7 @@ class WorkerPipeline:
             bbox_xyxy = track[:4]
             track_id = int(track[4])
             self.track_last_seen_ns[track_id] = current_time_ns
+            self.track_last_seen_frame[track_id] = int(frame_number)
             v_edge = 0.5
             overlap_ratio = 0.0
             if det_v_edges:
@@ -2497,7 +2562,7 @@ class WorkerPipeline:
                     reason="short_stale_tracklet",
                 )
             ))
-        self._cleanup_inactive_tracks(current_time_ns)
+        self._cleanup_inactive_tracks(current_time_ns, int(frame_number))
 
         frame_reserved_person_ids = {
             pid
@@ -6348,6 +6413,7 @@ class WorkerPipeline:
                     tracklet.entries[-1].bbox_xyxy,
                     tracklet.entries[-1].timestamp_ns,
                     blocked_person_ids,
+                    current_frame_idx=int(tracklet.entries[-1].frame_idx),
                 )
             blocked_duplicate_person_ids = set()
             if tracklet.entries:
@@ -6407,6 +6473,9 @@ class WorkerPipeline:
                     tracklet.track_id,
                     current_person_id,
                     tracklet.entries[-1].timestamp_ns if tracklet.entries else 0,
+                    current_frame_idx=(
+                        int(tracklet.entries[-1].frame_idx) if tracklet.entries else None
+                    ),
                 )
             )
             static_artifact = self._should_suppress_new_identity(tracklet)
@@ -6477,6 +6546,7 @@ class WorkerPipeline:
                     tracklet.entries[-1].bbox_xyxy,
                     tracklet.entries[-1].timestamp_ns,
                     current_person_id,
+                    current_frame_idx=int(tracklet.entries[-1].frame_idx),
                 )
 
             # Register the new person's attributes in attribute_voter
