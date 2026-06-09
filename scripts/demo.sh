@@ -150,7 +150,7 @@ cmd_up() {
     cmd_reset
   fi
 
-  local app_services=(inference_engine query_service streaming worker_cam1 worker_cam2 gateway ui)
+  local app_services=(inference_engine query_service streaming raw_stream worker_cam1 worker_cam2 gateway ui)
   if [ -n "$build_flag" ]; then
     echo "Rebuilding app services..."
     if [ "$reset" = "true" ]; then

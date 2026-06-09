@@ -68,6 +68,18 @@ class Settings(BaseSettings):
     # the same video produce the same person set every run.
     tracklet_window_frames: int = 90
     tracklet_stale_frames: int = 150
+    # --- Frame-clock lifecycle (deterministic under host CPU load) ---
+    # When True, the worker's track/person lifecycle guards count elapsed
+    # FRAMES (frame_idx) instead of wall-clock nanoseconds, so the same video
+    # yields the same identities no matter how fast/slow the host processes
+    # messages (e.g. while the Live tab streams and steals CPU). The frame
+    # thresholds below mirror the wall-clock seconds at a 30fps source, so ON
+    # reproduces the wall-clock baseline at nominal speed while staying
+    # load-invariant. OFF = exact wall-clock baseline behaviour (instant revert).
+    frame_clock_lifecycle_enabled: bool = False
+    co_active_max_gap_frames: int = 18            # ~0.6s @ 30fps
+    recent_person_reuse_max_gap_frames: int = 75  # ~2.5s @ 30fps
+    recent_match_guard_max_gap_frames: int = 120  # ~4.0s @ 30fps
     tracklet_idle_flush_enabled: bool = True
     # Frame-index based continuity memory. This survives short wall-clock
     # stalls/backpressure, where active-track cleanup may remove the live

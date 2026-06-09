@@ -1,55 +1,43 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import { Pause, Play } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { useWebSocket, type FrameUpdate, type TrackedPerson } from "@/hooks/use-websocket";
-import {
-  getCachedLiveIdentities,
-  mergeRawWithProcessedIds,
-  updateLiveIdentityCache,
-  type LiveIdentityCacheEntry,
-} from "@/lib/match-bboxes";
+import { useWebSocket } from "@/hooks/use-websocket";
 import { DeviceSelector } from "./device-selector";
 import { ConnectionBadge } from "./connection-badge";
 import { LiveFeed } from "./live-feed";
 
 const WS_URL = process.env.NEXT_PUBLIC_STREAMING_WS || "ws://localhost:8765";
+// Raw video is served as MJPEG by the standalone raw_stream service (decoupled
+// from the ReID path) and rendered natively by the browser for smoothness.
+const RAW_STREAM_URL = process.env.NEXT_PUBLIC_RAW_STREAM_URL || "http://localhost:8770";
 
 // Cap simultaneously-rendered feeds so a misconfigured fleet can't melt the
 // browser. Multi-camera demo runs 2; raise if more cameras are wired up.
 const MAX_FEEDS = 4;
 
-interface FeedView {
-  deviceId: string;
-  frame: FrameUpdate | null;
-  usingRawFallback: boolean;
-  idLagFrames: number;
-}
-
 export function LiveView() {
   // null = show every camera side-by-side; a value = focus a single camera.
   const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
   const [isLiveActive, setIsLiveActive] = useState(true);
-  const identityCacheRef = useRef(new Map<string, LiveIdentityCacheEntry>());
   const subscribedDeviceIds = useMemo(
     () => (selectedDevice ? [selectedDevice] : []),
     [selectedDevice]
   );
 
+  // Processed stream is kept ONLY for the device list + cross-camera badge (it
+  // is low-rate and not the bottleneck). The raw video no longer flows through
+  // the WebSocket — it comes from the MJPEG raw_stream service.
   const processed = useWebSocket(`${WS_URL}/ws`, subscribedDeviceIds, {
     enabled: isLiveActive,
-    maxFps: 30,
-  });
-  const raw = useWebSocket(`${WS_URL}/ws/raw`, subscribedDeviceIds, {
-    enabled: isLiveActive,
-    maxFps: 30,
+    maxFps: 10,
   });
 
   const deviceIds = useMemo(
-    () => Array.from(new Set([...processed.deviceIds, ...raw.deviceIds])).sort(),
-    [processed.deviceIds, raw.deviceIds]
+    () => Array.from(new Set(processed.deviceIds)).sort(),
+    [processed.deviceIds]
   );
 
   // Cameras to render: the focused one, or all of them (capped).
@@ -58,75 +46,14 @@ export function LiveView() {
     return deviceIds.slice(0, MAX_FEEDS);
   }, [deviceIds, selectedDevice]);
 
-  // Build one hybrid frame (raw image + processed person_ids/attributes) per
-  // visible camera. Identity-cache keys are `device_id:track_id` (namespaced
-  // by the worker), so a single shared cache map is collision-free across
-  // cameras. See live-view single-stream notes — same logic, applied per device.
-  const { feeds, crossCameraIds } = useMemo(() => {
-    const now = Date.now();
-    const builtFeeds: FeedView[] = [];
+  // Cross-camera identities: a person_id seen on >= 2 devices (from the
+  // low-rate processed stream). Pure badge signal; no per-frame overlay.
+  const crossCameraIds = useMemo(() => {
     const devicesByPersonId = new Map<number, Set<string>>();
-
     for (const deviceId of visibleDeviceIds) {
-      const processedFrame = processed.framesByDevice[deviceId] ?? null;
-      const rawFrame = raw.framesByDevice[deviceId] ?? null;
-
-      if (processedFrame) {
-        updateLiveIdentityCache(
-          identityCacheRef.current,
-          processedFrame.tracked_persons,
-          processedFrame.frame_number,
-          now
-        );
-      }
-
-      // Prefer the raw edge stream for the displayed image (stays smooth even
-      // when the worker is CPU-bound); overlay processed IDs via IoU projection.
-      const baseFrame = rawFrame ?? processedFrame;
-      let hybridPersons: TrackedPerson[] = baseFrame?.tracked_persons ?? [];
-
-      if (rawFrame && processedFrame) {
-        const currentKeys = new Set(
-          processedFrame.tracked_persons
-            .map((person) => person.live_track_key ?? person.tracklet_id)
-            .filter((key): key is string => typeof key === "string")
-        );
-        const cachedPersons = getCachedLiveIdentities(
-          identityCacheRef.current,
-          rawFrame.frame_number,
-          now
-        ).filter((person) => {
-          const key = person.live_track_key ?? person.tracklet_id;
-          return !key || !currentKeys.has(key);
-        });
-        hybridPersons = mergeRawWithProcessedIds(
-          rawFrame.tracked_persons,
-          processedFrame.tracked_persons,
-          {
-            cachedPersons,
-            minIou: 0.35,
-            sourceSize: { width: processedFrame.image_width, height: processedFrame.image_height },
-            targetSize: { width: rawFrame.image_width, height: rawFrame.image_height },
-          }
-        );
-      }
-
-      const frame = baseFrame ? { ...baseFrame, tracked_persons: hybridPersons } : null;
-      builtFeeds.push({
-        deviceId,
-        frame,
-        usingRawFallback: !!rawFrame && !!processedFrame,
-        idLagFrames:
-          rawFrame && processedFrame
-            ? Math.max(0, rawFrame.frame_number - processedFrame.frame_number)
-            : 0,
-      });
-
-      // Track which cameras each processed person_id appears on, to badge
-      // cross-camera identities (the panel itself was removed — the Live tab is
-      // a plain monitoring view; identities live in Persons/Timeline).
-      const sourcePersons = processedFrame?.tracked_persons ?? hybridPersons;
-      for (const person of sourcePersons) {
+      const frame = processed.framesByDevice[deviceId];
+      if (!frame) continue;
+      for (const person of frame.tracked_persons) {
         if (person.person_id != null) {
           const set = devicesByPersonId.get(person.person_id) ?? new Set<string>();
           set.add(deviceId);
@@ -134,23 +61,12 @@ export function LiveView() {
         }
       }
     }
-
-    const xCamIds = new Set<number>();
+    const xCam = new Set<number>();
     for (const [personId, devices] of devicesByPersonId) {
-      if (devices.size >= 2) xCamIds.add(personId);
+      if (devices.size >= 2) xCam.add(personId);
     }
-
-    return { feeds: builtFeeds, crossCameraIds: xCamIds };
-  }, [visibleDeviceIds, processed.framesByDevice, raw.framesByDevice]);
-
-  const anyRawFallback = feeds.some((f) => f.usingRawFallback);
-  const maxIdLag = feeds.reduce((m, f) => Math.max(m, f.idLagFrames), 0);
-  const connectionState =
-    processed.connectionState === "connected" || raw.connectionState === "connected"
-      ? "connected"
-      : processed.connectionState === "connecting" || raw.connectionState === "connecting"
-        ? "connecting"
-        : "disconnected";
+    return xCam;
+  }, [visibleDeviceIds, processed.framesByDevice]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -178,7 +94,7 @@ export function LiveView() {
             </Badge>
           ) : null}
         </div>
-        <ConnectionBadge state={isLiveActive ? connectionState : "disconnected"} />
+        <ConnectionBadge state={isLiveActive ? processed.connectionState : "disconnected"} />
       </div>
 
       {!isLiveActive ? (
@@ -190,29 +106,27 @@ export function LiveView() {
         </div>
       ) : null}
 
-      {anyRawFallback ? (
-        <div className="flex items-center gap-2">
-          <Badge variant="secondary">Live • smooth raw</Badge>
-          <p className="text-sm text-muted-foreground">
-            Live video uses the raw edge stream for smoothness. Person IDs + attributes from the
-            worker resolve asynchronously
-            {maxIdLag > 0 ? ` (up to ${maxIdLag} frames behind)` : null}.
-          </p>
-        </div>
-      ) : null}
-
       <div
         className={
-          feeds.length > 1
+          visibleDeviceIds.length > 1
             ? "grid w-full gap-3 grid-cols-1 xl:grid-cols-2"
             : "flex w-full"
         }
       >
-        {feeds.length === 0 ? (
-          <LiveFeed frame={null} isLiveActive={isLiveActive} />
+        {visibleDeviceIds.length === 0 ? (
+          <LiveFeed deviceId={null} mjpegUrl={null} isLiveActive={isLiveActive} />
         ) : (
-          feeds.map((f) => (
-            <LiveFeed key={f.deviceId} frame={f.frame} isLiveActive={isLiveActive} />
+          visibleDeviceIds.map((deviceId) => (
+            <LiveFeed
+              key={deviceId}
+              deviceId={deviceId}
+              mjpegUrl={
+                isLiveActive
+                  ? `${RAW_STREAM_URL}/mjpeg?device_id=${encodeURIComponent(deviceId)}`
+                  : null
+              }
+              isLiveActive={isLiveActive}
+            />
           ))
         )}
       </div>

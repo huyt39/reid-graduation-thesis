@@ -50,7 +50,7 @@ services:
     build: ../edge
     env_file: ../edge/.env
     environment:
-      - EDGE_SOURCE_URL=/app/infer/device2.mp4
+      - EDGE_SOURCE_URL=/app/infer/device52.MOV
       - EDGE_DEVICE_ID=cam1
       - EDGE_REID_TOPIC=reid_input_cam1
     depends_on:
@@ -63,9 +63,9 @@ services:
   # ── Camera 2 — plays whatever video EDGE_SOURCE_URL points at (see infer/). ──
   edge_cam2:
     build: ../edge
-    env_file: ../edge/.env
+    env_file: ../edge/.env.example
     environment:
-      - EDGE_SOURCE_URL=/app/infer/device_1.mp4
+      - EDGE_SOURCE_URL=/app/infer/device51.MOV
       - EDGE_DEVICE_ID=cam2
       - EDGE_REID_TOPIC=reid_input_cam2
     depends_on:
@@ -74,6 +74,28 @@ services:
     volumes:
       - ../contracts:/app/src/contracts:ro
       - ../../infer:/app/infer:ro
+
+  # ── Standalone raw-video MJPEG server. Reads each video with its OWN capture
+  #    and serves smooth MJPEG directly to the UI, fully decoupled from the edge
+  #    ReID loop and Kafka (does NOT affect reid_input/worker). Keep
+  #    RAW_STREAM_SOURCES in sync with the edge EDGE_SOURCE_URL values above. ──
+  raw_stream:
+    build: ../raw_stream
+    environment:
+      - RAW_STREAM_SOURCES=cam1=/app/infer/device52.MOV,cam2=/app/infer/device51.MOV
+      - RAW_STREAM_FPS=10
+      - RAW_STREAM_JPEG_QUALITY=60
+      - RAW_STREAM_MAX_DIM=540
+      # Cap FFmpeg decoder threads (separate from cv2.setNumThreads) so one
+      # reader uses ~1 core instead of fanning across the host.
+      - OPENCV_FFMPEG_CAPTURE_OPTIONS=threads;1
+    # Hard CPU ceiling so the raw stream can never starve the ReID pipeline even
+    # while the Live tab is open. Combined with lazy readers (0 CPU when no
+    # client) this keeps ReID unaffected. Raise if smoother video is needed.
+    cpus: "1.5"
+    volumes:
+      - ../../infer:/app/infer:ro
+    ports: ["8770:8770"]
 
   # ── Worker for camera 1. Shares Qdrant gallery + Redis person-id sequence
   #    with worker_cam2 → same physical person across cameras = same person_id.
@@ -84,6 +106,12 @@ services:
       - WORKER_PERSON_ID_SEQ_KEY=reid:seq:person_id
       - WORKER_INPUT_TOPIC=reid_input_cam1
       - WORKER_CONSUMER_GROUP=reid_worker_cam1
+      # Frame-clock lifecycle: count elapsed FRAMES (not wall-clock) for track/
+      # person staleness + co-active/reuse/match guards → ReID result is
+      # invariant to host CPU load (e.g. Live tab streaming). A/B via host env:
+      #   FRAME_CLOCK=true scripts/demo.sh up --build --reset   (ON)
+      #   scripts/demo.sh up --build --reset                    (OFF = baseline)
+      - WORKER_FRAME_CLOCK_LIFECYCLE_ENABLED=${FRAME_CLOCK:-false}
     depends_on:
       kafka:
         condition: service_healthy
@@ -107,6 +135,8 @@ services:
       - WORKER_PERSON_ID_SEQ_KEY=reid:seq:person_id
       - WORKER_INPUT_TOPIC=reid_input_cam2
       - WORKER_CONSUMER_GROUP=reid_worker_cam2
+      # See worker_cam1 — frame-clock lifecycle A/B toggle (host env FRAME_CLOCK).
+      - WORKER_FRAME_CLOCK_LIFECYCLE_ENABLED=${FRAME_CLOCK:-false}
     depends_on:
       kafka:
         condition: service_healthy
@@ -193,5 +223,7 @@ services:
       # the in-cluster service name — the browser can't resolve "gateway" itself.
       - NEXT_PUBLIC_GATEWAY_URL=http://localhost:18080
       - NEXT_PUBLIC_STREAMING_WS=ws://localhost:8765
+      # Raw-video MJPEG server (host-exposed port); browser renders <img src=.../mjpeg>.
+      - NEXT_PUBLIC_RAW_STREAM_URL=http://localhost:8770
     depends_on: [gateway]
     ports: ["3000:3000"]
