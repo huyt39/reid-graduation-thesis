@@ -16,6 +16,7 @@ import {
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useHydrated } from "@/hooks/use-hydrated";
 import { Button } from "@/components/ui/button";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
@@ -48,6 +49,48 @@ const NAV_ITEMS: NavItem[] = [
 function getInitials(name: string | undefined) {
   if (!name) return "U";
   return name.substring(0, 2).toUpperCase();
+}
+
+function UserMenu({ username, role }: { username: string; role: string }) {
+  const hydrated = useHydrated();
+
+  const trigger = (
+    <>
+      <Avatar className="h-7 w-7">
+        <AvatarFallback className="bg-primary text-primary-foreground text-xs">
+          {getInitials(username)}
+        </AvatarFallback>
+      </Avatar>
+      <span className="text-sm font-medium hidden sm:inline">{username}</span>
+    </>
+  );
+
+  // During SSR and the first hydration render, render a plain button (no Radix
+  // useId) so server and client markup match. The interactive dropdown mounts
+  // after hydration. Same classes/content as the trigger => no layout shift.
+  if (!hydrated) {
+    return (
+      <Button variant="ghost" className="flex items-center gap-2 h-9 px-2">
+        {trigger}
+      </Button>
+    );
+  }
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="ghost" className="flex items-center gap-2 h-9 px-2">
+          {trigger}
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-48">
+        <DropdownMenuLabel className="flex flex-col gap-0.5">
+          <span className="text-sm font-medium">{username}</span>
+          <span className="text-xs text-muted-foreground capitalize">{role}</span>
+        </DropdownMenuLabel>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
 }
 
 export function DashboardLayout({ children }: DashboardLayoutProps) {
@@ -165,24 +208,7 @@ export function DashboardLayout({ children }: DashboardLayoutProps) {
             </h1>
           </div>
 
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="ghost" className="flex items-center gap-2 h-9 px-2">
-                <Avatar className="h-7 w-7">
-                  <AvatarFallback className="bg-primary text-primary-foreground text-xs">
-                    {getInitials(user.username)}
-                  </AvatarFallback>
-                </Avatar>
-                <span className="text-sm font-medium hidden sm:inline">{user.username}</span>
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-48">
-              <DropdownMenuLabel className="flex flex-col gap-0.5">
-                <span className="text-sm font-medium">{user.username}</span>
-                <span className="text-xs text-muted-foreground capitalize">{user.role}</span>
-              </DropdownMenuLabel>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <UserMenu username={user.username} role={user.role} />
         </header>
 
         <main className="flex-1 overflow-y-auto bg-muted/30">
