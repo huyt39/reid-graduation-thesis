@@ -1,11 +1,11 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Pause, Play } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useWebSocket } from "@/hooks/use-websocket";
-import { DeviceSelector } from "./device-selector";
+import { DeviceSelector, ALL_CAMERAS } from "./device-selector";
 import { ConnectionBadge } from "./connection-badge";
 import { LiveFeed } from "./live-feed";
 
@@ -27,18 +27,49 @@ export function LiveView() {
     [selectedDevice]
   );
 
-  // Processed stream is kept ONLY for the device list + cross-camera badge (it
-  // is low-rate and not the bottleneck). The raw video no longer flows through
-  // the WebSocket — it comes from the MJPEG raw_stream service.
+  // Processed stream is kept ONLY for the cross-camera badge (it is low-rate and
+  // not the bottleneck). The raw video no longer flows through the WebSocket —
+  // it comes from the MJPEG raw_stream service.
   const processed = useWebSocket(`${WS_URL}/ws`, subscribedDeviceIds, {
     enabled: isLiveActive,
     maxFps: 10,
   });
 
-  const deviceIds = useMemo(
-    () => Array.from(new Set(processed.deviceIds)).sort(),
-    [processed.deviceIds]
-  );
+  // The live feed device list comes from raw_stream's own /devices endpoint, NOT
+  // the processed WebSocket stream. raw_stream opens its own VideoCapture per
+  // device and is fully decoupled from the ReID pipeline, so live video shows
+  // even when the reid_worker is down. Poll periodically to pick up new cameras.
+  const [rawDeviceIds, setRawDeviceIds] = useState<string[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    const fetchDevices = async () => {
+      try {
+        const res = await fetch(`${RAW_STREAM_URL}/devices`);
+        if (!res.ok) return;
+        const data = (await res.json()) as { devices?: unknown };
+        if (cancelled || !Array.isArray(data.devices)) return;
+        const ids = data.devices.filter((d): d is string => typeof d === "string");
+        setRawDeviceIds((prev) =>
+          prev.length === ids.length && prev.every((id, i) => id === ids[i]) ? prev : ids
+        );
+      } catch {
+        // raw_stream unreachable — keep the last known list (empty → "Waiting…").
+      }
+    };
+    void fetchDevices();
+    const interval = setInterval(() => void fetchDevices(), 8000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
+  // Prefer raw_stream's device list; fall back to the processed stream only if
+  // raw_stream is unreachable (preserves the old behavior in that case).
+  const deviceIds = useMemo(() => {
+    const source = rawDeviceIds.length > 0 ? rawDeviceIds : processed.deviceIds;
+    return Array.from(new Set(source)).sort();
+  }, [rawDeviceIds, processed.deviceIds]);
 
   // Cameras to render: the focused one, or all of them (capped).
   const visibleDeviceIds = useMemo(() => {
@@ -75,7 +106,7 @@ export function LiveView() {
           <DeviceSelector
             deviceIds={deviceIds}
             selected={selectedDevice}
-            onChange={setSelectedDevice}
+            onChange={(id) => setSelectedDevice(id === ALL_CAMERAS ? null : id)}
           />
           <Button
             type="button"
@@ -97,15 +128,6 @@ export function LiveView() {
         <ConnectionBadge state={isLiveActive ? processed.connectionState : "disconnected"} />
       </div>
 
-      {!isLiveActive ? (
-        <div className="flex items-center gap-2">
-          <Badge variant="outline">Paused</Badge>
-          <p className="text-sm text-muted-foreground">
-            Live stream is paused. Press Start live to resume.
-          </p>
-        </div>
-      ) : null}
-
       <div
         className={
           visibleDeviceIds.length > 1
@@ -120,11 +142,7 @@ export function LiveView() {
             <LiveFeed
               key={deviceId}
               deviceId={deviceId}
-              mjpegUrl={
-                isLiveActive
-                  ? `${RAW_STREAM_URL}/mjpeg?device_id=${encodeURIComponent(deviceId)}`
-                  : null
-              }
+              mjpegUrl={`${RAW_STREAM_URL}/mjpeg?device_id=${encodeURIComponent(deviceId)}`}
               isLiveActive={isLiveActive}
             />
           ))
