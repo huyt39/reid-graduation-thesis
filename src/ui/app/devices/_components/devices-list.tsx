@@ -2,7 +2,6 @@
 
 import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useDevices } from "@/hooks/use-devices";
 import { getDeviceDisplayLocation, getDeviceDisplayName } from "@/lib/device-labels";
@@ -39,11 +38,8 @@ export function DevicesList() {
         <Link key={d.device_id} href={`/devices/${d.device_id}`}>
           <Card className="hover:border-primary/40 transition-colors h-full">
             <CardHeader className="pb-3">
-              <CardTitle className="flex items-center justify-between text-base">
+              <CardTitle className="text-base">
                 <span className="text-sm">{d.device_id}</span>
-                <Badge variant={d.status === "online" ? "default" : "secondary"}>
-                  {d.status || "unknown"}
-                </Badge>
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-2 text-sm">
