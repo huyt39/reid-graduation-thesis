@@ -30,6 +30,12 @@ _state_lock = threading.Lock()
 _refcount: dict[str, int] = {d: 0 for d in _sources}
 _stop: dict[str, threading.Event] = {}
 _threads: dict[str, threading.Thread] = {}
+# Replay support: _ended marks a device whose source reached EOF (the reader is
+# holding on the last frame). The UI polls /status to surface a Replay button,
+# then POSTs /replay to set the device's event, which kicks the reader out of
+# its EOF hold and re-opens the capture from frame 0 (no auto-loop).
+_ended: dict[str, bool] = {d: False for d in _sources}
+_replay: dict[str, threading.Event] = {}
 
 
 def _downscale(frame):
@@ -44,11 +50,19 @@ def _downscale(frame):
     return cv2.resize(frame, (max(1, int(w * s)), max(1, int(h * s))), interpolation=cv2.INTER_AREA)
 
 
-def _reader(device_id: str, source: str, stop_event: threading.Event) -> None:
+def _set_ended(device_id: str, value: bool) -> None:
+    with _state_lock:
+        _ended[device_id] = value
+
+
+def _reader(device_id: str, source: str, stop_event: threading.Event,
+            replay_event: threading.Event) -> None:
     """Own VideoCapture, realtime-paced, plays the source ONCE then freezes on
     the last frame (no loop — matches the edge, which plays each video once).
-    Runs only while there are clients; exits promptly when stop_event is set
-    (last client left)."""
+    On EOF it marks the device ended and holds until either the client leaves
+    (stop_event) or the UI requests a replay (replay_event), which re-opens the
+    capture from frame 0. Runs only while there are clients; exits promptly when
+    stop_event is set (last client left)."""
     quality = int(settings.jpeg_quality)
     src = int(source) if source.isdigit() else source
     log.info("raw_stream.reader_started", device_id=device_id)
@@ -58,6 +72,7 @@ def _reader(device_id: str, source: str, stop_event: threading.Event) -> None:
             log.warning("raw_stream.open_failed", device_id=device_id, source=source)
             time.sleep(0.5)
             continue
+        _set_ended(device_id, False)  # fresh capture open → playing from frame 0
         src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) or 30.0
         send_fps = min(float(settings.fps), src_fps)
         send_interval = 1.0 / send_fps if send_fps > 0 else 1.0 / 10.0
@@ -88,9 +103,16 @@ def _reader(device_id: str, source: str, stop_event: threading.Event) -> None:
         # Reached a clean EOF (inner loop broke on grab failure): freeze on the
         # last frame instead of re-opening/looping. _latest still holds the last
         # encoded frame, so the MJPEG stream shows a static final image until the
-        # client disconnects (stop_event), matching the edge's play-once flow.
+        # client disconnects (stop_event) or requests a replay, matching the
+        # edge's play-once flow.
+        _set_ended(device_id, True)
         log.info("raw_stream.reader_eof_hold", device_id=device_id)
         while not stop_event.is_set():
+            if replay_event.is_set():
+                replay_event.clear()
+                _set_ended(device_id, False)
+                log.info("raw_stream.reader_replay", device_id=device_id)
+                break  # re-open the capture from frame 0 on the next outer loop
             time.sleep(0.1)
     log.info("raw_stream.reader_stopped", device_id=device_id)
 
@@ -101,8 +123,12 @@ def _acquire(device_id: str) -> None:
         t = _threads.get(device_id)
         if t is None or not t.is_alive():
             ev = threading.Event()
+            ev_replay = threading.Event()
             _stop[device_id] = ev
-            t = threading.Thread(target=_reader, args=(device_id, _sources[device_id], ev),
+            _replay[device_id] = ev_replay
+            _ended[device_id] = False
+            t = threading.Thread(target=_reader,
+                                 args=(device_id, _sources[device_id], ev, ev_replay),
                                  name=f"raw-{device_id}", daemon=True)
             _threads[device_id] = t
             t.start()
@@ -116,6 +142,8 @@ def _release(device_id: str) -> None:
             if ev is not None:
                 ev.set()
             _threads[device_id] = None
+            _replay.pop(device_id, None)
+            _ended[device_id] = False
             with _locks[device_id]:
                 _latest.pop(device_id, None)
 
@@ -161,6 +189,29 @@ def readyz() -> dict:
 @app.get("/devices")
 def devices() -> dict:
     return {"devices": list(_sources.keys())}
+
+
+@app.get("/status")
+def status(device_id: str = Query(...)) -> dict:
+    if device_id not in _sources:
+        raise HTTPException(status_code=404, detail=f"unknown device_id {device_id}")
+    with _state_lock:
+        ended = _ended.get(device_id, False)
+    return {"device_id": device_id, "ended": ended}
+
+
+@app.post("/replay")
+def replay(device_id: str = Query(...)) -> dict:
+    if device_id not in _sources:
+        raise HTTPException(status_code=404, detail=f"unknown device_id {device_id}")
+    # Only meaningful while a reader thread is running (a client is connected);
+    # if no reader is active there is nothing holding on EOF to kick.
+    with _state_lock:
+        ev = _replay.get(device_id)
+        if ev is not None:
+            ev.set()
+            _ended[device_id] = False
+    return {"ok": ev is not None}
 
 
 @app.get("/mjpeg")

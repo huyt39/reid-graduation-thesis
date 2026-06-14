@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { RotateCcw } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 
 // The Live tab is a plain monitoring view. The raw video is served as MJPEG by
@@ -15,16 +17,23 @@ import { Card } from "@/components/ui/card";
 // to close the MJPEG connection — which lets the lazy backend reader idle.
 // raw_stream sends CORS `*`, so the <img crossOrigin="anonymous"> -> canvas
 // readback is not tainted and toDataURL() works.
+//
+// Replay: raw_stream plays each source once then freezes on the last frame (no
+// loop). We poll /status to learn when the video has ended and show a Replay
+// button overlaid on the frozen frame; clicking it POSTs /replay, which kicks
+// the backend reader back to frame 0 over the already-open MJPEG connection.
 interface Props {
   deviceId: string | null;
   mjpegUrl: string | null;
+  rawStreamUrl: string | null;
   isLiveActive: boolean;
 }
 
-export function LiveFeed({ deviceId, mjpegUrl, isLiveActive }: Props) {
+export function LiveFeed({ deviceId, mjpegUrl, rawStreamUrl, isLiveActive }: Props) {
   const imgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [frozen, setFrozen] = useState<string | null>(null);
+  const [ended, setEnded] = useState(false);
   // The live <img> stays mounted while streaming; we only unmount it AFTER a
   // pause snapshot has been captured, so the ref is still valid at capture time.
   const [streaming, setStreaming] = useState(isLiveActive);
@@ -32,6 +41,7 @@ export function LiveFeed({ deviceId, mjpegUrl, isLiveActive }: Props) {
   useEffect(() => {
     if (isLiveActive) {
       setFrozen(null);
+      setEnded(false);
       setStreaming(true);
       return;
     }
@@ -54,6 +64,43 @@ export function LiveFeed({ deviceId, mjpegUrl, isLiveActive }: Props) {
     }
     setStreaming(false);
   }, [isLiveActive]);
+
+  // Poll the backend for EOF only while actively streaming this device; raw_stream
+  // sets `ended` when the source freezes on its last frame. Stop polling on pause.
+  useEffect(() => {
+    if (!isLiveActive || !streaming || !deviceId || !rawStreamUrl) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch(
+          `${rawStreamUrl}/status?device_id=${encodeURIComponent(deviceId)}`
+        );
+        if (!res.ok) return;
+        const data = (await res.json()) as { ended?: unknown };
+        if (!cancelled) setEnded(data.ended === true);
+      } catch {
+        // raw_stream unreachable — keep the last known state.
+      }
+    };
+    void poll();
+    const interval = setInterval(() => void poll(), 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [isLiveActive, streaming, deviceId, rawStreamUrl]);
+
+  const handleReplay = async () => {
+    setEnded(false); // optimistic — the open MJPEG connection resumes on its own
+    if (!deviceId || !rawStreamUrl) return;
+    try {
+      await fetch(`${rawStreamUrl}/replay?device_id=${encodeURIComponent(deviceId)}`, {
+        method: "POST",
+      });
+    } catch {
+      // Network error — leave it; the next status poll will re-show Replay.
+    }
+  };
 
   if (!mjpegUrl) {
     return (
@@ -89,6 +136,16 @@ export function LiveFeed({ deviceId, mjpegUrl, isLiveActive }: Props) {
           <p className="text-muted-foreground text-sm">Paused</p>
         </div>
       )}
+
+      {ended && isLiveActive ? (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/50">
+          <p className="text-sm text-white/80">Video ended</p>
+          <Button type="button" onClick={handleReplay}>
+            <RotateCcw className="h-4 w-4" />
+            Replay
+          </Button>
+        </div>
+      ) : null}
 
       {!isLiveActive ? (
         <div className="absolute top-2 right-2">

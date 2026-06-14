@@ -136,13 +136,14 @@ export function LiveView() {
         }
       >
         {visibleDeviceIds.length === 0 ? (
-          <LiveFeed deviceId={null} mjpegUrl={null} isLiveActive={isLiveActive} />
+          <LiveFeed deviceId={null} mjpegUrl={null} rawStreamUrl={null} isLiveActive={isLiveActive} />
         ) : (
           visibleDeviceIds.map((deviceId) => (
             <LiveFeed
               key={deviceId}
               deviceId={deviceId}
               mjpegUrl={`${RAW_STREAM_URL}/mjpeg?device_id=${encodeURIComponent(deviceId)}`}
+              rawStreamUrl={RAW_STREAM_URL}
               isLiveActive={isLiveActive}
             />
           ))
