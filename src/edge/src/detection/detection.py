@@ -13,9 +13,7 @@ class DetectionModel:
         self.conf_threshold = conf_threshold
         self.imgsz = imgsz
         self.verbose = verbose
-        # Warmup: shift YOLO's first-call JIT/graph-compile cost out of the
-        # user-facing frame loop. Without this, the first ~6 frames each
-        # take ~10-30s on Mac CPU before steady-state ~3 fps kicks in.
+        
         dummy = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
         for _ in range(3):
             self.model(dummy, verbose=False, conf=conf_threshold, imgsz=imgsz, classes=[0])

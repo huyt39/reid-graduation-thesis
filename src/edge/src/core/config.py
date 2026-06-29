@@ -37,10 +37,6 @@ class Settings(BaseSettings):
     always_send_min_area_ratio: float = 0.0075
     always_send_max_overlap_ratio: float = 0.35
     always_send_min_cutoff_score: float = 0.6
-    # Hard-drop detections whose bbox is overlapped by another bbox above this
-    # ratio. At ≥ 0.5 the crop typically contains two people, which produces
-    # blended embeddings that contaminate downstream ReID identities. Set
-    # high (e.g. 0.99) to disable.
     hard_drop_overlap_ratio: float = 0.5
     poll_interval_s: float = 0.01
     log_every_n_processed_frames: int = 100
