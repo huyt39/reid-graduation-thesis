@@ -2,10 +2,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Standalone raw-video MJPEG server. Fully independent of the ReID path:
-    it opens its OWN VideoCapture per device and serves MJPET over HTTP, so the
-    live UI video is smooth regardless of detection/worker CPU. It does NOT touch
-    Kafka, the edge ReID loop or the worker."""
 
     model_config = SettingsConfigDict(env_prefix="RAW_STREAM_")
 
@@ -13,7 +9,6 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8770
 
-    # "cam1=/app/infer/vid61.MOV,cam2=/app/infer/vid62.MOV"
     sources: str = ""
 
     fps: float = 10.0

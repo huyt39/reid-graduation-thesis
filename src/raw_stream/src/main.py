@@ -11,10 +11,6 @@ from fastapi.responses import StreamingResponse
 
 from src.config import settings
 
-# Cap OpenCV/FFmpeg internal threading so each decode loop uses ~1 core instead
-# of fanning out across the host (a reader was observed at ~167% CPU). Combined
-# with lazy readers (below) this keeps the raw stream from starving the ReID
-# pipeline on a CPU-bound host.
 cv2.setNumThreads(1)
 
 log = structlog.get_logger()
@@ -23,17 +19,12 @@ _sources = settings.source_map()
 _latest: dict[str, bytes] = {}
 _locks: dict[str, threading.Lock] = {d: threading.Lock() for d in _sources}
 
-# Lazy reader lifecycle: a device's decode loop runs ONLY while >=1 MJPEG client
-# is connected, so when nobody is watching the live tab (e.g. during a ReID
-# measurement run) this service uses ~0 CPU and does not perturb ReID.
+
 _state_lock = threading.Lock()
 _refcount: dict[str, int] = {d: 0 for d in _sources}
 _stop: dict[str, threading.Event] = {}
 _threads: dict[str, threading.Thread] = {}
-# Replay support: _ended marks a device whose source reached EOF (the reader is
-# holding on the last frame). The UI polls /status to surface a Replay button,
-# then POSTs /replay to set the device's event, which kicks the reader out of
-# its EOF hold and re-opens the capture from frame 0 (no auto-loop).
+
 _ended: dict[str, bool] = {d: False for d in _sources}
 _replay: dict[str, threading.Event] = {}
 
@@ -57,12 +48,7 @@ def _set_ended(device_id: str, value: bool) -> None:
 
 def _reader(device_id: str, source: str, stop_event: threading.Event,
             replay_event: threading.Event) -> None:
-    """Own VideoCapture, realtime-paced, plays the source ONCE then freezes on
-    the last frame (no loop — matches the edge, which plays each video once).
-    On EOF it marks the device ended and holds until either the client leaves
-    (stop_event) or the UI requests a replay (replay_event), which re-opens the
-    capture from frame 0. Runs only while there are clients; exits promptly when
-    stop_event is set (last client left)."""
+
     quality = int(settings.jpeg_quality)
     src = int(source) if source.isdigit() else source
     log.info("raw_stream.reader_started", device_id=device_id)
@@ -72,7 +58,7 @@ def _reader(device_id: str, source: str, stop_event: threading.Event,
             log.warning("raw_stream.open_failed", device_id=device_id, source=source)
             time.sleep(0.5)
             continue
-        _set_ended(device_id, False)  # fresh capture open → playing from frame 0
+        _set_ended(device_id, False)
         src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) or 30.0
         send_fps = min(float(settings.fps), src_fps)
         send_interval = 1.0 / send_fps if send_fps > 0 else 1.0 / 10.0
@@ -81,12 +67,12 @@ def _reader(device_id: str, source: str, stop_event: threading.Event,
         last_send_vt = -1.0
         while not stop_event.is_set():
             if not cap.grab():
-                break  # end of video — stop advancing, hold the last frame (no loop)
+                break
             fidx += 1
             video_t = fidx / src_fps
             real_t = time.perf_counter() - start
             if video_t > real_t:
-                time.sleep(min(video_t - real_t, 0.1))  # cap sleep so stop is checked promptly
+                time.sleep(min(video_t - real_t, 0.1))
             if video_t - last_send_vt < send_interval:
                 continue
             last_send_vt = video_t
@@ -100,11 +86,7 @@ def _reader(device_id: str, source: str, stop_event: threading.Event,
         cap.release()
         if stop_event.is_set():
             break
-        # Reached a clean EOF (inner loop broke on grab failure): freeze on the
-        # last frame instead of re-opening/looping. _latest still holds the last
-        # encoded frame, so the MJPEG stream shows a static final image until the
-        # client disconnects (stop_event) or requests a replay, matching the
-        # edge's play-once flow.
+
         _set_ended(device_id, True)
         log.info("raw_stream.reader_eof_hold", device_id=device_id)
         while not stop_event.is_set():
@@ -204,8 +186,7 @@ def status(device_id: str = Query(...)) -> dict:
 def replay(device_id: str = Query(...)) -> dict:
     if device_id not in _sources:
         raise HTTPException(status_code=404, detail=f"unknown device_id {device_id}")
-    # Only meaningful while a reader thread is running (a client is connected);
-    # if no reader is active there is nothing holding on EOF to kick.
+
     with _state_lock:
         ev = _replay.get(device_id)
         if ev is not None:
