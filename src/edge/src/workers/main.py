@@ -285,9 +285,7 @@ class EdgePipeline:
                 ):
                     log.info("edge_frame_read", frame_idx=frame_idx)
 
-                # Decouple preview-rate from ReID-rate: skipped detection
-                # frames can still publish to edge_preview, while reid_input
-                # only receives frames carrying usable detections.
+                # publish messages for preview and usable detections for reid input 
                 skip_detection = (
                     not self.settings.demo_mode
                     and (

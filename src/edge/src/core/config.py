@@ -38,7 +38,6 @@ class Settings(BaseSettings):
     always_send_max_overlap_ratio: float = 0.35
     always_send_min_cutoff_score: float = 0.6
     hard_drop_overlap_ratio: float = 0.5
-    poll_interval_s: float = 0.01
     log_every_n_processed_frames: int = 100
     log_every_n_frames: int = 30
     model_config = SettingsConfigDict(
