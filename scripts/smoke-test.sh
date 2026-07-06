@@ -4,8 +4,7 @@
 # Runs a fresh demo replay and verifies that:
 #   1. Edge processes the bundled video to completion
 #   2. The worker creates a plausible number of persons (5-9 for vid3.mp4)
-#   3. Triton served > 50 OSNet inferences (proves the inference path works)
-#   4. Streaming exposes a usable WebSocket
+#   3. Streaming exposes a usable WebSocket
 #
 # Exit code 0 on PASS, 1 on FAIL. Prints a short summary regardless.
 
@@ -53,31 +52,7 @@ else
   record_fail "persons=$PERSONS (expected 5..9 for vid3.mp4; tune .env if drift)"
 fi
 
-print_header "Step 4: checking Triton inference count"
-OSNET_COUNT=$(curl -s http://localhost:8013/metrics 2>/dev/null \
-  | awk -F'[ {}]' '/^nv_inference_count\{model="osnet"/ {print $NF}' | head -1)
-if [[ "$OSNET_COUNT" =~ ^[0-9]+$ ]] && [ "$OSNET_COUNT" -gt 50 ]; then
-  record_pass "Triton served $OSNET_COUNT OSNet inferences"
-else
-  record_fail "Triton OSNet inference count=$OSNET_COUNT (expected > 50)"
-fi
-
-print_header "Step 5: checking Triton batching efficiency"
-OSNET_EXEC=$(curl -s http://localhost:8013/metrics 2>/dev/null \
-  | awk -F'[ {}]' '/^nv_inference_exec_count\{model="osnet"/ {print $NF}' | head -1)
-if [[ "$OSNET_EXEC" =~ ^[0-9]+$ ]] && [ "$OSNET_EXEC" -gt 0 ]; then
-  BATCH_RATIO=$(awk "BEGIN { printf \"%.2f\", $OSNET_COUNT / $OSNET_EXEC }")
-  AT_LEAST_TWO=$(awk "BEGIN { print ($OSNET_COUNT / $OSNET_EXEC >= 2.0) ? 1 : 0 }")
-  if [ "$AT_LEAST_TWO" -eq 1 ]; then
-    record_pass "Triton avg batch size = ${BATCH_RATIO}x (>= 2x; dynamic batching working)"
-  else
-    record_fail "Triton avg batch size = ${BATCH_RATIO}x (< 2x; not batching effectively)"
-  fi
-else
-  record_fail "Triton exec count missing or zero"
-fi
-
-print_header "Step 6: streaming readyz check"
+print_header "Step 4: streaming readyz check"
 if curl -fsS http://localhost:8765/readyz >/dev/null 2>&1; then
   record_pass "streaming /readyz returned 200"
 else

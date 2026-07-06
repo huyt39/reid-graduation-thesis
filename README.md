@@ -1,2 +1,1 @@
-# reid-production
-Production-oriented skeleton for ReID microservices.
+Re-ID project for my graduation thesis, semester 20252

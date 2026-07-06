@@ -45,12 +45,20 @@ services:
       MINIO_ROOT_PASSWORD: minio123
     ports: ["9002:9000", "9003:9001"]
 
-  # ── Camera 1 — plays whatever video EDGE_SOURCE_URL points at (see infer/). ──
+  #  Camera 1 — plays whatever video EDGE_SOURCE_URL points at (see infer/).
   edge_cam1:
     build: ../edge
     env_file: ../edge/.env
+    # Per-camera CPU budget. Without a cap each edge's OpenMP/BLAS pool fans out
+    # across every host core, so N concurrent cameras oversubscribe and thrash
+    # (measured: 2 uncapped cameras = ~8 FPS each vs ~12.5 FPS each when capped
+    # to 2 cores). OMP_NUM_THREADS is aligned to the cap so the thread pool does
+    # not spawn more workers than the cgroup allows. 2 cores ≈ 12 FPS @imgsz=192,
+    # comfortably above the realtime target; raise per host core budget.
+    cpus: "2"
     environment:
-      - EDGE_SOURCE_URL=/app/infer/device52.MOV
+      - OMP_NUM_THREADS=2
+      - EDGE_SOURCE_URL=/app/infer/vid61.MOV
       - EDGE_DEVICE_ID=cam1
       - EDGE_REID_TOPIC=reid_input_cam1
     depends_on:
@@ -60,12 +68,15 @@ services:
       - ../contracts:/app/src/contracts:ro
       - ../../infer:/app/infer:ro
 
-  # ── Camera 2 — plays whatever video EDGE_SOURCE_URL points at (see infer/). ──
+  #  Camera 2
   edge_cam2:
     build: ../edge
     env_file: ../edge/.env.example
+    # Per-camera CPU budget
+    cpus: "2"
     environment:
-      - EDGE_SOURCE_URL=/app/infer/device51.MOV
+      - OMP_NUM_THREADS=2
+      - EDGE_SOURCE_URL=/app/infer/vid62.MOV
       - EDGE_DEVICE_ID=cam2
       - EDGE_REID_TOPIC=reid_input_cam2
     depends_on:
@@ -75,14 +86,11 @@ services:
       - ../contracts:/app/src/contracts:ro
       - ../../infer:/app/infer:ro
 
-  # ── Standalone raw-video MJPEG server. Reads each video with its OWN capture
-  #    and serves smooth MJPEG directly to the UI, fully decoupled from the edge
-  #    ReID loop and Kafka (does NOT affect reid_input/worker). Keep
-  #    RAW_STREAM_SOURCES in sync with the edge EDGE_SOURCE_URL values above. ──
+  #  Standalone raw-video MJPEG server. Reads each video with its OWN capture
   raw_stream:
     build: ../raw_stream
     environment:
-      - RAW_STREAM_SOURCES=cam1=/app/infer/device52.MOV,cam2=/app/infer/device51.MOV
+      - RAW_STREAM_SOURCES=cam1=/app/infer/vid61.MOV,cam2=/app/infer/vid62.MOV
       - RAW_STREAM_FPS=10
       - RAW_STREAM_JPEG_QUALITY=60
       - RAW_STREAM_MAX_DIM=540
@@ -97,7 +105,7 @@ services:
       - ../../infer:/app/infer:ro
     ports: ["8770:8770"]
 
-  # ── Worker for camera 1. Shares Qdrant gallery + Redis person-id sequence
+  #  Worker for camera 1. Shares Qdrant gallery + Redis person-id sequence
   #    with worker_cam2 → same physical person across cameras = same person_id.
   worker_cam1:
     build: ../reid_worker
@@ -106,11 +114,7 @@ services:
       - WORKER_PERSON_ID_SEQ_KEY=reid:seq:person_id
       - WORKER_INPUT_TOPIC=reid_input_cam1
       - WORKER_CONSUMER_GROUP=reid_worker_cam1
-      # Frame-clock lifecycle: count elapsed FRAMES (not wall-clock) for track/
-      # person staleness + co-active/reuse/match guards → ReID result is
-      # invariant to host CPU load (e.g. Live tab streaming). A/B via host env:
-      #   FRAME_CLOCK=true scripts/demo.sh up --build --reset   (ON)
-      #   scripts/demo.sh up --build --reset                    (OFF = baseline)
+      - WORKER_MODEL_SERVICE_URL=${WORKER_MODEL_SERVICE_URL:-http://inference_engine:8000}
       - WORKER_FRAME_CLOCK_LIFECYCLE_ENABLED=${FRAME_CLOCK:-false}
     depends_on:
       kafka:
@@ -135,6 +139,8 @@ services:
       - WORKER_PERSON_ID_SEQ_KEY=reid:seq:person_id
       - WORKER_INPUT_TOPIC=reid_input_cam2
       - WORKER_CONSUMER_GROUP=reid_worker_cam2
+      # See worker_cam1 — overridable for native MPS demo (host.docker.internal).
+      - WORKER_MODEL_SERVICE_URL=${WORKER_MODEL_SERVICE_URL:-http://inference_engine:8000}
       # See worker_cam1 — frame-clock lifecycle A/B toggle (host env FRAME_CLOCK).
       - WORKER_FRAME_CLOCK_LIFECYCLE_ENABLED=${FRAME_CLOCK:-false}
     depends_on:
@@ -153,18 +159,6 @@ services:
     volumes:
       - ../contracts:/app/src/contracts:ro
 
-  triton:
-    image: nvcr.io/nvidia/tritonserver:24.04-py3
-    command: tritonserver --model-repository=/models --strict-model-config=false --log-info=1
-    volumes:
-      - ../../triton_models:/models:ro
-    ports: ["8011:8000", "8012:8001", "8013:8002"]
-    healthcheck:
-      test: ["CMD", "/bin/bash", "-lc", "curl -fsS http://localhost:8000/v2/health/ready"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
-
   inference_engine:
     build: ../inference_engine
     env_file: ../inference_engine/.env
@@ -172,16 +166,11 @@ services:
       mongo:
         condition: service_started
     environment:
-      - INFERENCE_USE_TRITON=false
-      - INFERENCE_TRITON_URL=triton:8000
-      - INFERENCE_OSNET_WEIGHTS=/app/models/osnet_good/model.pth.tar-150
+      - INFERENCE_OSNET_WEIGHTS=/app/src/assets/models/osnet/model.pth.tar-150
       - INFERENCE_OSNET_ONNX_PATH=
+      - INFERENCE_EFFICIENTNET_WEIGHTS=
       - INFERENCE_MULTI_ATTR_WEIGHTS=/app/src/assets/models/multi_attr/best_model_multi_attr_b0.pth
       - INFERENCE_STANDALONE_GENDER_WEIGHTS=/app/src/assets/models/gender/gender_model.pth
-    volumes:
-      - ../../efficientnet_b0_gender_classifier.pth:/app/models/efficientnet_b0_gender_classifier.pth:ro
-      - ../../reid-microservices/src/model_serving/src/assets/models/osnet/model.pth.tar-150:/app/models/osnet_good/model.pth.tar-150:ro
-      - ../../triton_models/osnet/1:/app/models/osnet:ro
     ports: ["8001:8000"]
 
   streaming:
@@ -210,19 +199,12 @@ services:
     build: ../vllm_service
     env_file: ../vllm_service/.env
     ports: ["18100:8100"]
-    # The upstream LLM endpoint is configured via VLLM_LLM_BASE_URL in the env file —
-    # point at any OpenAI-compatible API (local vLLM container, Ollama, OpenAI, etc.).
-    # query_service's NL parser falls back to a regex matcher if this service is down,
-    # so the readiness check (VLLM_REQUIRE_LLM_FOR_READY=false) lets the stack come up
-    # without a live LLM in dev environments.
 
   ui:
     build: ../ui
     environment:
-      # Browser-side env: must point at the host-exposed gateway port (18080), not
-      # the in-cluster service name — the browser can't resolve "gateway" itself.
       - NEXT_PUBLIC_GATEWAY_URL=http://localhost:18080
-      - NEXT_PUBLIC_STREAMING_WS=ws://localhost:8765
+      - NEXT_PUBLIC_STREAMING_WS=ws://localhost:18080/ws/stream
       # Raw-video MJPEG server (host-exposed port); browser renders <img src=.../mjpeg>.
       - NEXT_PUBLIC_RAW_STREAM_URL=http://localhost:8770
     depends_on: [gateway]

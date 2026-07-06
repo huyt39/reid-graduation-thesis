@@ -40,7 +40,6 @@ coverage/
 /reid_tuning_package/
 /clipreid_eval_kit/
 /classification models/
-/triton_models/
 /docs/
 
 # Untracked model assets / experimental backbones under inference_engine
@@ -49,5 +48,4 @@ src/inference_engine/src/assets/models/osnet_ain_ms/
 src/inference_engine/src/assets/models/osnet_ibn/
 src/inference_engine/src/models/clipreid/
 
-# Planning notes / handoffs / service docs (kept local — user excludes .md)
-*.md
+

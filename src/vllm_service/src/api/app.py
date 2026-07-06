@@ -16,7 +16,7 @@ from src.services.result_summarizer import ResultSummarizer
 
 logger = structlog.get_logger()
 
-# Shared singletons populated by lifespan
+# shared singletons populated by lifespan => init = none, app restart => req reuse prepared object, no need to create new
 _llm_client: LLMClient | None = None
 _query_parser: QueryParser | None = None
 _summarizer: ResultSummarizer | None = None
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=settings.service_name, lifespan=lifespan)
 
 
-@app.middleware("http")
+@app.middleware("http") #req in, if header has request id=>reuse; else: create new uuid
 async def attach_request_id(request: Request, call_next):
     request_id = request.headers.get("x-request-id", str(uuid4()))
     request.state.request_id = request_id
@@ -64,7 +64,7 @@ async def attach_request_id(request: Request, call_next):
     return response
 
 
-# ── Schemas ──────────────────────────────────────────────────────────
+# schemas
 
 class ParseRequest(BaseModel):
     text: str = Field(..., min_length=1)
@@ -79,14 +79,14 @@ class SummarizeRequest(BaseModel):
     question: str
     query_type: str
     params: dict = Field(default_factory=dict)
-    results: Any = None
+    results: Any = None #raw result has many shapes depend on query type
 
 
 class SummarizeResponse(BaseModel):
     summary: str
 
 
-# ── Health ──────────────────────────────────────────────────────────
+# health
 
 @app.get("/healthz")
 def healthz():
@@ -111,7 +111,7 @@ async def readyz():
     return payload
 
 
-# ── Parsing & summarization ─────────────────────────────────────────
+# business endpoint: parse and summary
 
 @app.post("/parse", response_model=ParseResponse)
 async def parse(req: ParseRequest):

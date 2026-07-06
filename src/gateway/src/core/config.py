@@ -5,11 +5,6 @@ class Settings(BaseSettings):
     service_name: str = "gateway"
     service_port: int = 8080
 
-    # JWT
-    jwt_secret: str = "change-me-in-production"
-    jwt_algorithm: str = "HS256"
-    jwt_expiry_minutes: int = 60
-
     # Upstream services
     streaming_url: str = "ws://streaming:8765"
     query_service_url: str = "http://query_service:8090"
@@ -19,10 +14,6 @@ class Settings(BaseSettings):
 
     # CORS — comma-separated list of allowed browser origins
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
-
-    # Bootstrap admin credentials (for initial login)
-    admin_username: str = "admin"
-    admin_password: str = "admin"
 
     model_config = SettingsConfigDict(
         env_file=".env", env_prefix="GATEWAY_", extra="ignore",

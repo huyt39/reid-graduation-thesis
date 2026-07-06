@@ -1,8 +1,3 @@
-"""Plain-English summarizer for structured query results.
-
-Optional companion to ``query_parser`` — the UI can call ``POST /summarize`` with
-the original query + the structured response and get a short human-readable blurb.
-"""
 from __future__ import annotations
 
 import json
@@ -14,7 +9,7 @@ from src.services.llm_client import LLMClient
 
 log = structlog.get_logger()
 
-
+# optional because if summarizer error => query service still has deterministic summary fallback
 SYSTEM_PROMPT = """You are a helpful assistant that answers questions about a \
 person re-identification surveillance system. You are given the user's original \
 question, the structured query that was run, and the raw JSON results.

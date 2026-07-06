@@ -1,9 +1,3 @@
-"""Thin OpenAI-compatible HTTP client.
-
-Sends chat-completion requests to any endpoint that implements the OpenAI
-``/chat/completions`` shape: vLLM's OpenAI server, Ollama's /v1 layer, OpenAI
-itself, etc. The model is configured per-service via ``VLLM_LLM_MODEL``.
-"""
 from __future__ import annotations
 
 import httpx

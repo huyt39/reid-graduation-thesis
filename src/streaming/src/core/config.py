@@ -23,14 +23,7 @@ class Settings(BaseSettings):
     broadcast_semaphore: int = 20
     broadcast_max_fps: float = 30.0
 
-    # MinIO (for presigned snapshot URLs)
-    minio_internal_endpoint: str = "localhost:9000"
-    minio_public_endpoint: str = "localhost:9002"
-    minio_access_key: str = "minio"
-    minio_secret_key: str = "minio123"
-    minio_secure: bool = False
-
-    # MinIO (for presigned snapshot URLs)
+    # MinIO
     minio_internal_endpoint: str = "localhost:9000"
     minio_public_endpoint: str = "localhost:9002"
     minio_access_key: str = "minio"

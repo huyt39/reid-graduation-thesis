@@ -37,14 +37,13 @@ LABEL_NAMES = {
     "hat":       ["no_hat", "hat"],
     "glasses":   ["no_glasses", "glasses"],
     "sleeve":    ["short_sleeve", "long_sleeve"],
-    # NOTE: idx 1 ↔ idx 2 swapped vs the PA100K canonical comment in the
-    # training script. The training .mat used here has cols 23/24 in the
-    # opposite order (col 23 = Skirt&Dress, col 24 = Shorts), so the
-    # classifier head learned: visual-skirt → idx 1, visual-shorts → idx 2.
-    # Diagnostic probe on live tracklets confirmed this symmetric inversion
-    # (skirt-wearer → idx 1 high; shorts-wearer → idx 2 high). Align the
-    # display labels with what the head actually represents.
-    "lower":     ["trousers", "skirt_dress", "shorts"],
+    # PA-100K lower order = [Trousers, Shorts, Skirt&Dress]. The .mat's own
+    # `attributes` field defines col22=Trousers, col23=Shorts, col24=Skirt&Dress
+    # (visually verified on one-hot crops), and the head is trained on argmax of
+    # those columns in that order — so head idx1=Shorts, idx2=Skirt&Dress, NO swap.
+    # (A previous idx1↔2 swap here, justified by a model-circular probe, was the
+    # actual cause of "shorts shown as skirt_dress" and has been removed.)
+    "lower":     ["trousers", "shorts", "skirt_dress"],
 }
 
 

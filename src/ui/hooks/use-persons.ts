@@ -3,6 +3,7 @@
 import { useEffect } from "react";
 import useSWR from "swr";
 import { personsClient, type PersonsListParams } from "@/lib/api/persons-client";
+import { getStreamingWebSocketUrl } from "@/lib/streaming-websocket";
 import type { PaginatedPersons } from "@/types";
 
 const fetcher = async (
@@ -18,7 +19,7 @@ const fetcher = async (
 
 type PersonsRealtimeListener = () => void;
 
-const WS_URL = process.env.NEXT_PUBLIC_STREAMING_WS || "ws://localhost:8765";
+const WS_URL = getStreamingWebSocketUrl();
 const PERSONS_SIGNAL_MIN_INTERVAL_MS = 750;
 const PERSONS_WS_BACKOFF_CAP_MS = 8000;
 
@@ -74,7 +75,7 @@ function ensurePersonsRealtimeConnection() {
     return;
   }
 
-  const ws = new WebSocket(`${WS_URL}/ws`);
+  const ws = new WebSocket(WS_URL);
   personsRealtimeWs = ws;
 
   ws.onopen = () => {

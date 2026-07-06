@@ -1,12 +1,3 @@
-"""Natural-language → structured-query JSON converter.
-
-Sends a system prompt + few-shot examples to the configured LLM and returns the
-shape ``query_service.nl_parser`` expects: ``{"query_type": str, "params": dict}``.
-
-The 6 valid query types and their `params` schemas are mirrored from
-``src/query_service/src/schemas/query.py``. Any deviation here will be rejected
-by ``query_service`` and fall back to its regex parser.
-"""
 from __future__ import annotations
 
 import json
@@ -22,14 +13,15 @@ log = structlog.get_logger()
 
 
 VALID_QUERY_TYPES = {
-    "person_lookup",
-    "person_search",
-    "timeline",
-    "similarity_search",
-    "sighting_aggregation",
-    "device_lookup",
+    "person_lookup", # find a person by id
+    "person_search", # find people by attributes
+    "timeline", # check a person by time
+    "similarity_search", # find similar people
+    "sighting_aggregation", # count sightings
+    "device_lookup", # device info
 }
 
+# regex: rule to parse simple sentence without calling llm
 PERSON_COUNT_PATTERNS = [
     r"\bhow many\s+(people|persons)\b",
     r"\b(total|count|number of)\s+(people|persons)\b",
@@ -179,7 +171,8 @@ FEW_SHOT_EXAMPLES: list[dict] = [
                  '{"filters": {"gender": "female", "backpack": "backpack", "hat": "hat"}}}')},
 ]
 
-
+# helper functions:
+# drop fence to keep json loadss
 def _strip_code_fence(content: str) -> str:
     """Some models wrap JSON in ```json ... ``` despite instructions; strip it."""
     s = content.strip()
@@ -189,12 +182,12 @@ def _strip_code_fence(content: str) -> str:
         s = re.sub(r"\s*```$", "", s)
     return s.strip()
 
-
+# get person id from params
 def _person_id_from_params(params: dict[str, Any]) -> int | None:
     person_id = params.get("person_id")
     return person_id if isinstance(person_id, int) else None
 
-
+# no use llm, just detect
 def _deterministic_parse(text: str) -> dict[str, Any] | None:
     q = text.lower().strip()
     filters: dict[str, Any] = {}
@@ -272,6 +265,7 @@ class QueryParser:
         self.temperature = temperature
         self.max_tokens = max_tokens
 
+    # build message for llm
     def _messages(self, text: str) -> list[dict]:
         now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
         system = SYSTEM_PROMPT.replace("{now}", now_iso)

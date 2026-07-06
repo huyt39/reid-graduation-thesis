@@ -28,7 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--endpoint", default="http://localhost:8001/embedding/batch")
     parser.add_argument("--single-endpoint", default="http://localhost:8001/embedding")
     parser.add_argument("--backend", choices=["endpoint", "onnx"], default="endpoint")
-    parser.add_argument("--onnx-model", default="triton_models/osnet/1/model.onnx")
+    parser.add_argument(
+        "--onnx-model",
+        default="",
+        help="Path to an exported OSNet .onnx model (required when --backend onnx).",
+    )
     parser.add_argument("--model", default="osnet")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument(

@@ -5,11 +5,12 @@ import { Pause, Play } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useWebSocket } from "@/hooks/use-websocket";
+import { getStreamingWebSocketUrl } from "@/lib/streaming-websocket";
 import { DeviceSelector, ALL_CAMERAS } from "./device-selector";
 import { ConnectionBadge } from "./connection-badge";
 import { LiveFeed } from "./live-feed";
 
-const WS_URL = process.env.NEXT_PUBLIC_STREAMING_WS || "ws://localhost:8765";
+const WS_URL = getStreamingWebSocketUrl();
 // Raw video is served as MJPEG by the standalone raw_stream service (decoupled
 // from the ReID path) and rendered natively by the browser for smoothness.
 const RAW_STREAM_URL = process.env.NEXT_PUBLIC_RAW_STREAM_URL || "http://localhost:8770";
@@ -30,7 +31,7 @@ export function LiveView() {
   // Processed stream is kept ONLY for the cross-camera badge (it is low-rate and
   // not the bottleneck). The raw video no longer flows through the WebSocket —
   // it comes from the MJPEG raw_stream service.
-  const processed = useWebSocket(`${WS_URL}/ws`, subscribedDeviceIds, {
+  const processed = useWebSocket(WS_URL, subscribedDeviceIds, {
     enabled: isLiveActive,
     maxFps: 10,
   });

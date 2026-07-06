@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=settings.service_name, lifespan=lifespan)
 
 
-# ── Health ────────────────────────────────────────────────────────────
+# health
 
 @app.get("/healthz")
 def healthz():
@@ -48,7 +48,7 @@ def readyz():
     }
 
 
-# ── Embedding endpoints ──────────────────────────────────────────────
+# embedding endpoints
 
 @app.post("/embedding")
 async def embedding(
@@ -78,7 +78,7 @@ async def embedding_batch(
     return {"embeddings": features_list, "count": len(features_list)}
 
 
-# ── Similarity ────────────────────────────────────────────────────────
+# similarity
 
 @app.post("/similarity")
 async def similarity(
@@ -94,7 +94,7 @@ async def similarity(
     return {"similarity": sim, "model_used": model}
 
 
-# ── Gender classification ────────────────────────────────────────────
+# gender classification
 
 @app.post("/gender/classify")
 async def gender_classify(image: UploadFile = File(...)):
@@ -106,15 +106,11 @@ async def gender_classify(image: UploadFile = File(...)):
     return result
 
 
-# ── Multi-attribute classification (8 PA-100K tasks) ─────────────────
+# multri attributes classification
 
 @app.post("/attributes/classify")
 async def attributes_classify(image: UploadFile = File(...)):
-    """Single-image prediction across 8 person attributes.
-
-    Returns a dict keyed by task name (gender, age_child, backpack, sidebag,
-    hat, glasses, sleeve, lower); each value is ``{label, confidence, probabilities}``.
-    """
+    
     data = await image.read()
     try:
         result = registry.classify_attributes(data)

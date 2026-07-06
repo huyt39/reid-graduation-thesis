@@ -99,7 +99,6 @@ class ModelRegistry:
         self.gender_model = None
         self.multi_attr_model = None  # 8-task PA-100K classifier; takes priority over gender_model
         self.standalone_gender_model = None  # PETA-trained gender classifier; overrides multi_attr gender head
-        self.triton = None  # TritonBackend instance when settings.use_triton
 
         self.embedding_transform = transforms.Compose([
             transforms.ToTensor(),
@@ -128,55 +127,44 @@ class ModelRegistry:
         self.device = self._pick_device()
         log.info("model_registry.device", device=str(self.device))
 
-        # Triton backend short-circuits OSNet + multi_attr loading.
-        if settings.use_triton:
-            from src.services.triton_backend import TritonBackend
-            self.triton = TritonBackend(url=settings.triton_url)
-            log.info(
-                "model_registry.triton_enabled",
-                url=settings.triton_url,
-                osnet=self.triton.osnet_ready,
-                multi_attr=self.triton.multi_attr_ready,
-            )
-        else:
-            onnx_path = _resolve_path(settings.osnet_onnx_path) if settings.osnet_onnx_path else None
-            if onnx_path is not None and onnx_path.exists():
-                try:
-                    self.osnet_onnx = ort.InferenceSession(
-                        str(onnx_path),
-                        providers=["CPUExecutionProvider"],
-                    )
-                    self.osnet_onnx_input_name = self.osnet_onnx.get_inputs()[0].name
-                    log.info("model_registry.osnet_onnx_loaded", path=str(onnx_path))
-                except Exception as exc:
-                    self.osnet_onnx = None
-                    self.osnet_onnx_input_name = None
-                    log.warning(
-                        "model_registry.osnet_onnx_load_failed",
-                        path=str(onnx_path),
-                        error=str(exc),
-                    )
+        onnx_path = _resolve_path(settings.osnet_onnx_path) if settings.osnet_onnx_path else None
+        if onnx_path is not None and onnx_path.exists():
+            try:
+                self.osnet_onnx = ort.InferenceSession(
+                    str(onnx_path),
+                    providers=["CPUExecutionProvider"],
+                )
+                self.osnet_onnx_input_name = self.osnet_onnx.get_inputs()[0].name
+                log.info("model_registry.osnet_onnx_loaded", path=str(onnx_path))
+            except Exception as exc:
+                self.osnet_onnx = None
+                self.osnet_onnx_input_name = None
+                log.warning(
+                    "model_registry.osnet_onnx_load_failed",
+                    path=str(onnx_path),
+                    error=str(exc),
+                )
 
-            # OSNet (always loaded)
-            osnet_path = _resolve_path(settings.osnet_weights) if settings.osnet_weights else None
-            if osnet_path is not None and osnet_path.exists():
-                try:
-                    from src.models.osnet import osnet_x1_0
-                    self.osnet = osnet_x1_0(weight_path=str(osnet_path), device=self.device)
-                    self.osnet.eval()
-                    log.info("model_registry.osnet_loaded")
-                except Exception as exc:
-                    self.osnet = None
-                    log.warning(
-                        "model_registry.osnet_load_failed",
-                        path=str(osnet_path),
-                        error=str(exc),
-                    )
-            else:
-                log.warning("model_registry.osnet_weights_missing", path=str(osnet_path) if osnet_path else "")
+        # OSNet (always loaded)
+        osnet_path = _resolve_path(settings.osnet_weights) if settings.osnet_weights else None
+        if osnet_path is not None and osnet_path.exists():
+            try:
+                from src.models.osnet import osnet_x1_0
+                self.osnet = osnet_x1_0(weight_path=str(osnet_path), device=self.device)
+                self.osnet.eval()
+                log.info("model_registry.osnet_loaded")
+            except Exception as exc:
+                self.osnet = None
+                log.warning(
+                    "model_registry.osnet_load_failed",
+                    path=str(osnet_path),
+                    error=str(exc),
+                )
+        else:
+            log.warning("model_registry.osnet_weights_missing", path=str(osnet_path) if osnet_path else "")
 
         # OSNet-AIN (domain-generalization variant; loaded if weights present)
-        if getattr(settings, "osnet_ain_weights", "") and not settings.use_triton:
+        if getattr(settings, "osnet_ain_weights", ""):
             ain_path = _resolve_path(settings.osnet_ain_weights)
             if ain_path is not None and ain_path.exists():
                 try:
@@ -194,60 +182,68 @@ class ModelRegistry:
             else:
                 log.warning("model_registry.osnet_ain_weights_missing", path=str(ain_path) if ain_path else "")
 
-        # LMBN (optional, not yet exported to Triton)
-        if settings.lmbn_weights and not settings.use_triton:
+        # LMBN (optional). Not used for production embeddings (the worker
+        # requests "osnet_ain"); load is best-effort so a missing/broken LMBN
+        # or backbone weight degrades to lmbn=None instead of taking down the
+        # whole engine at startup.
+        if settings.lmbn_weights:
             lmbn_path = _resolve_path(settings.lmbn_weights)
             if lmbn_path.exists():
-                from src.models.lightmbn_n import LMBN_n
-                self.lmbn = LMBN_n(
-                    num_classes=767, feats=512, activation_map=False,
-                    osnet_weight_path=str(osnet_path) if osnet_path and osnet_path.exists() else None,
-                    device=self.device,
-                )
-                ckpt = torch.load(str(lmbn_path), map_location=self.device, weights_only=False)
-                state_dict = ckpt
-                if isinstance(ckpt, dict):
-                    for key in ("state_dict", "net", "model"):
-                        if key in ckpt and isinstance(ckpt[key], dict):
-                            state_dict = ckpt[key]
-                            break
-                def _strip(k: str) -> str:
-                    for prefix in ("module.", "model."):
-                        if k.startswith(prefix):
-                            k = k[len(prefix):]
-                    return k
-                state_dict = {_strip(k): v for k, v in state_dict.items()}
-                # Drop shape-mismatched keys — typically classifier heads from a
-                # fine-tune saved with a different num_classes than the production
-                # model (767). load_state_dict(strict=False) ignores missing/unexpected
-                # keys but still errors on shape mismatch. The classifier is unused
-                # at inference; only the BNNeck embedding is read.
-                model_sd = self.lmbn.state_dict()
-                filtered: dict[str, torch.Tensor] = {}
-                dropped: list[str] = []
-                for k, v in state_dict.items():
-                    if k in model_sd and model_sd[k].shape != v.shape:
-                        dropped.append(k)
-                        continue
-                    filtered[k] = v
-                missing, unexpected = self.lmbn.load_state_dict(filtered, strict=False)
-                self.lmbn.to(self.device)
-                self.lmbn.eval()
-                log.info(
-                    "model_registry.lmbn_loaded",
-                    path=str(lmbn_path),
-                    missing=len(missing),
-                    unexpected=len(unexpected),
-                    dropped_shape_mismatch=len(dropped),
-                )
+                try:
+                    from src.models.lightmbn_n import LMBN_n
+                    self.lmbn = LMBN_n(
+                        num_classes=767, feats=512, activation_map=False,
+                        osnet_weight_path=str(osnet_path) if osnet_path and osnet_path.exists() else None,
+                        device=self.device,
+                    )
+                    ckpt = torch.load(str(lmbn_path), map_location=self.device, weights_only=False)
+                    state_dict = ckpt
+                    if isinstance(ckpt, dict):
+                        for key in ("state_dict", "net", "model"):
+                            if key in ckpt and isinstance(ckpt[key], dict):
+                                state_dict = ckpt[key]
+                                break
+                    def _strip(k: str) -> str:
+                        for prefix in ("module.", "model."):
+                            if k.startswith(prefix):
+                                k = k[len(prefix):]
+                        return k
+                    state_dict = {_strip(k): v for k, v in state_dict.items()}
+                    # Drop shape-mismatched keys — typically classifier heads from a
+                    # fine-tune saved with a different num_classes than the production
+                    # model (767). load_state_dict(strict=False) ignores missing/unexpected
+                    # keys but still errors on shape mismatch. The classifier is unused
+                    # at inference; only the BNNeck embedding is read.
+                    model_sd = self.lmbn.state_dict()
+                    filtered: dict[str, torch.Tensor] = {}
+                    dropped: list[str] = []
+                    for k, v in state_dict.items():
+                        if k in model_sd and model_sd[k].shape != v.shape:
+                            dropped.append(k)
+                            continue
+                        filtered[k] = v
+                    missing, unexpected = self.lmbn.load_state_dict(filtered, strict=False)
+                    self.lmbn.to(self.device)
+                    self.lmbn.eval()
+                    log.info(
+                        "model_registry.lmbn_loaded",
+                        path=str(lmbn_path),
+                        missing=len(missing),
+                        unexpected=len(unexpected),
+                        dropped_shape_mismatch=len(dropped),
+                    )
+                except Exception as exc:
+                    self.lmbn = None
+                    log.warning(
+                        "model_registry.lmbn_load_failed",
+                        path=str(lmbn_path),
+                        error=str(exc),
+                    )
 
         # Multi-attribute classifier (8 PA-100K tasks). Loaded preferentially over the
         # legacy single-task gender classifier — when present, /gender/classify is served
-        # by extracting the gender head from this model. Skipped when Triton serves
-        # the multi_attr model itself.
+        # by extracting the gender head from this model.
         multi_attr_path = _resolve_path(settings.multi_attr_weights) if settings.multi_attr_weights else None
-        if settings.use_triton:
-            multi_attr_path = None
         if multi_attr_path is not None and multi_attr_path.exists():
             try:
                 from src.models.multi_attr_classifier import MultiAttrEfficientNetB0
@@ -334,11 +330,6 @@ class ModelRegistry:
 
     def _warmup(self) -> None:
         with torch.no_grad():
-            if self.triton is not None:
-                if self.triton.osnet_ready:
-                    self.triton.embed(np.zeros((1, 3, 256, 128), dtype=np.float32))
-                if self.triton.multi_attr_ready:
-                    self.triton.classify_attributes(np.zeros((1, 3, 224, 224), dtype=np.float32))
             dummy_emb = torch.randn(1, 3, 256, 128, device=self.device)
             if self.osnet:
                 self.osnet(dummy_emb)
@@ -377,7 +368,7 @@ class ModelRegistry:
     @staticmethod
     def _raise_embedding_unavailable() -> None:
         raise RuntimeError(
-            "No ReID embedding model loaded. Configure OSNet PyTorch/ONNX weights or enable Triton OSNet; "
+            "No ReID embedding model loaded. Configure OSNet PyTorch/ONNX weights; "
             "refusing to return fallback pixel embeddings."
         )
 
@@ -394,10 +385,6 @@ class ModelRegistry:
         self, tensors: torch.Tensor, model: str = "osnet",
     ) -> list[list[float]]:
         """Batch inference on pre-built tensors. Used by EmbeddingBatchQueue."""
-        if self.triton is not None and self.triton.osnet_ready:
-            arr = tensors.detach().cpu().numpy().astype(np.float32)
-            emb = self.triton.embed(arr)
-            return emb.tolist()
         if model == "osnet_ain" and self.osnet_ain is not None:
             features = self.osnet_ain(tensors)
             features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-8)
@@ -418,10 +405,6 @@ class ModelRegistry:
     @torch.no_grad()
     def extract_embedding(self, image_bytes: bytes, model: str = "osnet") -> list[float]:
         tensor = self.preprocess_embedding(image_bytes)
-        if self.triton is not None and self.triton.osnet_ready:
-            arr = tensor.detach().cpu().numpy().astype(np.float32)
-            emb = self.triton.embed(arr)
-            return emb.flatten().tolist()
         if model == "osnet_ain" and self.osnet_ain is not None:
             features = self.osnet_ain(tensor)  # [1, 512]
             features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-8)
@@ -445,10 +428,6 @@ class ModelRegistry:
         if not images:
             return []
         tensors = torch.cat([self.preprocess_embedding(img) for img in images], dim=0)
-        if self.triton is not None and self.triton.osnet_ready:
-            arr = tensors.detach().cpu().numpy().astype(np.float32)
-            emb = self.triton.embed(arr)
-            return emb.tolist()
         if model == "osnet_ain" and self.osnet_ain is not None:
             features = self.osnet_ain(tensors)
             features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-8)
@@ -467,13 +446,6 @@ class ModelRegistry:
     @torch.no_grad()
     def classify_attributes(self, image_bytes: bytes) -> dict:
         """Run the 8-task multi-attribute classifier on a single crop."""
-        if self.triton is not None and self.triton.multi_attr_ready:
-            tensor = self.preprocess_classification(image_bytes)
-            arr = tensor.detach().cpu().numpy().astype(np.float32)
-            result = self.triton.classify_attributes(arr)
-            if self.standalone_gender_model is not None:
-                result["gender"] = self.standalone_gender_model.predict(tensor)
-            return result
         if self.multi_attr_model is None:
             raise RuntimeError("Multi-attribute model not loaded")
         tensor = self.preprocess_classification(image_bytes)
@@ -544,11 +516,21 @@ class ModelRegistry:
     @staticmethod
     def _pick_device() -> torch.device:
         if settings.device == "auto":
-            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # cuda -> mps -> cpu. MPS lets the engine use the Apple Silicon GPU
+            # when running natively on macOS (Docker on macOS has no Metal
+            # passthrough, so MPS only applies to host-native runs). The cuda
+            # branch stays first so GPU/Linux hosts keep their existing behavior.
+            if torch.cuda.is_available():
+                return torch.device("cuda")
+            if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+                return torch.device("mps")
+            return torch.device("cpu")
         return torch.device(settings.device)
 
     @property
     def is_ready(self) -> bool:
-        if self.triton is not None:
-            return self.triton.osnet_ready
-        return self.osnet is not None or self.osnet_onnx is not None
+        return (
+            self.osnet is not None
+            or self.osnet_ain is not None
+            or self.osnet_onnx is not None
+        )

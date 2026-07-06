@@ -150,25 +150,46 @@ cmd_up() {
     cmd_reset
   fi
 
+  # Native MPS demo mode: the inference_engine runs natively on the host (Apple
+  # Silicon GPU via PyTorch MPS — Docker on macOS has no Metal passthrough), so
+  # we skip its container and point workers at it via host.docker.internal.
+  # Start the engine first with: scripts/run_native_mps.sh
+  #   MPS_NATIVE=true scripts/demo.sh up --build --reset
   local app_services=(inference_engine query_service streaming raw_stream worker_cam1 worker_cam2 gateway ui)
+  local extra_up=""
+  if [ "${MPS_NATIVE:-false}" = "true" ]; then
+    echo "MPS_NATIVE=true → skipping inference_engine container; workers use host-native MPS engine."
+    export WORKER_MODEL_SERVICE_URL="http://host.docker.internal:8000"
+    app_services=(query_service streaming raw_stream worker_cam1 worker_cam2 gateway ui)
+    # --no-deps so workers' depends_on does not pull the inference_engine
+    # container back up. Infra was already started above.
+    extra_up="--no-deps"
+  fi
+
   if [ -n "$build_flag" ]; then
     echo "Rebuilding app services..."
     if [ "$reset" = "true" ]; then
-      docker compose -f "$COMPOSE_FILE" up -d --build --force-recreate "${app_services[@]}"
+      docker compose -f "$COMPOSE_FILE" up -d $extra_up --build --force-recreate "${app_services[@]}"
     else
-      docker compose -f "$COMPOSE_FILE" up -d --build "${app_services[@]}"
+      docker compose -f "$COMPOSE_FILE" up -d $extra_up --build "${app_services[@]}"
     fi
   else
     echo "Starting app services..."
     if [ "$reset" = "true" ]; then
-      docker compose -f "$COMPOSE_FILE" up -d --force-recreate "${app_services[@]}"
+      docker compose -f "$COMPOSE_FILE" up -d $extra_up --force-recreate "${app_services[@]}"
     else
-      docker compose -f "$COMPOSE_FILE" up -d "${app_services[@]}"
+      docker compose -f "$COMPOSE_FILE" up -d $extra_up "${app_services[@]}"
     fi
   fi
 
   echo "Waiting for services..."
-  wait_for_http_optional "inference_engine" "http://localhost:8001/healthz" 30 || true
+  if [ "${MPS_NATIVE:-false}" = "true" ]; then
+    wait_for_http "inference_engine (native MPS)" "http://localhost:8000/healthz" 30 || {
+      echo "Native MPS engine not reachable on :8000. Start it first: scripts/run_native_mps.sh" >&2
+    }
+  else
+    wait_for_http_optional "inference_engine" "http://localhost:8001/healthz" 30 || true
+  fi
   wait_for_http "query_service" "http://localhost:18090/readyz"
   wait_for_http "streaming"     "http://localhost:8765/readyz"
   wait_for_http "gateway"       "http://localhost:18080/readyz"
