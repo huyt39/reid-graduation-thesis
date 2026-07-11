@@ -1,4 +1,5 @@
 """Loads and holds all inference models + their preprocessing transforms."""
+# app.py is http gate, this is infer: image bytes to tensor, run model and tensor output to json
 from __future__ import annotations
 
 from io import BytesIO
@@ -21,19 +22,7 @@ _IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
 class _LetterboxResize:
-    """Aspect-preserving resize to (target_h, target_w) with gray padding.
 
-    Replaces the standard `transforms.Resize((H, W))` which stretches the crop
-    to fit. For occlusion / partial-body ReID this is the established fix:
-    a partial body keeps its real geometry instead of being warped to 2:1,
-    so the embedding model sees a recognizable shape padded with neutral
-    pixels rather than a distorted full-frame.
-
-    Applied after ToTensor (input is a CxHxW float tensor in [0, 1]) and
-    before Normalize. Fill is 0.5 (neutral gray) in the un-normalized space,
-    which becomes near-zero (close to the dataset mean) after Normalize and
-    therefore minimally distracts the model's first conv layer.
-    """
     def __init__(self, target_h: int = 256, target_w: int = 128, fill: float = 0.5) -> None:
         self.target_h = target_h
         self.target_w = target_w
@@ -99,6 +88,7 @@ class ModelRegistry:
         self.gender_model = None
         self.multi_attr_model = None  # 8-task PA-100K classifier; takes priority over gender_model
         self.standalone_gender_model = None  # PETA-trained gender classifier; overrides multi_attr gender head
+        self.effb0_gender_model = None  # EfficientNet-B0 (lukemelas) gender classifier; top priority when present
 
         self.embedding_transform = transforms.Compose([
             transforms.ToTensor(),
@@ -308,6 +298,33 @@ class ModelRegistry:
         else:
             log.info("model_registry.standalone_gender_weights_missing", path=str(standalone_gender_path))
 
+        # EfficientNet-B0 gender classifier (efficientnet_pytorch layout). Highest-priority
+        # gender source when present — overrides both the standalone and multi-attr gender heads.
+        effb0_gender_path = (
+            _resolve_path(settings.effb0_gender_weights)
+            if settings.effb0_gender_weights
+            else None
+        )
+        if effb0_gender_path is not None and effb0_gender_path.exists():
+            try:
+                from src.models.effb0_gender import EffB0GenderModel
+                self.effb0_gender_model = EffB0GenderModel(
+                    str(effb0_gender_path), self.device
+                )
+                log.info("model_registry.effb0_gender_loaded", path=str(effb0_gender_path))
+            except Exception as exc:
+                self.effb0_gender_model = None
+                log.warning(
+                    "model_registry.effb0_gender_load_failed",
+                    path=str(effb0_gender_path),
+                    error=str(exc),
+                )
+        else:
+            log.info(
+                "model_registry.effb0_gender_weights_missing",
+                path=str(effb0_gender_path) if effb0_gender_path else "",
+            )
+
         # Legacy single-task gender classifier (loaded only if multi-attr is absent).
         if self.multi_attr_model is None:
             eff_path = _resolve_path(settings.efficientnet_weights) if settings.efficientnet_weights else None
@@ -346,6 +363,8 @@ class ModelRegistry:
                 self.gender_model(dummy_cls)
             if self.standalone_gender_model:
                 self.standalone_gender_model.model(dummy_cls)
+            if self.effb0_gender_model:
+                self.effb0_gender_model.model(dummy_cls)
         log.info("model_registry.warmup_done")
 
     # ── Inference helpers ─────────────────────────────────────────────
@@ -450,7 +469,11 @@ class ModelRegistry:
             raise RuntimeError("Multi-attribute model not loaded")
         tensor = self.preprocess_classification(image_bytes)
         result = self.multi_attr_model.predict(tensor)
-        if self.standalone_gender_model is not None:
+        # Gender head override, highest-priority first. The EffB0 model owns its own
+        # preprocessing (plain resize, not letterbox), so it takes raw bytes.
+        if self.effb0_gender_model is not None:
+            result["gender"] = self.effb0_gender_model.predict(image_bytes)
+        elif self.standalone_gender_model is not None:
             result["gender"] = self.standalone_gender_model.predict(tensor)
         return result
 
@@ -458,10 +481,17 @@ class ModelRegistry:
     def classify_gender(self, image_bytes: bytes) -> dict:
         """Backward-compatible gender endpoint.
 
-        Prefers the standalone PETA-trained gender model (88% acc).
+        Prefers the EfficientNet-B0 gender model, then the standalone PETA-trained model.
         Falls back to the multi-attribute model gender head, then the legacy model.
         Response shape is unchanged — callers like ``GenderVoter`` keep working.
         """
+        if self.effb0_gender_model is not None:
+            gen = self.effb0_gender_model.predict(image_bytes)
+            return {
+                "gender": gen["label"],
+                "confidence": gen["confidence"],
+                "probabilities": gen["probabilities"],
+            }
         if self.standalone_gender_model is not None:
             tensor = self.preprocess_classification(image_bytes)
             gen = self.standalone_gender_model.predict(tensor)

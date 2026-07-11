@@ -14,7 +14,7 @@ _META_TTL = 300   # 5 minutes
 _EMB_TTL = 60     # 1 minute
 
 
-class RedisPersonCache:
+class RedisPersonCache: # cache metadata và embedding người trong thời gian ngắn
     def __init__(self, url: str = "redis://localhost:6379/0") -> None:
         self._redis = aioredis.from_url(url, decode_responses=False)
 
@@ -26,7 +26,7 @@ class RedisPersonCache:
 
     # ── Person metadata ───────────────────────────────────────────────
 
-    async def set_person_meta(self, person_id: int, data: dict, ttl: int = _META_TTL) -> None:
+    async def set_person_meta(self, person_id: int, data: dict, ttl: int = _META_TTL) -> None: # lưu và đọc metadata người dưới dạng json, có ttl để tự hết hạn
         try:
             await self._redis.setex(self._meta_key(person_id), ttl, json.dumps(data))
         except Exception:
@@ -42,7 +42,7 @@ class RedisPersonCache:
 
     # ── Person embedding ──────────────────────────────────────────────
 
-    async def set_person_embedding(self, person_id: int, embedding: np.ndarray, ttl: int = _EMB_TTL) -> None:
+    async def set_person_embedding(self, person_id: int, embedding: np.ndarray, ttl: int = _EMB_TTL) -> None: # Lưu và đọc embedding dạng bytes float32. Dùng khi cần lấy embedding nhanh mà không đi qua storage nặng hơn
         try:
             await self._redis.setex(self._emb_key(person_id), ttl, embedding.astype(np.float32).tobytes())
         except Exception:
@@ -60,7 +60,7 @@ class RedisPersonCache:
 
     # ── Invalidation ──────────────────────────────────────────────────
 
-    async def invalidate(self, person_id: int) -> None:
+    async def invalidate(self, person_id: int) -> None: # Xóa cache metadata và embedding của một person khi dữ liệu không còn đáng tin hoặc đã cập nhật
         try:
             await self._redis.delete(self._meta_key(person_id), self._emb_key(person_id))
         except Exception:
@@ -70,7 +70,7 @@ class RedisPersonCache:
         await self._redis.aclose()
 
 
-class RedisPersonIdAllocator:
+class RedisPersonIdAllocator: # Cấp person_id tăng dần bằng Redis INCR. Đây là cách đảm bảo mỗi person mới có ID duy nhất
     def __init__(
         self,
         url: str = "redis://localhost:6379/0",

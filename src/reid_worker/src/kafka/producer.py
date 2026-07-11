@@ -1,3 +1,5 @@
+# tracked persons dict
+
 from kafka import KafkaProducer
 
 from src.kafka.serialization import load_avro_schema, serialize_avro

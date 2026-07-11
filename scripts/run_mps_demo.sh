@@ -1,20 +1,9 @@
-#!/usr/bin/env bash
-#
-# Run the FULL pipeline with the inference_engine on the Apple Silicon GPU (MPS).
-# The engine runs natively on the host (Docker on macOS has no Metal passthrough);
-# every other service stays in Docker and talks to it via host.docker.internal.
-#
-# The engine serves on :8000 (demo.sh's MPS_NATIVE mode points workers there).
-# Make sure nothing else holds :8000 before running.
-#
 # Usage:
 #   scripts/run_mps_demo.sh                 # engine on MPS + full stack + reset
 #   scripts/run_mps_demo.sh --build         # rebuild app images first (apply code changes)
 #   scripts/run_mps_demo.sh --no-reset      # keep identity stores
 #   flags combine, e.g.: scripts/run_mps_demo.sh --build --no-reset
-#
-# NOTE: MPS is NOT bit-identical with CPU → ReID results are non-deterministic.
-# Good for live/throughput demos, NOT for reproducible A/B evaluation.
+
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,10 +19,7 @@ for arg in "$@"; do
   esac
 done
 
-# 1. Free the engine port — but ONLY kill our own MPS engine process (a leftover
-#    `python -m src` / uvicorn from a previous run). NEVER kill Docker Desktop's
-#    backend or any other server that happens to hold the port: killing
-#    com.docker.backend takes Docker down with it.
+# 1. Free the engine port — but ONLY kill our own MPS engine process 
 kill_our_engine_on_port() {
   local pid cmd killed=0
   # only the LISTENing process — not stray CLOSED/ESTABLISHED client sockets
@@ -89,20 +75,9 @@ MPS_NATIVE=true "${ROOT_DIR}/scripts/demo.sh" up ${BUILD_FLAG} ${RESET_FLAG}
 
 cat <<EOF
 
-============================================================
-Full pipeline is up with the engine on GPU (MPS, :${MPS_PORT}).
-
 Measure detector FPS per camera (let it run ~30s first):
   docker logs deploy-edge_cam1-1 2>&1 | grep edge_progress | tail -3
   docker logs deploy-edge_cam2-1 2>&1 | grep edge_progress | tail -3
   # detector fps ≈ 1000 / avg_detect_ms
 
-Live CPU per container:
-  docker stats --no-stream | grep -E 'edge_cam|worker_cam'
-
-Stop the native engine when done:
-  kill ${ENGINE_PID}    # or: lsof -ti :${MPS_PORT} | xargs kill
-Return to CPU mode:
-  scripts/demo.sh up --reset
-============================================================
 EOF

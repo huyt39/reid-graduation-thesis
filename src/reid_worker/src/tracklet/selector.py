@@ -19,24 +19,18 @@ class TopKSelector:
         self.high_quality_threshold = high_quality_threshold
 
     def _selection_score(self, entry: TrackletEntry) -> float:
+        # ưu tiên frame rõ, phạt frame bị overlap nhiều
         return entry.v_score - self.overlap_lambda * entry.overlap_ratio
 
     def is_tracklet_ready(self, entries: list[TrackletEntry]) -> bool:
         if len(entries) < self.min_tracklet_len:
             return False
+        # tracklet chỉ sẵn sàng khi có đủ frame đạt ngưỡng chất lượng
         high_quality = sum(1 for e in entries if e.v_score >= self.high_quality_threshold)
         return high_quality >= self.min_high_quality_frames
 
     def select(self, entries: list[TrackletEntry]) -> list[TrackletEntry]:
-        # Design intent (Bước 3 of the pipeline doc): the selected frames must
-        # be at least min_temporal_gap apart so the embedding aggregation gets
-        # diverse views, not near-identical adjacent frames. The previous
-        # implementation enforced this and then bypassed it with a fill-up
-        # loop that took near-duplicate frames to reach K — defeating the
-        # constraint and inflating embedding_consistency artificially. We
-        # return fewer than K frames when diversity can't be satisfied; the
-        # downstream is_tracklet_ready / consensus filter handles short
-        # selections.
+
         sorted_entries = sorted(entries, key=self._selection_score, reverse=True)
         selected: list[TrackletEntry] = []
         selected_frame_idxs: list[int] = []

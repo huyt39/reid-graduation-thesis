@@ -25,6 +25,7 @@ QDRANT_VECTOR_SIZE="512"
 REDIS_DB="0"
 KAFKA_TOPICS=("reid_input_cam1" "reid_input_cam2" "reid_output" "edge_preview")
 EDGE_SERVICES=("edge_cam1" "edge_cam2")
+IDENTITY_RUNTIME_SERVICES=("edge_cam1" "edge_cam2" "worker_cam1" "worker_cam2" "streaming")
 KAFKA_BOOTSTRAP="localhost:9092"
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -74,6 +75,9 @@ wait_for_mongo() {
 # ── subcommands ────────────────────────────────────────────────────────────
 
 cmd_reset() {
+  echo "Stopping identity runtime services to prevent stale writes during reset..."
+  docker compose -f "$COMPOSE_FILE" stop "${IDENTITY_RUNTIME_SERVICES[@]}" >/dev/null 2>&1 || true
+
   echo "Starting identity stores if needed..."
   docker compose -f "$COMPOSE_FILE" up -d kafka mongo qdrant redis minio >/dev/null
 

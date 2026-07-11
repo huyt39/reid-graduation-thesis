@@ -5,6 +5,7 @@ import scipy
 from src.utils.ops import batch_probiou, bbox_ioa
 
 
+# ghép track với detection dựa trên ma trận chi phí
 def linear_assignment(cost_matrix, thresh, use_lap=True):
     if cost_matrix.size == 0:
         return (
@@ -29,6 +30,7 @@ def linear_assignment(cost_matrix, thresh, use_lap=True):
     return matches, unmatched_a, unmatched_b
 
 
+# tính khoảng cách giữa track và detection bằng iou
 def iou_distance(atracks, btracks):
     if (atracks and isinstance(atracks[0], np.ndarray) or btracks and isinstance(btracks[0], np.ndarray)):
         atlbrs = atracks
@@ -52,6 +54,7 @@ def iou_distance(atracks, btracks):
     return 1 - ious
 
 
+# kết hợp iou distance với confidence của detection
 def fuse_score(cost_matrix, detections):
     if cost_matrix.size == 0:
         return cost_matrix

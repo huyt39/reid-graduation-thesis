@@ -10,13 +10,11 @@ class WeightedEmbeddingAggregator:
     ):
         self.gamma = gamma
         self.outlier_threshold = outlier_threshold
-        # Frames whose bbox overlaps another person at or above this ratio are
-        # crop-contaminated (the crop contains the other person's pixels) and
-        # are dropped before aggregation so the matching embedding represents
-        # this person's clean appearance. 1.0 disables the exclusion. Falls
-        # back to all frames when too few clean ones survive.
         self.exclude_overlap_ratio = exclude_overlap_ratio
 
+
+# nhận danh sách embedding, visibility, overlap -> tạo embedding cuối:
+# loại frame overlap nặng -> tính trung bình có trọng số -> kiểm tra frame khác frame tạm thời để loại outlier -> tính lại embedding nếu còn frame tốt -> trả về embedding đã normalize
     def aggregate(
         self,
         embeddings: list[np.ndarray],
@@ -24,17 +22,6 @@ class WeightedEmbeddingAggregator:
         overlap_ratios: list[float] | None = None,
     ) -> np.ndarray:
         """Visibility-weighted mean with one round of outlier-aware reweighting.
-
-        First pass computes a standard weighted mean; second pass drops frames
-        whose cosine similarity to that provisional mean falls below
-        ``outlier_threshold`` and recomputes on the survivors. This keeps a
-        partially-contaminated tracklet (e.g., one stray crop from another
-        person) from skewing the final representation toward the outlier.
-        Falls back to the first-pass mean if too few frames survive.
-
-        Frames whose overlap_ratio is at or above ``exclude_overlap_ratio`` are
-        dropped up front (crop-contamination guard), unless fewer than two
-        clean frames remain, in which case all frames are kept.
         """
         assert len(embeddings) == len(v_scores)
         assert len(embeddings) > 0
@@ -66,7 +53,7 @@ class WeightedEmbeddingAggregator:
                 return refined
         return provisional
 
-    @staticmethod
+    @staticmethod # hàm phụ tính trung bình có trọng số và normalize vector kết quả về độ dài 1 -> giúp embedding phù hợp cho so sánh cosine similarity
     def _weighted_mean(stacked: np.ndarray, raw_weights: np.ndarray) -> np.ndarray:
         weights = raw_weights / (raw_weights.sum() + 1e-8)
         weighted_sum = (stacked * weights[:, np.newaxis]).sum(axis=0)
@@ -77,12 +64,6 @@ class WeightedEmbeddingAggregator:
 
     @staticmethod
     def compute_embedding_consistency(embeddings: list[np.ndarray]) -> float:
-        # PDF Bước 4: embedding_consistency = mean cosine(e_i, e_mean).
-        # The previous all-pairs formulation systematically under-scores
-        # tracklets where one strong frame dominates a weighted mean —
-        # exactly the well-curated top-K case the design wants to reward.
-        # Inputs are assumed L2-normalized (workers/main.py normalizes
-        # before pushing into this aggregator).
         if len(embeddings) < 2:
             return 1.0
         stacked = np.stack(embeddings, axis=0)

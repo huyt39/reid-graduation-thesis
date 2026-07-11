@@ -45,21 +45,14 @@ services:
       MINIO_ROOT_PASSWORD: minio123
     ports: ["9002:9000", "9003:9001"]
 
-  #  Camera 1 — plays whatever video EDGE_SOURCE_URL points at (see infer/).
+  #  Camera 1 
   edge_cam1:
     build: ../edge
     env_file: ../edge/.env
-    # Per-camera CPU budget. Without a cap each edge's OpenMP/BLAS pool fans out
-    # across every host core, so N concurrent cameras oversubscribe and thrash
-    # (measured: 2 uncapped cameras = ~8 FPS each vs ~12.5 FPS each when capped
-    # to 2 cores). OMP_NUM_THREADS is aligned to the cap so the thread pool does
-    # not spawn more workers than the cgroup allows. 2 cores ≈ 12 FPS @imgsz=192,
-    # comfortably above the realtime target; raise per host core budget.
     cpus: "2"
     environment:
       - OMP_NUM_THREADS=2
-      - EDGE_SOURCE_URL=/app/infer/vid61.MOV
-      - EDGE_DEVICE_ID=cam1
+      - EDGE_SOURCE_URL=/app/infer/device1.mp4
       - EDGE_REID_TOPIC=reid_input_cam1
     depends_on:
       kafka:
@@ -76,7 +69,7 @@ services:
     cpus: "2"
     environment:
       - OMP_NUM_THREADS=2
-      - EDGE_SOURCE_URL=/app/infer/vid62.MOV
+      - EDGE_SOURCE_URL=/app/infer/device2.mp4
       - EDGE_DEVICE_ID=cam2
       - EDGE_REID_TOPIC=reid_input_cam2
     depends_on:
@@ -90,23 +83,17 @@ services:
   raw_stream:
     build: ../raw_stream
     environment:
-      - RAW_STREAM_SOURCES=cam1=/app/infer/vid61.MOV,cam2=/app/infer/vid62.MOV
+      - RAW_STREAM_SOURCES=cam1=/app/infer/device1.mp4,cam2=/app/infer/device2.mp4
       - RAW_STREAM_FPS=10
       - RAW_STREAM_JPEG_QUALITY=60
       - RAW_STREAM_MAX_DIM=540
-      # Cap FFmpeg decoder threads (separate from cv2.setNumThreads) so one
-      # reader uses ~1 core instead of fanning across the host.
       - OPENCV_FFMPEG_CAPTURE_OPTIONS=threads;1
-    # Hard CPU ceiling so the raw stream can never starve the ReID pipeline even
-    # while the Live tab is open. Combined with lazy readers (0 CPU when no
-    # client) this keeps ReID unaffected. Raise if smoother video is needed.
     cpus: "1.5"
     volumes:
       - ../../infer:/app/infer:ro
     ports: ["8770:8770"]
 
-  #  Worker for camera 1. Shares Qdrant gallery + Redis person-id sequence
-  #    with worker_cam2 → same physical person across cameras = same person_id.
+  #  Worker for camera 1
   worker_cam1:
     build: ../reid_worker
     env_file: ../reid_worker/.env

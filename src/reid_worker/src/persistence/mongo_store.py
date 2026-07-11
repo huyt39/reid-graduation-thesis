@@ -18,10 +18,12 @@ class MongoPersonStore:
     TIMELINE = "timeline"
     OCCLUSION_CANDIDATES = "occlusion_candidates"
 
+    # kết nối mongodb và chọn database lưu dữ liệu reid
     def __init__(self, uri: str = "mongodb://localhost:27017", db_name: str = "reid_production") -> None:
         self._client = AsyncIOMotorClient(uri)
         self._db = self._client[db_name]
 
+    # kiểm tra xung đột gender mạnh để chặn merge nhầm
     @staticmethod
     def attributes_have_strong_gender_conflict(attrs_a: dict, attrs_b: dict) -> bool:
         """Gender-only confident disagreement. Unconditional block — never
@@ -47,6 +49,7 @@ class MongoPersonStore:
             and conf_b >= confidence_threshold
         )
 
+    # kiểm tra xung đột thuộc tính mức vừa để làm tín hiệu nghi ngờ split id
     @staticmethod
     def attributes_have_moderate_conflict(attrs_a: dict, attrs_b: dict) -> bool:
         """Looser version of attributes_have_strong_conflict.
@@ -75,6 +78,7 @@ class MongoPersonStore:
             return True
         return False
 
+    # kiểm tra xung đột thuộc tính mạnh đủ để chặn merge identity
     @staticmethod
     def attributes_have_strong_conflict(attrs_a: dict, attrs_b: dict) -> bool:
         """Return True only for semantic conflicts strong enough to block merging.
@@ -119,6 +123,7 @@ class MongoPersonStore:
                 conflict_count += 1
         return conflict_count >= 2
 
+    # tạo index cho các collection để query nhanh và tránh trùng khóa chính
     async def ensure_indexes(self) -> None:
         db = self._db
         await db[self.PERSONS].create_index("person_id", unique=True)
@@ -137,6 +142,7 @@ class MongoPersonStore:
 
     # ── Writes ────────────────────────────────────────────────────────
 
+    # tạo hoặc cập nhật document person cùng attributes và snapshot tốt nhất
     async def upsert_person(
         self,
         person_id: int,
@@ -199,6 +205,7 @@ class MongoPersonStore:
         except Exception:
             log.error("mongo.upsert_person_failed", person_id=person_id, exc_info=True)
 
+    # lưu record tracklet đã xử lý cùng quality, matching và evidence
     async def add_tracklet_record(
         self,
         *,
@@ -244,6 +251,7 @@ class MongoPersonStore:
         except Exception:
             log.error("mongo.add_tracklet_failed", tracklet_id=tracklet_id, exc_info=True)
 
+    # lưu một lần xuất hiện của person theo tracklet
     async def add_sighting(
         self,
         *,
@@ -283,6 +291,7 @@ class MongoPersonStore:
         except Exception:
             log.error("mongo.add_sighting_failed", person_id=person_id, exc_info=True)
 
+    # cập nhật snapshot đại diện nếu snapshot mới có điểm tốt hơn
     async def update_person_snapshot(
         self,
         person_id: int,
@@ -315,6 +324,7 @@ class MongoPersonStore:
                 exc_info=True,
             )
 
+    # cập nhật asset/evidence bổ sung cho tracklet sau khi upload ảnh
     async def update_tracklet_assets(
         self,
         tracklet_id: str,
@@ -341,6 +351,7 @@ class MongoPersonStore:
                 exc_info=True,
             )
 
+    # cập nhật snapshot key cho sighting theo tracklet
     async def update_sighting_snapshot(
         self,
         tracklet_id: str,
@@ -360,6 +371,7 @@ class MongoPersonStore:
                 exc_info=True,
             )
 
+    # ghi event vào timeline của person
     async def add_timeline_event(
         self,
         *,
@@ -380,6 +392,7 @@ class MongoPersonStore:
         except Exception:
             log.error("mongo.add_timeline_failed", person_id=person_id, exc_info=True)
 
+    # lưu candidate bị occlusion hoặc chưa đủ chắc để gán identity
     async def add_occlusion_candidate(
         self,
         *,
@@ -426,6 +439,7 @@ class MongoPersonStore:
                 exc_info=True,
             )
 
+    # đánh dấu occlusion candidate đã được attach vào một person
     async def mark_occlusion_candidate_attached(self, candidate_id: str, person_id: int) -> None:
         """Resolve an orphan occlusion candidate after it was attached to a person
         as evidence — flips its status so it no longer reads as unresolved."""
@@ -445,9 +459,11 @@ class MongoPersonStore:
                 exc_info=True,
             )
 
+    # đếm toàn bộ tracklet đang gắn với person
     async def count_tracklets(self, person_id: int) -> int:
         return await self._db[self.TRACKLETS].count_documents({"person_id": person_id})
 
+    # đếm tracklet canonical đủ tin cậy để làm bằng chứng merge
     async def count_canonical_tracklets(self, person_id: int) -> int:
         """Count person evidence that is allowed to anchor identity merges.
 
@@ -464,6 +480,7 @@ class MongoPersonStore:
             }
         )
 
+    # tính độ di chuyển tổng thể để phát hiện vật thể tĩnh bị nhận nhầm là người
     async def person_motion_extent(self, person_id: int) -> dict | None:
         """Aggregate a person's bbox centroid spread + mean size across ALL its
         tracklets (first+last bbox of each). Used by the person-level static-
@@ -501,6 +518,7 @@ class MongoPersonStore:
             "point_count": len(cxs),
         }
 
+    # xóa cứng person và các record liên quan trong mongo
     async def remove_person(self, person_id: int) -> None:
         """Hard-delete a person and all its records (PERSONS/SIGHTINGS/TRACKLETS/
         TIMELINE). Used by the static-artifact filter to drop a false-positive
@@ -513,6 +531,7 @@ class MongoPersonStore:
         except Exception:
             log.error("mongo.remove_person_failed", person_id=person_id, exc_info=True)
 
+    # lấy danh sách person gần đây còn active
     async def list_recent_person_ids(self, limit: int = 50) -> list[int]:
         cursor = self._db[self.PERSONS].find(
             {"is_active": {"$ne": False}},
@@ -521,6 +540,7 @@ class MongoPersonStore:
         docs = await cursor.to_list(length=int(limit))
         return [int(doc["person_id"]) for doc in docs if doc.get("person_id") is not None]
 
+    # kiểm tra hai person có xuất hiện chồng frame trên cùng camera không
     async def persons_cooccur(self, person_a: int, person_b: int) -> bool:
         """Return True when two persons appear in overlapping frames on the same device."""
         cursor = self._db[self.TRACKLETS].find(
@@ -547,6 +567,7 @@ class MongoPersonStore:
                     return True
         return False
 
+    # tính khoảng cách frame nhỏ nhất giữa hai person trên cùng camera
     async def persons_min_frame_gap(self, person_a: int, person_b: int) -> int | None:
         """Return minimum non-overlap frame gap between two persons on one device.
 
@@ -584,6 +605,7 @@ class MongoPersonStore:
                 best_gap = gap if best_gap is None else min(best_gap, gap)
         return best_gap
 
+    # đếm số camera khác nhau mà hai person cùng xuất hiện
     async def persons_distinct_device_count(self, person_a: int, person_b: int) -> int:
         """Count distinct cameras across both persons' tracklets.
 
@@ -600,6 +622,7 @@ class MongoPersonStore:
         devices = {str(doc.get("device_id", "")) for doc in docs if doc.get("device_id")}
         return len(devices)
 
+    # lấy gap gần nhất kèm bbox chuyển tiếp để hỗ trợ so sánh duplicate
     async def persons_min_frame_gap_with_bboxes(
         self,
         person_a: int,
@@ -678,6 +701,7 @@ class MongoPersonStore:
                     }
         return best
 
+    # tìm chuyển tiếp bbox gần nhất trong một cửa sổ thời gian
     async def persons_closest_spatial_transition_with_bboxes(
         self,
         person_a: int,
@@ -766,6 +790,7 @@ class MongoPersonStore:
                         }
         return best
 
+    # kiểm tra hai person có xung đột thuộc tính mạnh không
     async def persons_have_strong_attribute_conflict(self, person_a: int, person_b: int) -> bool:
         """Return True for high-confidence semantic conflicts between two identities."""
         docs = await self._db[self.PERSONS].find(
@@ -777,6 +802,7 @@ class MongoPersonStore:
         attrs_b = attrs_by_pid.get(person_b, {})
         return self.attributes_have_strong_conflict(attrs_a, attrs_b)
 
+    # kiểm tra riêng xung đột gender mạnh giữa hai person
     async def persons_have_strong_gender_conflict(self, person_a: int, person_b: int) -> bool:
         """Unconditional gender-conflict block — see attributes_have_strong_gender_conflict."""
         docs = await self._db[self.PERSONS].find(
@@ -788,6 +814,7 @@ class MongoPersonStore:
         attrs_b = attrs_by_pid.get(person_b, {})
         return self.attributes_have_strong_gender_conflict(attrs_a, attrs_b)
 
+    # kiểm tra disagreement gender theo nhiều sighting liên tiếp
     async def persons_have_clear_gender_disagreement(
         self,
         person_a: int,
@@ -857,6 +884,7 @@ class MongoPersonStore:
             return False
         return label_a != label_b
 
+    # lấy attributes của hai person trong một lần query
     async def fetch_two_persons_attributes(
         self, person_a: int, person_b: int
     ) -> tuple[dict, dict]:
@@ -870,6 +898,7 @@ class MongoPersonStore:
         attrs_by_pid = {int(doc.get("person_id")): doc.get("attributes") or {} for doc in docs}
         return attrs_by_pid.get(person_a, {}), attrs_by_pid.get(person_b, {})
 
+    # kiểm tra xung đột thuộc tính mức vừa để dùng như tín hiệu mềm
     async def persons_have_moderate_attribute_conflict(self, person_a: int, person_b: int) -> bool:
         """Moderate version — see attributes_have_moderate_conflict.
 
@@ -884,6 +913,7 @@ class MongoPersonStore:
         attrs_b = attrs_by_pid.get(person_b, {})
         return self.attributes_have_moderate_conflict(attrs_a, attrs_b)
 
+    # gộp source person vào target person trên các collection mongo
     async def merge_person(self, *, source_person_id: int, target_person_id: int, reason: dict) -> None:
         """Merge source identity into target across Mongo collections."""
         now = datetime.now(timezone.utc)
@@ -938,6 +968,7 @@ class MongoPersonStore:
             details={"source_person_id": source_person_id, **reason},
         )
 
+    # tính lại attributes của person từ toàn bộ sightings bằng voting confidence
     async def _recompute_voted_attributes(self, person_id: int) -> None:
         """Confidence-weighted majority vote across all sightings of a person.
 
@@ -980,9 +1011,11 @@ class MongoPersonStore:
             {"person_id": person_id}, {"$set": attr_set}
         )
 
+    # refresh attributes person từ evidence sighting đã xác nhận
     async def recompute_person_attributes(self, person_id: int) -> None:
         """Refresh person-level attributes from confirmed sighting evidence."""
         await self._recompute_voted_attributes(person_id)
 
+    # đóng kết nối mongodb
     def close(self) -> None:
         self._client.close()

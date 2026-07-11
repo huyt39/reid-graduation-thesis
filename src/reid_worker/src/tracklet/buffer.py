@@ -2,14 +2,6 @@ from src.tracklet.models import Tracklet, TrackletEntry, TrackletState
 
 
 class TrackletBuffer:
-    """Buffers tracklet entries and decides readiness/staleness.
-
-    Readiness is measured in FRAME INDEX units (deterministic across runs),
-    not wall-clock time. The previous wall-clock version made readiness depend
-    on how fast messages were processed, so the same video produced different
-    person sets run-to-run. Frame indices come from the source video and are
-    identical every run.
-    """
 
     def __init__(
         self,

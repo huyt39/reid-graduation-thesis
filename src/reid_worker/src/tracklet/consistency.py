@@ -12,7 +12,7 @@ class TrackletConsistency:
     overall: float
 
 
-def compute_bbox_size_stability(entries: list[TrackletEntry]) -> float:
+def compute_bbox_size_stability(entries: list[TrackletEntry]) -> float: # đánh giá bbox có thay đổi kích thước quá mạnh giữa các frame không
     if len(entries) < 2:
         return 1.0
     deltas = []
@@ -20,12 +20,13 @@ def compute_bbox_size_stability(entries: list[TrackletEntry]) -> float:
         prev, curr = entries[i - 1].bbox_xyxy, entries[i].bbox_xyxy
         area_prev = max((prev[2] - prev[0]) * (prev[3] - prev[1]), 1)
         area_curr = max((curr[2] - curr[0]) * (curr[3] - curr[1]), 1)
+        # chênh lệch diện tích càng nhỏ thì bbox càng ổn định
         deltas.append(abs(area_curr - area_prev) / area_prev)
     mean_delta = sum(deltas) / len(deltas)
     return max(0.0, min(1.0, 1.0 - mean_delta))
 
 
-def compute_position_stability(entries: list[TrackletEntry]) -> float:
+def compute_position_stability(entries: list[TrackletEntry]) -> float: # đánh giá tâm bbox có di chuyển mượt không, nếu bbox nhảy quá xa so với kích thước người -> điểm thấp
     if len(entries) < 2:
         return 1.0
     displacements = []
@@ -35,12 +36,14 @@ def compute_position_stability(entries: list[TrackletEntry]) -> float:
         cx_curr, cy_curr = (curr[0] + curr[2]) / 2, (curr[1] + curr[3]) / 2
         displacement = ((cx_curr - cx_prev) ** 2 + (cy_curr - cy_prev) ** 2) ** 0.5
         bbox_size = max(curr[2] - curr[0], curr[3] - curr[1], 1)
+        # chuẩn hóa độ dịch tâm theo kích thước bbox để so sánh công bằng
         displacements.append(displacement / bbox_size)
     mean_disp = sum(displacements) / len(displacements)
     return max(0.0, min(1.0, 1.0 - mean_disp / 0.5))
 
 
 def compute_good_frame_streak(entries: list[TrackletEntry], good_threshold: float = 0.6) -> int:
+    # đếm chuỗi frame tốt liên tiếp dài nhất trong tracklet
     max_streak = 0
     current_streak = 0
     for entry in entries:
@@ -55,6 +58,7 @@ def compute_good_frame_streak(entries: list[TrackletEntry], good_threshold: floa
 def compute_good_frame_ratio(entries: list[TrackletEntry], good_threshold: float = 0.6) -> float:
     if not entries:
         return 0.0
+    # tỷ lệ frame có v_score vượt ngưỡng chất lượng
     good_count = sum(1 for e in entries if e.v_score >= good_threshold)
     return good_count / len(entries)
 
@@ -67,6 +71,7 @@ def compute_tracklet_consistency(
     pos_stab = compute_position_stability(entries)
     streak = compute_good_frame_streak(entries, good_threshold)
     ratio = compute_good_frame_ratio(entries, good_threshold)
+    # gộp độ ổn định kích thước, vị trí và tỷ lệ frame tốt
     overall = 0.35 * size_stab + 0.35 * pos_stab + 0.30 * ratio
     return TrackletConsistency(
         bbox_size_stability=round(size_stab, 4),

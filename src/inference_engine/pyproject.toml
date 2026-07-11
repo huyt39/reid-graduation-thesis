@@ -10,12 +10,20 @@ dependencies = [
   "structlog>=24.4.0",
   "fastapi>=0.116.0",
   "uvicorn>=0.30.0",
-  "numpy>=1.26.0",
-  "torch>=2.0.0",
-  "torchvision>=0.15.0",
-  "Pillow>=10.0.0",
+  # Pinned exactly: the embedding is numerically sensitive to torch/numpy
+  # versions. Loose `>=` + a Dockerfile that ignores uv.lock let a rebuild
+  # silently pull newer wheels (torch 2.12.1 / numpy 2.4.6), which shifted
+  # OSNet embeddings enough to flip borderline gallery matches (~0.78->0.80)
+  # and over-merge distinct people. These pins match the uv.lock baseline and
+  # keep embeddings bit-stable across rebuilds.
+  "numpy==2.4.3",
+  "torch==2.12.0",
+  "torchvision==0.27.0",
+  "Pillow==12.2.0",
   "python-multipart>=0.0.20",
-  "onnxruntime>=1.20.0",
+  "onnxruntime==1.26.0",
+  # EfficientNet-B0 gender classifier loader (lukemelas layout). Pure-Python, torch-only dep.
+  "efficientnet-pytorch==0.7.1",
 ]
 
 [build-system]

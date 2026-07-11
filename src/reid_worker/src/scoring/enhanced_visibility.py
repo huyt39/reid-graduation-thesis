@@ -32,6 +32,7 @@ def compute_vel_smooth(
     if center_prev is None:
         return 0.5
 
+    # đo bbox di chuyển có mượt không: lệch tâm ít và gia tốc nhỏ thì điểm cao
     displacement = np.linalg.norm(center_curr - center_prev)
     normalized_disp = displacement / (bbox_size + 1e-7)
 
@@ -65,14 +66,12 @@ def compute_v_worker(
     weights: dict[str, float] | None = None,
     v_edge_floor_ratio: float = 0.0,
 ) -> float:
+    # trộn điểm nhìn rõ từ edge với độ ổn định bbox theo iou và chuyển động
     w = weights or {"v_edge": 0.60, "iou_prev": 0.25, "vel_smooth": 0.15}
     blended = (
         w["v_edge"] * v_edge + w["iou_prev"] * iou_prev_score + w["vel_smooth"] * vel_smooth_score
     )
-    # Floor: tracking-continuity terms (iou_prev / vel_smooth) drop sharply when a
-    # person RE-ENTERS after occlusion (ByteTrack box jump) — exactly the case an
-    # occlusion-oriented ReID must keep. Don't let those terms drag a clear,
-    # well-framed crop (high v_edge) below the floor and out of promotion gates.
+
     if v_edge_floor_ratio > 0.0:
         return max(blended, v_edge_floor_ratio * v_edge)
     return blended

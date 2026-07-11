@@ -51,7 +51,7 @@ class QdrantPersonStore:
                 vectors_config=VectorParams(size=self.embedding_dim, distance=Distance.COSINE),
             )
 
-    # ── Search ────────────────────────────────────────────────────────────────
+    # Tìm các person gần nhất với embedding mới. Vì mỗi person có thể có nhiều vector gallery, hàm này gom kết quả theo person_id, lấy điểm tốt nhất hoặc kết hợp top score để ra kết quả ổn định hơn.
 
     def search(self, embedding: np.ndarray, top_k: int = 5, score_threshold: float | None = None) -> list[tuple[int, float]]:
         """Return up to top_k (person_id, score) pairs above the threshold.
@@ -158,7 +158,7 @@ class QdrantPersonStore:
         except Exception:
             pass
 
-    # ── Write ─────────────────────────────────────────────────────────────────
+    # Thêm embedding đầu tiên cho một person mới. Đây thường là anchor ban đầu.
 
     def add_person(self, person_id: int, embedding: np.ndarray, metadata: dict) -> None:
         """Add the first gallery entry for a newly created person."""
@@ -221,6 +221,7 @@ class QdrantPersonStore:
                 per_person_best[pid] = score
         return sorted(per_person_best.items(), key=lambda item: -item[1])[:top_k]
 
+#Cập nhật gallery của person khi tracklet mới đủ tốt: visibility đủ cao, consistency đủ cao, tracklet đủ dài, và embedding vẫn giống gallery hiện tại. Nếu đạt, nó thêm embedding mới vào gallery.
     def gated_momentum_update(
         self,
         person_id: int,
@@ -381,7 +382,7 @@ class QdrantPersonStore:
                 payload={"person_id": target_person_id},
                 points=aux_point_ids,
             )
-        self._prune_gallery(target_person_id)
+        self._prune_gallery(target_person_id) # Giới hạn số vector lưu cho mỗi person. Khi quá nhiều vector, nó giữ lại các vector đa dạng nhất thay vì giữ tất cả.
         self._prune_aux_upper(target_person_id)
 
     def _scroll_aux_upper_records(self, person_id: int | None = None):

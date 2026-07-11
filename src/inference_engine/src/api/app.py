@@ -1,3 +1,6 @@
+# service has which endpoints and each endpoint's role, endpoint's input and output json
+# create ModelRegistry, batch embedding and expose endpoints
+
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -25,7 +28,7 @@ async def lifespan(app: FastAPI):
     registry.load()
     batch_queue.start()
     yield
-    await batch_queue.stop()
+    await batch_queue.stop() # model no load in endpoint req -> load when service start -> req no need to reload model each time
 
 
 app = FastAPI(title=settings.service_name, lifespan=lifespan)
@@ -47,7 +50,7 @@ def readyz():
         "device": str(registry.device),
     }
 
-
+# images -> bytes -> registry -> result -> json
 # embedding endpoints
 
 @app.post("/embedding")
@@ -55,7 +58,7 @@ async def embedding(
     image: UploadFile = File(...),
     model: str = Form("osnet"),
 ):
-    """Single-image embedding — transparently batched with concurrent requests."""
+    # Single-image embedding — transparently batched with concurrent requests -> 1 image 1 req, queue to batch
     data = await image.read()
     try:
         features = await batch_queue.enqueue(data, model=model)
@@ -69,7 +72,7 @@ async def embedding_batch(
     images: List[UploadFile] = File(...),
     model: str = Form("osnet"),
 ):
-    """Explicit multi-image batch embedding extraction."""
+    # Explicit multi-image batch embedding extraction -> multi images 1 req, call registry directly
     blobs = [await img.read() for img in images]
     try:
         features_list = registry.extract_embedding_batch(blobs, model=model)

@@ -1,3 +1,6 @@
+# define data of a frame and cache newest frame for each device
+# between kafka and ws (kafka: image data->bytes; frame cache: image data -> base64)
+
 from __future__ import annotations
 
 import threading
@@ -21,8 +24,8 @@ class FrameCache:
     """Thread-safe cache storing the latest frame per device."""
 
     def __init__(self) -> None:
-        self._frames: dict[str, FrameData] = {}
-        self._lock = threading.Lock()
+        self._frames: dict[str, FrameData] = {} # latest frame of each cam
+        self._lock = threading.Lock() # prevent race condition
 
     def update(self, frame: FrameData) -> None:
         with self._lock:

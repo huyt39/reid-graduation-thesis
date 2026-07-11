@@ -12,8 +12,10 @@ logger = Logger(__name__)
 
 
 class STrack(BaseTrack):
+    # kalman filter dùng chung để dự đoán nhiều track cùng lúc
     shared_kalman = KalmanFilterXYAH()
 
+    # tạo một track tạm từ detection đầu vào
     def __init__(self, xywh: list[float], score: float, cls: Any):
         super().__init__()
         assert len(xywh) in {5, 6}, f"expected 5 or 6 values but got {len(xywh)}"
@@ -27,6 +29,7 @@ class STrack(BaseTrack):
         self.idx = xywh[-1]
         self.angle = xywh[4] if len(xywh) == 6 else None
 
+    # dự đoán vị trí tiếp theo của một track
     def predict(self):
         mean_state = self.mean.copy()
         if self.state != TrackState.Tracked:
@@ -34,6 +37,7 @@ class STrack(BaseTrack):
         self.mean, self.covariance = self.kalman_filter.predict(mean_state, self.covariance)
 
     @staticmethod
+    # dự đoán vị trí cho nhiều track cùng lúc
     def multi_predict(stracks: list["STrack"]):
         if len(stracks) <= 0:
             return
@@ -48,6 +52,7 @@ class STrack(BaseTrack):
             stracks[i].covariance = cov
 
     @staticmethod
+    # áp dụng biến đổi camera motion cho nhiều track
     def multi_gmc(stracks: list["STrack"], H: np.ndarray = np.eye(2, 3)):
         if len(stracks) == 0:
             return
@@ -63,6 +68,7 @@ class STrack(BaseTrack):
             stracks[i].mean = mean
             stracks[i].covariance = cov
 
+    # kích hoạt track mới và cấp track id
     def activate(self, kalman_filter: KalmanFilterXYAH, frame_id: int):
         self.kalman_filter = kalman_filter
         self.track_id = self.next_id()
@@ -74,6 +80,7 @@ class STrack(BaseTrack):
         self.frame_id = frame_id
         self.start_frame = frame_id
 
+    # kích hoạt lại track từng bị lost khi match lại được detection
     def re_activate(self, new_track: "STrack", frame_id: int, new_id: bool = False):
         self.mean, self.covariance = self.kalman_filter.update(
             self.mean, self.covariance, self.convert_coords(new_track.tlwh)
@@ -89,6 +96,7 @@ class STrack(BaseTrack):
         self.angle = new_track.angle
         self.idx = new_track.idx
 
+    # cập nhật track bằng detection mới ở frame hiện tại
     def update(self, new_track: "STrack", frame_id: int):
         self.frame_id = frame_id
         self.tracklet_len += 1
@@ -102,10 +110,12 @@ class STrack(BaseTrack):
         self.angle = new_track.angle
         self.idx = new_track.idx
 
+    # chuyển bbox sang format dùng cho kalman
     def convert_coords(self, tlwh: np.ndarray) -> np.ndarray:
         return self.tlwh_to_xyah(tlwh)
 
     @property
+    # lấy bbox dạng top-left width-height
     def tlwh(self) -> np.ndarray:
         if self.mean is None:
             return self._tlwh.copy()
@@ -115,12 +125,14 @@ class STrack(BaseTrack):
         return ret
 
     @property
+    # lấy bbox dạng x1 y1 x2 y2
     def xyxy(self) -> np.ndarray:
         ret = self.tlwh.copy()
         ret[2:] += ret[:2]
         return ret
 
     @staticmethod
+    # đổi bbox tlwh sang center x, center y, aspect, height
     def tlwh_to_xyah(tlwh: np.ndarray) -> np.ndarray:
         ret = np.asarray(tlwh).copy()
         ret[:2] += ret[2:] / 2
@@ -128,12 +140,14 @@ class STrack(BaseTrack):
         return ret
 
     @property
+    # lấy bbox dạng center x, center y, width, height
     def xywh(self) -> np.ndarray:
         ret = np.asarray(self.tlwh).copy()
         ret[:2] += ret[2:] / 2
         return ret
 
     @property
+    # lấy bbox có thêm góc xoay nếu detection có angle
     def xywha(self) -> np.ndarray:
         if self.angle is None:
             logger.warning("angle_missing")
@@ -141,12 +155,14 @@ class STrack(BaseTrack):
         return np.concatenate([self.xywh, self.angle[None]])
 
     @property
+    # đóng gói kết quả track để trả ra ngoài
     def result(self) -> list[float]:
         coords = self.xyxy if self.angle is None else self.xywha
         return coords.tolist() + [self.track_id, self.score, self.cls, self.idx] + [self.state]
 
 
 class BYTETracker:
+    # khởi tạo tracker và các danh sách track theo trạng thái
     def __init__(self, args, frame_rate: int = 30):
         self.tracked_stracks = []
         self.lost_stracks = []
@@ -157,6 +173,7 @@ class BYTETracker:
         self.kalman_filter = self.get_kalmanfilter()
         self.reset_id()
 
+    # xử lý một frame mới và trả về các track đang active
     def update(self, scores, bboxes, cls, img=None, feats=None):
         self.frame_id += 1
         activated_stracks, refind_stracks, lost_stracks, removed_stracks = [], [], [], []
@@ -246,26 +263,32 @@ class BYTETracker:
 
         return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
 
+    # tạo kalman filter cho tracker
     def get_kalmanfilter(self):
         return KalmanFilterXYAH()
 
+    # chuyển detection thành danh sách strack
     def init_track(self, dets, scores, cls, img=None):
         return [STrack(xyxy, s, c) for (xyxy, s, c) in zip(dets, scores, cls)] if len(dets) else []
 
+    # tính distance giữa track và detection để matching
     def get_dists(self, tracks, detections):
         dists = matching.iou_distance(tracks, detections)
         if self.args.fuse_score:
             dists = matching.fuse_score(dists, detections)
         return dists
 
+    # dự đoán vị trí cho danh sách track
     def multi_predict(self, tracks):
         STrack.multi_predict(tracks)
 
     @staticmethod
+    # reset bộ đếm track id
     def reset_id():
         STrack.reset_id()
 
     @staticmethod
+    # gộp hai danh sách track và tránh trùng track id
     def joint_stracks(tlista, tlistb):
         exists = {}
         res = []
@@ -279,11 +302,13 @@ class BYTETracker:
         return res
 
     @staticmethod
+    # lấy các track ở list a không xuất hiện trong list b
     def sub_stracks(tlista, tlistb):
         track_ids_b = {t.track_id for t in tlistb}
         return [t for t in tlista if t.track_id not in track_ids_b]
 
     @staticmethod
+    # loại duplicate giữa track active và track lost
     def remove_duplicate_stracks(stracksa, stracksb):
         pdist = matching.iou_distance(stracksa, stracksb)
         pairs = np.where(pdist < 0.15)

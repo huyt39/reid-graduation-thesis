@@ -11,6 +11,7 @@ _BUCKET = "reid-snapshots"
 
 
 class MinIOSnapshotStore:
+    # kết nối minio và chuẩn bị bucket lưu snapshot
     def __init__(
         self,
         endpoint: str = "localhost:9000",
@@ -27,11 +28,13 @@ class MinIOSnapshotStore:
         except Exception as err:
             log.error("minio.init_failed", error=str(err), exc_info=True)
 
+    # tạo bucket snapshot nếu chưa tồn tại
     def _ensure_bucket(self) -> None:
         if not self._client.bucket_exists(_BUCKET):
             self._client.make_bucket(_BUCKET)
             log.info("minio.bucket_created", bucket=_BUCKET)
 
+    # upload bytes ảnh jpeg vào minio theo object key
     def upload_snapshot(self, key: str, image_bytes: bytes) -> str:
         """Upload JPEG bytes and return the object key."""
         if not self._available:
@@ -49,12 +52,15 @@ class MinIOSnapshotStore:
             log.error("minio.upload_failed", key=key, error=str(err), exc_info=True)
             return ""
 
+    # lưu ảnh đại diện tốt nhất của một person
     def upload_person_snapshot(self, person_id: int, image_bytes: bytes) -> str:
         return self.upload_snapshot(f"persons/{person_id}/best.jpg", image_bytes)
 
+    # lưu ảnh tốt nhất của một tracklet
     def upload_tracklet_snapshot(self, tracklet_id: str, image_bytes: bytes) -> str:
         return self.upload_snapshot(f"tracklets/{tracklet_id}/best.jpg", image_bytes)
 
+    # lưu snapshot theo từng frame của tracklet
     def upload_tracklet_frame_snapshot(
         self,
         tracklet_id: str,
@@ -63,6 +69,7 @@ class MinIOSnapshotStore:
     ) -> str:
         return self.upload_snapshot(f"tracklets/{tracklet_id}/frames/{frame_idx}.jpg", image_bytes)
 
+    # tạo url tạm thời để xem hoặc tải ảnh snapshot
     def presigned_url(self, key: str, expires_hours: int = 1) -> str:
         from datetime import timedelta
         if not key or not self._available:

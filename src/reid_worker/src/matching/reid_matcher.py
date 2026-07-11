@@ -1,3 +1,4 @@
+# trung tâm ra quyết định matching
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -25,11 +26,6 @@ class ReIDMatcher:
         promote_v_threshold: float = 0.6,
         promote_consistency_threshold: float = 0.7,
         new_identity_min_tracklet_len: int = 6,
-        # Default to 0 so legacy unit tests that don't model
-        # high-quality-frame counting still pass through the gate.
-        # Production wiring in workers/main.py passes the configured
-        # settings.min_high_quality_frames value, enforcing the PDF Bước 5
-        # condition in runtime.
         min_high_quality_frames: int = 0,
         update_v_threshold: float = 0.6,
         update_consistency_threshold: float = 0.7,
@@ -52,11 +48,6 @@ class ReIDMatcher:
         current_identity_switch_max_current_score: float = 0.70,
         capped_identity_soft_match_threshold: float = 0.72,
         near_gallery_defer_threshold: float = 0.50,
-        # Recall fallback: after sustained non-match, a deferred-near-gallery
-        # cluster whose best gallery match is still clearly different-person-level
-        # (< this) is minted as a NEW person instead of deferring forever. 0.0
-        # disables (pure defer). Risk: may split a same-person cross-view re-entry
-        # whose embedding is weak — keep low. See plan E9.
         near_gallery_deferred_mint_max_score: float = 0.0,
         good_streak_min_consecutive: int = 4,
         good_streak_promotion_enabled: bool = True,
@@ -107,10 +98,6 @@ class ReIDMatcher:
 
     @staticmethod
     def _composite_quality(v_avg: float, embedding_consistency: float) -> float:
-        # PDF Bước 5 promote-tentative gate uses BOTH v_avg and
-        # embedding_consistency conjunctively. We rank attempts by their
-        # product so an attempt that improves on either dimension can
-        # replace a stale-but-marginally-higher-v_avg attempt.
         return float(max(0.0, v_avg) * max(0.0, embedding_consistency))
 
     def _defer_short_new_identity(
@@ -144,11 +131,7 @@ class ReIDMatcher:
             int(tent.get("num_high_quality_frames", 0) or 0),
             int(num_high_quality_frames or 0),
         )
-        # Rank attempts by composite (v_avg * consistency) so a later
-        # attempt with better consistency replaces a stale first-attempt
-        # snapshot whose consistency was 0.40 from a partially-occluded
-        # frame. The previous v_avg-only criterion stranded the matcher
-        # with attempt-1 metadata even when attempt 5 was clearly cleaner.
+        
         if composite > float(tent.get("composite", -1.0)):
             tent["embedding"] = embedding
             tent["v_avg"] = v_avg
@@ -181,25 +164,7 @@ class ReIDMatcher:
         tentative_attempts: int | None,
         on_new_identity: Callable[[int], None] | None,
     ) -> int | None:
-        """Single bottleneck for minting a new person_id.
-
-        Enforces the four conjunctive gates from PDF Bước 5
-        (promote-tentative policy):
-
-          1. tracklet_len >= new_identity_min_tracklet_len
-          2. num_high_quality_frames >= min_high_quality_frames
-          3. v_avg >= promote_v_threshold
-          4. embedding_consistency >= promote_consistency_threshold
-
-        The fifth design condition — "no candidate above match threshold"
-        — is satisfied implicitly by the call sites: every code path that
-        funnels into this helper has already searched the gallery and
-        failed to find an eligible match. Re-running the search here
-        would double the Qdrant cost without adding safety.
-
-        Returns the new person_id if all gates pass, else None (the
-        caller is responsible for keeping the tracklet tentative).
-        """
+       
         if tracklet_len < self.new_identity_min_tracklet_len:
             self._record_decision(
                 track_id,
@@ -425,13 +390,6 @@ class ReIDMatcher:
         pid, score = eligible[0]
         runner_up = eligible[1][1] if len(eligible) > 1 else None
         gap = (score - runner_up) if runner_up is not None else float("inf")
-        # Always compute full-body gallery support for this candidate (min_score
-        # =0.0 so the real value is visible even when low). The upper-body crop
-        # alone is weak: two different people at different scale can score high on
-        # torso-cropped embeddings (observed red-jacket vs black-shirt = 0.74 on
-        # the upper crop while being different people). Requiring full-body support
-        # rejects those cross-person glues while keeping genuine same-person
-        # cross-scale links (which retain decent full-body similarity).
         full_gallery_score = self.store.search_person(pid, embedding, min_score=0.0)
         full_fmt = "n/a" if full_gallery_score is None else f"{full_gallery_score:.3f}"
         if self.scale_aux_full_gallery_min_score > 0.0 and (
@@ -499,11 +457,7 @@ class ReIDMatcher:
         tentative_attempts: int | None,
         on_new_identity: Callable[[int], None] | None = None,
     ) -> int | None:
-        # Thin delegator to the gated mint helper. Every create site in the
-        # matcher must funnel through here so the promote-tentative policy
-        # (PDF Bước 5) is enforced uniformly. on_new_identity fires
-        # synchronously inside the helper so the attribute-conflict guard
-        # sees the new person_id immediately.
+    
         return self._mint_new_identity_if_allowed(
             track_id=track_id,
             embedding=embedding,
@@ -531,18 +485,6 @@ class ReIDMatcher:
         forbidden_person_ids: set[int] | None = None,
         recent_incompatible_person_ids: set[int] | None = None,
         allow_new_identity: bool = True,
-        # When allow_new_identity=False, capped_soft_match is the fallback
-        # path that absorbs the tracklet into the nearest existing person
-        # at a deliberately-lower threshold (capped_identity_soft_match_threshold,
-        # default 0.57). That behaviour is appropriate when minting is
-        # denied by the MAX_PERSON_IDENTITIES cap (we can't make a new
-        # person, so absorb at low confidence). It is the WRONG behaviour
-        # when minting is denied because the tracklet itself is
-        # unreliable (e.g., embedding consensus failed) — those tracklets
-        # should defer to occlusion candidates, not get force-merged into
-        # the nearest existing person at sim 0.57. The caller signals the
-        # distinction via this flag: True for the identity-cap case,
-        # False for the unreliable-tracklet case.
         allow_capped_soft_match: bool = True,
         on_new_identity: Callable[[int], None] | None = None,
         good_streak: int = 0,

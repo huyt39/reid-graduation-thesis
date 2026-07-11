@@ -1,15 +1,10 @@
 """Multi-attribute voting with per-tracklet majority + per-person hysteresis.
-
-Generalizes the previous gender-only voter to handle the 8 PA-100K attributes (and
-any other tasks the inference engine returns). Each task is voted independently;
-per-person history is tracked per-task so a flip on `gender` doesn't reset state
-on `lower` or `hat`.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-
+# person's current status
 @dataclass
 class _PersonAttrHistory:
     current_label: str = "unknown"
@@ -18,23 +13,18 @@ class _PersonAttrHistory:
     last_tracklet_label: str = "unknown"
     stable_support: int = 0
 
-
+# lưu phiếu trong một tracklet cho từng loại thuộc tính - đếm số lần mỗi label xuất hiện và tổng confidence của label đó
 @dataclass
 class _TrackletTaskVote:
     counts: dict[str, int] = field(default_factory=dict)
     label_conf: dict[str, float] = field(default_factory=dict)  # per-label confidence sum
     n: int = 0
 
-
+# khởi tạo các ngưỡng quyết định và 2 bộ nhớ chính:_tracklet_votes: gom dự đoán theo từng track_id; _person_history: lưu lịch sử thuộc tính theo từng person_id
 class AttributeVoter:
     """Two-level voting over arbitrary attribute tasks.
-
     Level 1 (per tracklet): accumulate frame-level predictions, majority wins.
     Level 2 (per person): only flip a person-level label when 2 consecutive
-    tracklets agree on a *different* label with confidence >= ``person_threshold``.
-
-    Frame inputs follow the inference engine's ``/attributes/classify`` shape:
-    ``{task: {"label": str, "confidence": float, "probabilities": ...}}``.
     """
 
     def __init__(
@@ -51,10 +41,9 @@ class AttributeVoter:
         # person_id -> task -> hysteresis state
         self._person_history: dict[int, dict[str, _PersonAttrHistory]] = {}
 
-    # ── Tracklet-level ────────────────────────────────────────────────
+    # tracklet level
 
     def vote_frame(self, track_id: int, attrs: dict[str, dict]) -> None:
-        """Accumulate one frame's predictions for the given tracklet."""
         votes = self._tracklet_votes.setdefault(track_id, {})
         for task, info in attrs.items():
             label = info.get("label") if isinstance(info, dict) else None
@@ -67,7 +56,6 @@ class AttributeVoter:
             v.n += 1
 
     def peek_tracklet_gender(self, track_id: int) -> tuple[str, float]:
-        """Return the current majority-vote gender without consuming tracklet state."""
         votes = self._tracklet_votes.get(track_id, {})
         v = votes.get("gender")
         if v is None or v.n == 0:
@@ -77,29 +65,25 @@ class AttributeVoter:
         return (best_label, round(best_label_avg_conf, 4))
 
     def resolve_tracklet(self, track_id: int) -> dict[str, tuple[str, float]]:
-        """Majority-vote each task. Returns ``{task: (label, avg_confidence)}``. Drops state."""
         votes = self._tracklet_votes.pop(track_id, {})
         out: dict[str, tuple[str, float]] = {}
         for task, v in votes.items():
             if v.n == 0:
                 out[task] = ("unknown", 0.0)
                 continue
-            # Confidence-weighted majority: the label with the highest total confidence wins.
-            # Per-label avg confidence is used for the threshold check so a label that wins
-            # by count but with low per-frame confidence doesn't inflate the reported value.
+
             best_label = max(v.label_conf.items(), key=lambda kv: kv[1])[0]
             best_label_avg_conf = v.label_conf[best_label] / v.counts[best_label]
             out[task] = (best_label, round(best_label_avg_conf, 4))
         return out
 
-    # ── Person-level (hysteresis, per task) ───────────────────────────
+    # person level
 
     def resolve_person(
         self,
         person_id: int,
         tracklet_attrs: dict[str, tuple[str, float]],
     ) -> dict[str, tuple[str, float]]:
-        """Update per-person, per-task hysteresis. Returns the (possibly unchanged) snapshot."""
         per_person = self._person_history.setdefault(person_id, {})
         out: dict[str, tuple[str, float]] = {}
         for task, (t_label, t_conf) in tracklet_attrs.items():
@@ -113,7 +97,6 @@ class AttributeVoter:
                 out[task] = (h.current_label, h.current_confidence)
                 continue
 
-            # Same label as current — reinforce, slow exponential update.
             if t_label == h.current_label:
                 h.consecutive_agree = 0
                 h.last_tracklet_label = t_label
@@ -122,14 +105,12 @@ class AttributeVoter:
                 out[task] = (h.current_label, round(h.current_confidence, 4))
                 continue
 
-            # Different label — count consecutive agreements on the new label.
             if t_label == h.last_tracklet_label:
                 h.consecutive_agree += 1
             else:
                 h.consecutive_agree = 1
             h.last_tracklet_label = t_label
 
-            # Flip only on 2 consecutive high-confidence agreements.
             flip_threshold = float(self.task_flip_thresholds.get(task, self.flip_threshold))
             if h.consecutive_agree >= 2 and t_conf >= flip_threshold:
                 h.current_label = t_label
@@ -140,19 +121,15 @@ class AttributeVoter:
             out[task] = (h.current_label, round(h.current_confidence, 4))
         return out
 
-    # ── Read-only accessors (used by emission code) ───────────────────
 
     def person_snapshot(self, person_id: int) -> dict[str, tuple[str, float]]:
-        """Return ``{task: (current_label, current_confidence)}`` for tasks seen so far."""
         per_person = self._person_history.get(person_id, {})
         return {task: (h.current_label, h.current_confidence) for task, h in per_person.items()}
 
     def known_person_ids(self) -> set[int]:
-        """Return the set of person_ids that already have person-level history."""
         return set(self._person_history.keys())
 
     def person_task_stable_support(self, person_id: int, task: str) -> int:
-        """Return how many resolved tracklets have reinforced the current task label."""
         per_person = self._person_history.get(person_id, {})
         history = per_person.get(task)
         if history is None or history.current_label == "unknown":

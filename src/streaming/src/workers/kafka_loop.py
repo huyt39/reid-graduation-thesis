@@ -83,7 +83,7 @@ async def run_kafka_loop(
         try:
             await asyncio.sleep(0)  # yield to WebSocket handlers
 
-            messages = await asyncio.to_thread(
+            messages = await asyncio.to_thread( # read message from kafka consumer
                 consumer.poll, timeout_ms=1000, max_records=max_poll_records,
             )
 
@@ -111,7 +111,7 @@ async def run_kafka_loop(
                 continue
 
             for msg in messages:
-                frame = _decode_frame(msg, minio_urls=minio_urls, source=source)
+                frame = _decode_frame(msg, minio_urls=minio_urls, source=source) # decode kafka to frame data
                 if frame is None:
                     continue
 

@@ -1,3 +1,5 @@
+# read kafka message true topic, schema, return python dict for the realtime process
+
 import io
 from pathlib import Path
 
@@ -5,7 +7,7 @@ import avro.schema
 from avro.io import BinaryDecoder, DatumReader
 from kafka import KafkaConsumer
 
-
+# find and load avro schema
 def _resolve_schema_path(schema_path: str) -> Path:
     path = Path(schema_path)
     if path.is_absolute():
@@ -31,7 +33,7 @@ def load_avro_schema(schema_path: str) -> avro.schema.Schema:
     with resolved.open("r", encoding="utf-8") as f:
         return avro.schema.parse(f.read())
 
-
+# decode kafka bytes to dict
 def deserialize_avro(schema: avro.schema.Schema, raw_bytes: bytes) -> dict:
     reader = DatumReader(schema)
     buf = io.BytesIO(raw_bytes)
@@ -44,7 +46,7 @@ class StreamingKafkaConsumer:
         self,
         bootstrap_servers: str = "localhost:29092",
         topic: str = "reid_output",
-        group_id: str = "streaming_consumer_group",
+        group_id: str = "streaming_consumer_group", # use group id to manage consumer group
         schema_path: str = "src/contracts/reid_output.avsc",
     ):
         self.topic = topic

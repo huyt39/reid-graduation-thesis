@@ -1,8 +1,4 @@
-"""Async batch queue for transparent request batching on the /embedding endpoint.
-
-Collects concurrent single-image requests and fires them as one GPU batch,
-honouring max_batch_size and batch_timeout_ms from config.
-"""
+# just serve for post /embedding endpoint
 from __future__ import annotations
 
 import asyncio
@@ -16,20 +12,12 @@ log = structlog.get_logger()
 
 @dataclass
 class _Item:
-    tensor: torch.Tensor          # shape [1, 3, H, W] already on device
+    tensor: torch.Tensor          # shape [1, 3, H, W] already on device, also preprocessed image
     future: asyncio.Future         # resolved with list[float]
     model: str
 
 
 class EmbeddingBatchQueue:
-    """Drop-in replacement for direct registry.extract_embedding() calls.
-
-    Usage:
-        queue = EmbeddingBatchQueue(registry, max_batch_size=32, timeout_ms=10)
-        queue.start()                          # in lifespan startup
-        features = await queue.enqueue(img_bytes, model="osnet")
-        await queue.stop()                     # in lifespan shutdown
-    """
 
     def __init__(self, registry, max_batch_size: int = 32, timeout_ms: int = 10) -> None:
         self._registry = registry
@@ -38,8 +26,7 @@ class EmbeddingBatchQueue:
         self._q: asyncio.Queue[_Item] = asyncio.Queue()
         self._task: asyncio.Task | None = None
 
-    # ── Lifecycle ──────────────────────────────────────────────────────
-
+    # lifecycle
     def start(self) -> None:
         self._task = asyncio.create_task(self._processor(), name="embedding-batch-queue")
         log.info("batch_queue.started", max_batch=self._max, timeout_ms=int(self._timeout * 1000))
@@ -52,8 +39,7 @@ class EmbeddingBatchQueue:
             except asyncio.CancelledError:
                 pass
 
-    # ── Public API ─────────────────────────────────────────────────────
-
+    # public api
     async def enqueue(self, image_bytes: bytes, model: str = "osnet") -> list[float]:
         """Preprocess image and enqueue; returns when the batch is executed."""
         loop = asyncio.get_running_loop()
@@ -64,8 +50,7 @@ class EmbeddingBatchQueue:
         await self._q.put(_Item(tensor=tensor, future=future, model=model))
         return await future
 
-    # ── Background processor ───────────────────────────────────────────
-
+    # background processor
     async def _processor(self) -> None:
         while True:
             # Block until at least one item is available

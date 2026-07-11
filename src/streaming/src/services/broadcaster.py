@@ -1,3 +1,5 @@
+# manage ws clients and send new frame to client of each cam
+
 from __future__ import annotations
 
 import asyncio
@@ -34,7 +36,7 @@ class WebSocketBroadcaster:
             self._connections.remove(ws)
         self._subscriptions.pop(ws, None)
 
-    def subscribe(self, ws: WebSocket, device_ids: list[str]) -> None:
+    def subscribe(self, ws: WebSocket, device_ids: list[str]) -> None: # client have to send message subscribe
         self._subscriptions[ws] = set(device_ids)
 
     async def send_device_list(self, ws: WebSocket) -> None:
@@ -50,7 +52,7 @@ class WebSocketBroadcaster:
             return
         await ws.send_text(self._frame_to_json(frame))
 
-    async def broadcast(self, frame: FrameData) -> None:
+    async def broadcast(self, frame: FrameData) -> None: # convert framedata to json
         if not self._connections:
             return
 
@@ -73,9 +75,9 @@ class WebSocketBroadcaster:
     async def _safe_send(
         self, ws: WebSocket, message: str, disconnected: list[WebSocket],
     ) -> None:
-        async with self._semaphore:
+        async with self._semaphore: # no send too many ws at the same time
             try:
-                if ws.client_state == WebSocketState.CONNECTED:
+                if ws.client_state == WebSocketState.CONNECTED: # just send if still connected
                     await ws.send_text(message)
             except Exception:
                 disconnected.append(ws)

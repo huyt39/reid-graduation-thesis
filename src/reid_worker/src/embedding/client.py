@@ -26,7 +26,7 @@ class ModelServiceClient:
             await self.client.aclose()
             self.client = None
 
-    async def extract_features(
+    async def extract_features( # send images to endpoint /embedding for images'vector
         self,
         image_data: bytes,
         model: str = "osnet",
@@ -54,11 +54,7 @@ class ModelServiceClient:
         raise Exception(f"Batch feature extraction failed: {response.status_code}: {response.text}")
 
     async def classify_gender(self, image_data: bytes) -> dict[str, Any]:
-        """Call POST /gender/classify. Returns {"gender", "confidence", "probabilities"}.
-
-        Note: the inference engine serves this endpoint from the multi-attribute model
-        when available, so the response shape is preserved for backward compat but the
-        underlying weights are the regularized 8-task model.
+        """Call POST /gender/classify. Returns {"gender", "confidence", "probabilities"}
         """
         self._ensure_client()
         files = {"image": ("image.jpg", image_data, "image/jpeg")}
@@ -68,11 +64,7 @@ class ModelServiceClient:
         raise Exception(f"Gender classification failed: {response.status_code}: {response.text}")
 
     async def classify_attributes(self, image_data: bytes) -> dict[str, Any]:
-        """Call POST /attributes/classify — full 8-task person-attribute prediction.
-
-        Returns a dict keyed by task name; each value carries ``label``, ``confidence``,
-        and ``probabilities``. See ``inference_engine/src/models/multi_attr_classifier.py``
-        for the task list and label vocabularies.
+        """Call POST /attributes/classify — full 8-task person-attribute prediction
         """
         self._ensure_client()
         files = {"image": ("image.jpg", image_data, "image/jpeg")}

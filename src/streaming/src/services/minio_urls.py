@@ -1,3 +1,5 @@
+# create url for snapshot save to minio => help UI see snapshot from minio without credential
+
 from __future__ import annotations
 
 from datetime import timedelta
@@ -18,13 +20,13 @@ class MinIOURLBuilder:
         self._bucket = bucket
         public = public_endpoint or internal_endpoint
 
-        self._internal_client = Minio(
+        self._internal_client = Minio( # client 1: check bucket in service/container
             internal_endpoint,
             access_key=access_key,
             secret_key=secret_key,
             secure=secure,
         )
-        self._public_client = Minio(
+        self._public_client = Minio( # client 2: public client to generate url for browser
             public,
             access_key=access_key,
             secret_key=secret_key,

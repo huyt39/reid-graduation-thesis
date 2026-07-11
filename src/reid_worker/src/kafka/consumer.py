@@ -1,3 +1,5 @@
+# read message from kafka and decode avro bytes -> python dict
+
 import io
 from pathlib import Path
 

@@ -1,3 +1,5 @@
+# serve worker's output
+
 import io
 from pathlib import Path
 
